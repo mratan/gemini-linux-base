@@ -1,0 +1,74 @@
+diff --git a/Documentation/devicetree/bindings/display/mediatek/mediatek,dpi.yaml b/Documentation/devicetree/bindings/display/mediatek/mediatek,dpi.yaml
+index 803c00f26..f5e18060b 100644
+--- a/Documentation/devicetree/bindings/display/mediatek/mediatek,dpi.yaml
++++ b/Documentation/devicetree/bindings/display/mediatek/mediatek,dpi.yaml
+@@ -20,6 +20,7 @@ properties:
+     oneOf:
+       - enum:
+           - mediatek,mt2701-dpi
++          - mediatek,mt6797-dpi
+           - mediatek,mt7623-dpi
+           - mediatek,mt8173-dpi
+           - mediatek,mt8183-dpi
+@@ -50,6 +51,9 @@ properties:
+       - const: engine
+       - const: pll
+ 
++  power-domains:
++    maxItems: 1
++
+   pinctrl-0: true
+   pinctrl-1: true
+ 
+diff --git a/drivers/gpu/drm/mediatek/mtk_dpi.c b/drivers/gpu/drm/mediatek/mtk_dpi.c
+index 2f931e4e2..e37a172f0 100644
+--- a/drivers/gpu/drm/mediatek/mtk_dpi.c
++++ b/drivers/gpu/drm/mediatek/mtk_dpi.c
+@@ -922,6 +922,39 @@ static const struct mtk_dpi_conf mt2701_conf = {
+ 	.csc_enable_bit = CSC_ENABLE,
+ };
+ 
++/*
++ * MT6797 (Helio X20/X27) DPI0. The vendor 3.18 driver
++ * (drivers/misc/mediatek/video/mt6797/dispsys/ddp_dpi.c) drives DPI0 from
++ * TVDPLL with a direct RGB pin-out and dual-edge DDR framing, exactly the
++ * MT8173-generation DPI IP — so the MT8173 config is the template here:
++ * same cal_factor (TVDPLL divider selection), direct-pin RGB output,
++ * input-swap support and CK/DE polarity control.
++ *
++ * max_clock_khz is carried over from mt8173 (300 MHz); the External display
++ * target is <=1080p60 (148.5 MHz), well inside that bound.
++ * TODO: verify on hardware — the DPI feeds the SiI9024A over only 12 physical
++ * data lines (GPIO39..GPIO50 = DPI_D0..D11, vendor sil9024a.dtsi), i.e. the
++ * board relies on dual-edge DDR to carry RGB888; the pixel/engine clock split
++ * (CLK_MM_DPI_INTERFACE_CLOCK vs CLK_MM_DPI_MM_CLOCK) and the dpi0_sel->TVDPLL
++ * reparent are runtime concerns validated in the on-device slice.
++ */
++static const struct mtk_dpi_conf mt6797_conf = {
++	.cal_factor = mt8173_calculate_factor,
++	.reg_h_fre_con = 0xe0,
++	.max_clock_khz = 300000,
++	.output_fmts = mt8173_output_fmts,
++	.num_output_fmts = ARRAY_SIZE(mt8173_output_fmts),
++	.pixels_per_iter = 1,
++	.is_ck_de_pol = true,
++	.swap_input_support = true,
++	.support_direct_pin = true,
++	.dimension_mask = HPW_MASK,
++	.hvsize_mask = HSIZE_MASK,
++	.channel_swap_shift = CH_SWAP,
++	.yuv422_en_bit = YUV422_EN,
++	.csc_enable_bit = CSC_ENABLE,
++};
++
+ static const struct mtk_dpi_conf mt8183_conf = {
+ 	.cal_factor = mt8183_calculate_factor,
+ 	.reg_h_fre_con = 0xe0,
+@@ -1091,6 +1124,7 @@ static void mtk_dpi_remove(struct platform_device *pdev)
+ 
+ static const struct of_device_id mtk_dpi_of_ids[] = {
+ 	{ .compatible = "mediatek,mt2701-dpi", .data = &mt2701_conf },
++	{ .compatible = "mediatek,mt6797-dpi", .data = &mt6797_conf },
+ 	{ .compatible = "mediatek,mt8173-dpi", .data = &mt8173_conf },
+ 	{ .compatible = "mediatek,mt8183-dpi", .data = &mt8183_conf },
+ 	{ .compatible = "mediatek,mt8186-dpi", .data = &mt8186_conf },

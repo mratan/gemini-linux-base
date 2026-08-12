@@ -1,0 +1,227 @@
+diff --git a/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts b/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
+index 90e18783c..0eccc52de 100644
+--- a/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
++++ b/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
+@@ -30,6 +30,19 @@ / {
+ 
+ 	aliases {
+ 		serial0 = &uart0;
++		/*
++		 * Display component instance aliases. mediatek-drm resolves an
++		 * OVL/RDMA node to its DDP_COMPONENT_* id via of_alias_get_id();
++		 * with two OVL and two RDMA instances (primary DSI vs external
++		 * DPI) these are required to disambiguate ovl0/ovl1 and
++		 * rdma0/rdma1. Harmless for the already-working single-instance
++		 * DSI path (ovl0/rdma0 resolve to id 0 either way).
++		 */
++		ovl0 = &disp_ovl0;
++		ovl1 = &disp_ovl1;
++		rdma0 = &disp_rdma0;
++		rdma1 = &disp_rdma1;
++		dpi0 = &dpi0;
+ 	};
+ 
+ 	chosen {
+@@ -1518,3 +1531,202 @@ fusb301a_sw_sel_hog: fusb301a-sw-sel-hog {
+ 		line-name = "fusb301a-sw-sel";
+ 	};
+ };
++
++/*
++ * ============================================================================
++ * External display (HDMI-out on the right USB-C port) — Track 3, Slice VS1.
++ *
++ * Path: MT6797 DDP -> DPI0 (parallel RGB, 12 data lines, dual-edge DDR) ->
++ * SiI9024A HDMI transmitter (Silicon Image 902x "TPI" family) on I2C3 @ 0x39
++ * -> HDMI TMDS muxed onto the right USB-C pins by the right-port mux. This is
++ * NOT USB-C DP Alt Mode; only the Planet 30-001-01 pin-remap cable drives it.
++ *
++ * Board wiring (evidence: vendor ubports-3.18 arch/arm64/boot/dts/sil9024a.dtsi
++ * and mt6797.dts; cross-checked against the on-device DTB
++ * docs/vendor-dtb/gemini_kali_boot.dts):
++ *   - I2C3 @ 0x39 (TX_SLAVE_ADDR 0x72 >> 1; vendor siHdmiTx_902x_TPI.h),
++ *     confirmed by the live i2c scan (glossary: SiI9024A).
++ *   - reset  = GPIO57  (vendor gpio_sil9022_rst_*; active-low: rst_low holds
++ *     the chip in reset).
++ *   - EINT   = GPIO62 / EINT1 (hot-plug). NOT wired as an interrupt here:
++ *     upstream pinctrl-mt6797 has no EINT support (blockers.md B-11), exactly
++ *     as the charger/aw9523b nodes omit theirs. sii902x polls HPD without it.
++ *   - 1V2 en = GPIO247 (vendor gpio_sil9022_1v2_en_*; gates the SiI9024A 1.2 V
++ *     digital core -> modelled as the cvcc12 supply below).
++ *   - DPI    = GPIO39..GPIO54 -> DPI_D0..D11, DE, CK, HSYNC, VSYNC (only 12
++ *     data lines: RGB888 is carried dual-edge/DDR, per vendor ddp_dpi.c).
++ *
++ * No firmware blob: the SiI9024A is brought up by pure TPI I2C register writes
++ * and reads EDID over DDC (vendor hdmi/sil9024 has no request_firmware / *.bin;
++ * the mainline drm/bridge/sii902x.c bridge is likewise firmware-free).
++ *
++ * STATUS: the DPI0 source (dpi0, disp_ovl1, disp_rdma1) and the sii9022 bridge
++ * are left status="disabled" here. This slice's gate is Device-free (build +
++ * dtbs_check); enabling the pipe, the mmsys external-path mux routing and the
++ * right-port mux switching are the on-device External display slice. Keeping
++ * the pipe disabled guarantees the working internal DSI panel is untouched
++ * (mediatek-drm skips a path whose component nodes are disabled).
++ * ============================================================================
++ */
++
++/* SiI9024A 1.2 V digital-core supply, gated by GPIO247 (vendor 1v2_en). */
++/ {
++	hdmi_1v2: regulator-hdmi-1v2 {
++		compatible = "regulator-fixed";
++		regulator-name = "hdmi_1v2";
++		regulator-min-microvolt = <1200000>;
++		regulator-max-microvolt = <1200000>;
++		enable-gpios = <&pio 247 GPIO_ACTIVE_HIGH>;
++		/* TODO: verify enable polarity on hardware (vendor drives
++		 * GPIO247 high to enable the rail). */
++	};
++
++	/* HDMI type-A receptacle presented to the user via the Planet cable. */
++	hdmi_connector: connector {
++		compatible = "hdmi-connector";
++		label = "hdmi";
++		type = "a";
++		status = "disabled";
++
++		port {
++			hdmi_con_in: endpoint {
++				remote-endpoint = <&sii9022_out>;
++			};
++		};
++	};
++};
++
++&i2c3 {
++	pinctrl-names = "default";
++	pinctrl-0 = <&i2c3_pins_a>;
++	clock-frequency = <100000>;
++	status = "okay";
++
++	/*
++	 * SiI9024A HDMI bridge. Driven by the mainline drm/bridge/sii902x.c
++	 * (compatible sil,sii9022 — covers the whole 902x TPI family; see
++	 * CONTEXT.md "SiI9024A"). Disabled until the on-device slice; the DPI
++	 * encoder it attaches to (dpi0) is disabled too.
++	 */
++	sii9022: hdmi-bridge@39 {
++		compatible = "sil,sii9022";
++		reg = <0x39>;
++		reset-gpios = <&pio 57 GPIO_ACTIVE_LOW>;
++		iovcc-supply = <&vdd_fixed_1v8>;
++		cvcc12-supply = <&hdmi_1v2>;
++		pinctrl-names = "default";
++		pinctrl-0 = <&hdmi_pins>;
++		status = "disabled";
++
++		ports {
++			#address-cells = <1>;
++			#size-cells = <0>;
++
++			port@0 {
++				reg = <0>;
++				sii9022_in: endpoint {
++					remote-endpoint = <&dpi0_out>;
++				};
++			};
++
++			port@1 {
++				reg = <1>;
++				sii9022_out: endpoint {
++					remote-endpoint = <&hdmi_con_in>;
++				};
++			};
++		};
++	};
++};
++
++/* External-display DDP pipe (independent of the DSI path). Disabled here;
++ * enabled together in the on-device slice. */
++&disp_ovl1 {
++	status = "disabled";
++};
++
++&disp_rdma1 {
++	status = "disabled";
++};
++
++&dpi0 {
++	pinctrl-names = "default", "sleep";
++	pinctrl-0 = <&dpi_pins>;
++	pinctrl-1 = <&dpi_pins_idle>;
++	status = "disabled";
++};
++
++/* Wire the DPI0 output to the SiI9024A parallel-RGB input. */
++&dpi0_out {
++	remote-endpoint = <&sii9022_in>;
++};
++
++&pio {
++	/*
++	 * DPI parallel-RGB bus: GPIO39..GPIO54 in DPI function (vendor
++	 * sil9024a.dtsi gpio_sil9022_dpi_func1). 12 data lines (D0..D11) plus
++	 * DE/CK/HSYNC/VSYNC — RGB888 is carried dual-edge (DDR).
++	 */
++	dpi_pins: dpi-pins {
++		pins-dpi {
++			pinmux = <MT6797_GPIO39__FUNC_DPI_D0>,
++				 <MT6797_GPIO40__FUNC_DPI_D1>,
++				 <MT6797_GPIO41__FUNC_DPI_D2>,
++				 <MT6797_GPIO42__FUNC_DPI_D3>,
++				 <MT6797_GPIO43__FUNC_DPI_D4>,
++				 <MT6797_GPIO44__FUNC_DPI_D5>,
++				 <MT6797_GPIO45__FUNC_DPI_D6>,
++				 <MT6797_GPIO46__FUNC_DPI_D7>,
++				 <MT6797_GPIO47__FUNC_DPI_D8>,
++				 <MT6797_GPIO48__FUNC_DPI_D9>,
++				 <MT6797_GPIO49__FUNC_DPI_D10>,
++				 <MT6797_GPIO50__FUNC_DPI_D11>,
++				 <MT6797_GPIO51__FUNC_DPI_DE>,
++				 <MT6797_GPIO52__FUNC_DPI_CK>,
++				 <MT6797_GPIO53__FUNC_DPI_HSYNC>,
++				 <MT6797_GPIO54__FUNC_DPI_VSYNC>;
++		};
++	};
++
++	/*
++	 * SiI9024A control GPIOs as plain GPIO function: reset GPIO57,
++	 * 1v2-enable GPIO247, and EINT/HPD GPIO62 (kept as GPIO input; not an
++	 * interrupt until pinctrl-mt6797 gains EINT support — blockers.md B-11).
++	 * pinmux only: upstream pinctrl-mt6797 implements no pinconf, so bias/
++	 * slew from the vendor DTS is left as the bootloader set it (same
++	 * convention as the msdc0/aw9523b pin groups in this DTS).
++	 */
++	/*
++	 * DPI idle state: the same 16 pins parked as GPIO outputs low (vendor
++	 * sil9024a.dtsi gpio_sil9022_dpi_gpio), selected on the "sleep" pinctrl
++	 * state so the parallel bus is quiet when HDMI is off.
++	 */
++	dpi_pins_idle: dpi-pins-idle {
++		pins-dpi {
++			pinmux = <MT6797_GPIO39__FUNC_GPIO39>,
++				 <MT6797_GPIO40__FUNC_GPIO40>,
++				 <MT6797_GPIO41__FUNC_GPIO41>,
++				 <MT6797_GPIO42__FUNC_GPIO42>,
++				 <MT6797_GPIO43__FUNC_GPIO43>,
++				 <MT6797_GPIO44__FUNC_GPIO44>,
++				 <MT6797_GPIO45__FUNC_GPIO45>,
++				 <MT6797_GPIO46__FUNC_GPIO46>,
++				 <MT6797_GPIO47__FUNC_GPIO47>,
++				 <MT6797_GPIO48__FUNC_GPIO48>,
++				 <MT6797_GPIO49__FUNC_GPIO49>,
++				 <MT6797_GPIO50__FUNC_GPIO50>,
++				 <MT6797_GPIO51__FUNC_GPIO51>,
++				 <MT6797_GPIO52__FUNC_GPIO52>,
++				 <MT6797_GPIO53__FUNC_GPIO53>,
++				 <MT6797_GPIO54__FUNC_GPIO54>;
++		};
++	};
++
++	hdmi_pins: hdmi-pins {
++		pins-ctrl {
++			pinmux = <MT6797_GPIO57__FUNC_GPIO57>,
++				 <MT6797_GPIO62__FUNC_GPIO62>,
++				 <MT6797_GPIO247__FUNC_GPIO247>;
++		};
++	};
++};
