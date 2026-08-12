@@ -137,6 +137,6 @@ index 0eccc52de..46be5851b 100644
 +		regulator-min-microvolt = <600000>;
 +		regulator-max-microvolt = <1393750>;
 +		regulator-ramp-delay = <6250>;
-+		regulator-boot-on;
++		/* NOT regulator-boot-on: chip @0x60 unconfirmed (richtek,rt5735 vs a fan53555-family part have different VSEL encodings), so do not enable/apply this rail at boot until the die is confirmed on hardware (audit finding F5). */
 +	};
 +};
