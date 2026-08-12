@@ -43,7 +43,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             qemu-system-arm qemu-user-static binfmt-support mmdebstrap \
-            arch-test debian-archive-keyring gdisk e2fsprogs zstd xz-utils
+            arch-test debian-archive-keyring gdisk e2fsprogs zstd xz-utils kmod
 
       - name: Build Debian 13 arm64 loop-image rootfs (experimental.img)
         run: sudo scripts/mkrootfs-loop.sh --out out/experimental.img
@@ -51,8 +51,8 @@ jobs:
       - name: Fetch stock Debian arm64 kernel + static busybox (QEMU proof bits)
         run: |
           set -o pipefail   # a failure in the script must not be masked by tee
-          sudo bash scripts/ci/fetch-qemu-boot-bits.sh "$RUNNER_TEMP/deb-extract" \
-            | tee -a "$GITHUB_ENV"
+          python3 scripts/ci/fetch-qemu-boot-bits.py \
+            --dest "$RUNNER_TEMP/deb-extract" | tee -a "$GITHUB_ENV"
           # the env vars must actually be present and valid
           grep -q '^MODULES_BASE=..*' "$GITHUB_ENV"
           grep -q '^VMLINUZ=..*' "$GITHUB_ENV"

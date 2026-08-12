@@ -33,7 +33,7 @@ import sys
 APPLETS = [
     "sh", "mount", "umount", "switch_root", "losetup", "insmod",
     "mkdir", "mknod", "cat", "ls", "echo", "sleep", "setsid", "cttyhack",
-    "grep", "sed", "sort", "cut", "head", "blkid", "uname", "readlink",
+    "grep", "sed", "sort", "cut", "head", "uname", "readlink",
     "test", "[", "ln", "cp", "mv", "rm", "sync", "dmesg", "ps", "df",
 ]
 

@@ -85,15 +85,19 @@ loop-mount `/experimental.img` from it, and `switch_root` into the image.
    both;
 3. any remaining partition as a fallback.
 
-Each candidate is mounted **read-only** and probed for the image file
-(`gemini.rootimg=`, default `/experimental.img`); the image is then
-loop-mounted read-only and validated (`/sbin/init` executable, overridable
-via `gemini.init=`). **Everything stays read-only until the pivot is
-committed**; the single write-enabling action is the `remount,rw` of the
-host partition immediately before `switch_root`. On **any** failure before
-that, the initramfs unmounts what it probed and drops to a rescue shell
-having written nothing (`gemini.rescue` on the cmdline forces this). After
-the pivot the host partition mount is moved to `/host` in the rootfs.
+Each candidate is mounted **read-only with `noload`** — plain `ro` is not
+enough, because an ext4 ro mount still replays a dirty journal onto the
+block device; `noload` makes the probe provably write nothing — and probed
+for the image file (`gemini.rootimg=`, default `/experimental.img`); the
+image is then loop-mounted `ro,noload` and validated (`/sbin/init`
+executable, overridable via `gemini.init=`). **Everything stays read-only
+until the pivot is committed**; the single write-enabling action is the
+fresh read-write mount of the host partition (where any pending journal
+replay legitimately happens) immediately before `switch_root`. On **any**
+failure before that, the initramfs unmounts what it probed and drops to a
+rescue shell having written nothing (`gemini.rescue` on the cmdline forces
+this). After the pivot the host partition mount is moved to `/host` in the
+rootfs.
 
 Build (deterministic gzipped newc cpio, no root/fakeroot needed):
 
@@ -103,7 +107,7 @@ scripts/mkinitramfs.py --busybox <static-arm64-busybox> \
 ```
 
 The busybox binary is **never committed**: CI fetches it from the Debian
-`busybox-static` arm64 package (`scripts/ci/fetch-qemu-boot-bits.sh`). The
+`busybox-static` arm64 package (`scripts/ci/fetch-qemu-boot-bits.py`). The
 device kernel needs no modules in the initramfs (devtmpfs/ext4/loop are
 built into the arm64 defconfig the build uses); the QEMU test variant adds
 the stock Debian kernel's virtio/ext4/loop modules via
