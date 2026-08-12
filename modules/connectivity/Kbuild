@@ -35,10 +35,17 @@ mtk_btif-y := \
 	btif/btif_plat.o \
 	btif/btif_dma_plat.o
 
-# Wi-Fi chardev gate (/dev/wmtWifi — userspace writes '1' to power Wi-Fi on)
-obj-m += wmt_chrdev_wifi.o
-wmt_chrdev_wifi-y := wlan/wmt_chrdev_wifi.o
-CFLAGS_wlan/wmt_chrdev_wifi.o := -DCREATE_NODE_DYNAMIC=1
+# Wi-Fi chardev gate (/dev/wmtWifi — userspace writes '1' to power Wi-Fi on).
+# NOT a standalone module: it is linked INTO wlan_gen3.ko (see the wlan_gen3-y
+# append below). The chardev and the gen3 driver reference each other's symbols
+# (chardev reads gen3's g_IsNeedDoChipReset; gen3 calls the chardev's
+# wifi_reset_start/end + register_set_p2p_mode_handler), which as two separate
+# modules formed a bidirectional EXPORT_SYMBOL cycle that depmod cannot order
+# (issue #22). Merging makes every such edge intra-module. Built with
+# MTK_WCN_BUILT_IN_DRIVER so it exposes mtk_wcn_wmt_wifi_init/exit (driven by
+# gen3's initWlan/exitWlan) instead of its own module_init — a single .ko may
+# have only one module entry point, which stays gl_init.c's.
+CFLAGS_wlan/wmt_chrdev_wifi.o := -DCREATE_NODE_DYNAMIC=1 -DMTK_WCN_BUILT_IN_DRIVER
 
 # Gen3 WLAN driver — the driver actually built for CONSYS_6797 (MT6630-class
 # core, SDIO-like AHB HIF). Object list mirrors the vendor gen3 Makefile's
@@ -145,6 +152,11 @@ wlan_gen3-y := \
 	wlan/gen3/mgmt/wapi.o
 
 $(foreach o,$(wlan_gen3-y),$(eval CFLAGS_$(o) := $(WLAN_GEN3_CFLAGS)))
+
+# Chardev gate linked into wlan_gen3.ko (see comment above). Appended AFTER the
+# foreach so it keeps its own CFLAGS (CREATE_NODE_DYNAMIC + MTK_WCN_BUILT_IN_DRIVER)
+# and is NOT compiled with the gen3 -DMT6797/HIF include flags.
+wlan_gen3-y += wlan/wmt_chrdev_wifi.o
 
 # WMT core + STP + SoC platform glue, as one module (keeps the vendor's
 # intra-stack symbol web internal; exports stay available for wlan gen3)

@@ -199,7 +199,33 @@ enables the cfg80211 features the driver requires (`NL80211_TESTMODE`,
 - **G18 [novel] cross-module EXPORT_SYMBOL** — `gConEmiPhyBase`,
   `mtk_wcn_consys_hw_wifi_paldo_ctrl` (both in the WMT module, consumed by the
   gen3 AHB HIF) and `g_IsNeedDoChipReset` (gen3, consumed by the chardev) are
-  now exported so the four modules link.
+  now exported so the four modules link. **Superseded in part by G20:** the
+  `g_IsNeedDoChipReset` export (and the chardev's reverse exports back to gen3)
+  were removed when the chardev was merged into `wlan_gen3.ko`; the two WMT-core
+  exports remain (that edge, mtk_stp_wmt_soc → wlan_gen3, is acyclic).
+- **G20 [novel] ⚠ chardev merged into wlan_gen3.ko — EXPORT_SYMBOL cycle broken**
+  (tracker issue #22, follow-up to Slice 9/#10). As two separate modules,
+  `wmt_chrdev_wifi.ko` and `wlan_gen3.ko` exported symbols to *each other* —
+  chardev → gen3: `g_IsNeedDoChipReset` (gl_rst.c, read by the chardev's
+  `WMT_CHECK_DO_CHIP_RESET`); gen3 → chardev: `wifi_reset_start`, `wifi_reset_end`
+  (gl_rst.c reset FSM) and `register_set_p2p_mode_handler` (gl_init.c). That
+  bidirectional edge is a true cycle: neither can insmod first and `depmod`
+  cannot emit a `modules.dep` load order (harmless to compile/modpost, so #10
+  stayed green, but blocks runtime loading). **Fix:** `wlan/wmt_chrdev_wifi.o`
+  is now linked into `wlan_gen3.ko` (Kbuild: appended to `wlan_gen3-y`, kept out
+  of the gen3 `WLAN_GEN3_CFLAGS` foreach so it keeps its own
+  `CREATE_NODE_DYNAMIC` flag and is *not* built with `-DMT6797`/HIF includes).
+  All four symbols become intra-module direct links, so their four `EXPORT_SYMBOL`
+  lines were dropped. A single `.ko` may have only one module entry point, so the
+  chardev is compiled with `-DMTK_WCN_BUILT_IN_DRIVER` (per-object only — *not*
+  tree-wide, which would also disable gl_init.c's `module_init`), exposing
+  `mtk_wcn_wmt_wifi_init`/`_exit`; `initWlan()` calls init first (so /dev/wmtWifi
+  and the reset mutex exist before bus registration or any reset callback) and
+  `exitWlan()` calls exit last, with unwind on the `glRegisterBus` failure path.
+  Result: `mtk_btif` → `mtk_stp_wmt_soc` → `wlan_gen3` is acyclic and depmod
+  emits a valid order. Runtime note for bring-up: loading `wlan_gen3.ko` now
+  *also* creates /dev/wmtWifi (previously a separate insmod); userspace power-on
+  sequence via /dev/wmtWifi is otherwise unchanged.
 - **G19 [novel] sched_setscheduler unexported (v5.9)** — the Wi-Fi kthread
   priority set uses `sched_set_fifo_low()` (exported); **the vendor's exact
   numeric priority/policy is not reproduced**, only "elevated RT". `gl_init.c`.

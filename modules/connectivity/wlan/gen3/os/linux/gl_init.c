@@ -2476,11 +2476,31 @@ static VOID wlanRemove(VOID)
 */
 /*----------------------------------------------------------------------------*/
 /* 1 Module Entry Point */
+/*
+ * issue #22: the /dev/wmtWifi chardev gate (wmt_chrdev_wifi.c) is linked into
+ * this module instead of being a separate wmt_chrdev_wifi.ko (that split formed
+ * a bidirectional EXPORT_SYMBOL cycle with gen3). Built with
+ * MTK_WCN_BUILT_IN_DRIVER, it exposes these entry points instead of its own
+ * module_init/exit; we drive them from initWlan/exitWlan so the merged .ko has
+ * exactly one module entry point (this file's).
+ */
+extern int mtk_wcn_wmt_wifi_init(void);
+extern void mtk_wcn_wmt_wifi_exit(void);
+
 static int initWlan(void)
 {
 	int ret = 0;
 
 	DBGLOG(INIT, INFO, "initWlan\n");
+
+	/* Bring up /dev/wmtWifi first so the power gate and reset mutex exist
+	 * before the bus is registered or any reset callback can fire.
+	 */
+	ret = mtk_wcn_wmt_wifi_init();
+	if (ret) {
+		DBGLOG(INIT, ERROR, "mtk_wcn_wmt_wifi_init failed: %d\n", ret);
+		return ret;
+	}
 
 	wlanDebugInit();
 
@@ -2496,6 +2516,7 @@ static int initWlan(void)
 
 	if (ret == -EIO) {
 		kalUninitIOBuffer();
+		mtk_wcn_wmt_wifi_exit();	/* issue #22: unwind the merged chardev gate */
 		return ret;
 	}
 #if (CFG_CHIP_RESET_SUPPORT)
@@ -2531,6 +2552,8 @@ static VOID exitWlan(void)
 	destroyWirelessDevice();
 	glP2pDestroyWirelessDevice();
 	procUninitProcFs();
+
+	mtk_wcn_wmt_wifi_exit();	/* issue #22: tear down the merged /dev/wmtWifi gate */
 
 	DBGLOG(INIT, INFO, "exitWlan\n");
 

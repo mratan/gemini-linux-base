@@ -53,7 +53,15 @@
 static BOOLEAN fgResetTriggered = FALSE;
 BOOLEAN fgIsResetting = FALSE;
 UINT32 g_IsNeedDoChipReset;
-EXPORT_SYMBOL(g_IsNeedDoChipReset);
+/*
+ * issue #22: the /dev/wmtWifi chardev (wmt_chrdev_wifi.c) reads this flag. The
+ * chardev is now linked into the same module (wlan_gen3.ko) rather than being a
+ * separate wmt_chrdev_wifi.ko, so the reference is resolved intra-module at link
+ * time and no EXPORT_SYMBOL is required. Exporting it (port addition G18) plus
+ * the chardev exporting wifi_reset_start/end back to gen3 formed a bidirectional
+ * inter-module cycle that depmod could not order; dropping the export here (and
+ * the reverse exports in the chardev) breaks it.
+ */
 
 /*******************************************************************************
 *                           P R I V A T E   D A T A

@@ -111,7 +111,10 @@ VOID register_set_p2p_mode_handler(set_p2p_mode handler)
 	WIFI_INFO_FUNC("(pid %d) register set p2p mode handler %p\n", current->pid, handler);
 	pf_set_p2p_mode = handler;
 }
-EXPORT_SYMBOL(register_set_p2p_mode_handler);
+/* issue #22: gen3 (gl_init.c) calls this; now linked into the same
+ * wlan_gen3.ko, so no cross-module export is needed (see g_IsNeedDoChipReset
+ * in gl_rst.c for the full cycle rationale).
+ */
 
 #define WMT_CHECK_DO_CHIP_RESET() \
 do { \
@@ -166,7 +169,7 @@ INT32 wifi_reset_start(VOID)
 
 	return 0;
 }
-EXPORT_SYMBOL(wifi_reset_start);
+/* issue #22: called by gen3's reset FSM (gl_rst.c), now intra-module. */
 
 /*-----------------------------------------------------------------*/
 /*
@@ -244,7 +247,7 @@ done:
 
 	return ret;
 }
-EXPORT_SYMBOL(wifi_reset_end);
+/* issue #22: called by gen3's reset FSM (gl_rst.c), now intra-module. */
 
 static int WIFI_open(struct inode *inode, struct file *file)
 {

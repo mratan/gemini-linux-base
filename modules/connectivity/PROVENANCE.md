@@ -39,7 +39,19 @@ hard-requires (`NL80211_TESTMODE`, `CFG80211_WEXT`). `wlan/gen3/lint/` was
 dropped (vendor static-analysis noise, not built).
 
 Modules produced (all pass modpost against the Base tree kernel):
-`mtk_btif.ko`, `mtk_stp_wmt_soc.ko`, `wmt_chrdev_wifi.ko`, `wlan_gen3.ko`.
+`mtk_btif.ko`, `mtk_stp_wmt_soc.ko`, `wlan_gen3.ko`. (Slice 9 also built a
+standalone `wmt_chrdev_wifi.ko`; it is now linked into `wlan_gen3.ko` — see the
+next paragraph and API-CHURN-LOG G20.)
+
+### Gen3 chardev merge (tracker issue #22)
+
+The `/dev/wmtWifi` power gate (`wlan/wmt_chrdev_wifi.c`) and the gen3 driver
+exported symbols to each other, forming a bidirectional `EXPORT_SYMBOL` cycle
+that `depmod` cannot order (blocks runtime module loading; compile/modpost were
+unaffected). The chardev is now compiled *into* `wlan_gen3.ko` rather than as a
+separate module, collapsing every chardev↔gen3 symbol edge to an intra-module
+link. Load order is now acyclic: `mtk_btif` → `mtk_stp_wmt_soc` → `wlan_gen3`.
+Full rationale and the init/exit wiring are in API-CHURN-LOG.md **G20**.
 
 All 6.6-compatibility modifications to vendored sources are logged in
 `API-CHURN-LOG.md` — one entry per change, tagged mechanical/semantic and
