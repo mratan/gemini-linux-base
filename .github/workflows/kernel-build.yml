@@ -48,6 +48,18 @@ jobs:
           CONFIG_FRAGMENTS="$GITHUB_WORKSPACE/configs" \
             ./scripts/build.sh config
 
+      # gemini-consys.config embeds the proprietary CONSYS firmware into the
+      # kernel (CONFIG_EXTRA_FIRMWARE) from a path that only exists on the
+      # private build machine. Those blobs must never land in a public repo or
+      # public CI artifact, so the CI baseline builds without them; the embed
+      # happens at local packaging time instead.
+      - name: Drop private EXTRA_FIRMWARE embed (blobs stay off public CI)
+        run: |
+          cd "$GITHUB_WORKSPACE/linux-6.6"
+          ./scripts/config --set-str EXTRA_FIRMWARE ""
+          ./scripts/config --set-str EXTRA_FIRMWARE_DIR ""
+          make ARCH=arm64 olddefconfig
+
       - name: Build Image.gz + dtbs + modules
         run: |
           LINUX_SRC="$GITHUB_WORKSPACE/linux-6.6" \
