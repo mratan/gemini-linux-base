@@ -19,7 +19,7 @@ CON=/dev/console
 say() { echo "$@" > "$CON" 2>/dev/null || echo "$@"; }
 
 FW_NAMES="ROMv3_patch_1_0_hdr.bin ROMv3_patch_1_1_hdr.bin WIFI_RAM_CODE_6797 WMT_SOC.cfg"
-KO_NAMES="mtk_btif mtk_stp_wmt_soc wmt_chrdev_wifi wlan_gen3"
+KO_NAMES="mtk_btif mtk_stp_wmt_soc wlan_gen3"
 DAEMON_UNITS="wmt-loader.service wmt-launcher.service"
 
 say "GEMINI-SLICE10-VERIFY: begin (uname -r=$(uname -r 2>/dev/null))"

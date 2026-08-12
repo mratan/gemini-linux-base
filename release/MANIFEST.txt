@@ -7,7 +7,7 @@
 # component identities are canonical and pinned here:
 #   * firmware payload  -> the authoritative catalog SHA-256s (PAYLOAD-CATALOG.md)
 #   * daemon units / self-check overlay -> committed source, hashes canonical
-#   * the wmt_chrdev_wifi<->wlan_gen3 EXPORT_SYMBOL cycle note (see RUNBOOK §4a)
+#   * module set is 3 (wmt_chrdev_wifi merged into wlan_gen3, issue #22)
 # The BUILD-OUTPUT hashes below (Image.gz, .ko, boot3/rootfs images) are from a
 # LOCAL reference build (note kernel_release "6.6.0-dirty"). Each `release`
 # CI run REGENERATES this manifest against the kernel-build artifact and uploads
@@ -27,13 +27,14 @@ boot3_image      6f4d63e195e1eed2692d6f32403ddadc29a39519881f6e565442dc66a6b2cf7
 
 ## ported connectivity modules  (/lib/modules/6.6.0-dirty/updates)
 # module source tree: modules/connectivity @ fork commit above (see PROVENANCE.md)
+# NOTE: these .ko hashes are the pre-#22 reference; wlan_gen3.ko now includes the
+#       merged chardev, so its hash changes on the next regeneration.
   mtk_btif.ko  f06f87702ab21618cbdb958f6469f3a565077048d98176e732ac7803bd93aec1  [vermagic: 6.6.0-dirty SMP preempt mod_unload aarch64]
   mtk_stp_wmt_soc.ko  96ab9509b90a910f386e982e14e2c12f9878ead7eb301fc83d3a12a01bb44c38  [vermagic: 6.6.0-dirty SMP preempt mod_unload aarch64]
-  wmt_chrdev_wifi.ko  7522158d60b9f4894783f682273053f25f92c09eb6d30dc3961fc6688b1ca540  [vermagic: 6.6.0-dirty SMP preempt mod_unload aarch64]
   wlan_gen3.ko  c85d9f0e36808a42faf5e4ca815446cf106003b49d268cb6cbd9dae382639cf4  [vermagic: 6.6.0-dirty SMP preempt mod_unload aarch64]
-# NOTE: wmt_chrdev_wifi <-> wlan_gen3 form a bidirectional EXPORT_SYMBOL
-#       cycle; load by explicit insmod in the supervised bring-up, not
-#       modprobe (depmod cannot emit modules.dep). See RUNBOOK.md step 4.
+# NOTE: acyclic load order mtk_btif -> mtk_stp_wmt_soc -> wlan_gen3 (issue #22);
+#       wmt_chrdev_wifi merged into wlan_gen3. depmod emits a valid modules.dep;
+#       modprobe works. See RUNBOOK.md step 4.
 
 ## CONSYS firmware payload  (/lib/firmware)  — authoritative catalog hashes
   ROMv3_patch_1_0_hdr.bin  d85864206b999501568a69edd8305319f9961fb65d56f77f438be29ff05c57a8  (211908 B) [catalog; staged + verified]

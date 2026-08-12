@@ -40,10 +40,10 @@ rootfs in **QEMU** asserting `GEMINI-MODULES-STAGED-OK`,
 workflow — CI stages named placeholders; the manifest still pins the catalog
 hashes.
 
-## Known integration finding (issue #11)
+## Module set (issue #22)
 
-`wmt_chrdev_wifi` and `wlan_gen3` have a **bidirectional `EXPORT_SYMBOL`
-dependency**, so `depmod` cannot emit `modules.dep` and neither module can
-`insmod` first. The WMT core (`mtk_btif` → `mtk_stp_wmt_soc`) is unaffected.
-This blocks Wi-Fi function-on and needs a Gen3-slice (issue #10) follow-up (one
-combined module / a runtime callback registry / built-in). See `RUNBOOK.md` §4a.
+Three modules load in the acyclic order `mtk_btif → mtk_stp_wmt_soc →
+wlan_gen3`. The former `wmt_chrdev_wifi`↔`wlan_gen3` `EXPORT_SYMBOL` cycle was
+resolved by merging the chardev into `wlan_gen3` (issue #22), so `depmod` emits
+a valid `modules.dep` and `modprobe` works. `wmt_chrdev_wifi.ko` no longer
+exists separately. See `RUNBOOK.md` §4a.

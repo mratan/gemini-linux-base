@@ -193,27 +193,16 @@ that would race and contaminate the first capture; see `userspace/wmt-daemons`).
 
 ### 4a. Load the kernel modules — explicit order, by full path
 
-> **KNOWN INTEGRATION FINDING (issue #11).** `wmt_chrdev_wifi` and `wlan_gen3`
-> have a **bidirectional `EXPORT_SYMBOL` dependency** (each imports symbols the
-> other exports: `wlan_gen3` needs `register_set_p2p_mode_handler`,
-> `wifi_reset_start/end`; `wmt_chrdev_wifi` needs `g_IsNeedDoChipReset`,
-> `wlanGetFwIDVersion`). Consequences:
-> - `depmod` refuses to emit `modules.dep` (dependency cycle) — so `modprobe`
->   cannot resolve these two, and the image ships with no `modules.dep` for
->   them (assembly skips depmod deliberately);
-> - **neither of the two can `insmod` first** — whichever loads first has
->   unresolved symbols from the other. The WMT **core** path
->   (`mtk_btif` → `mtk_stp_wmt_soc`) is unaffected and loads cleanly; the
->   **Wi-Fi datapath** pair currently cannot be loaded as separate `.ko`.
-> - **This must be resolved before Wi-Fi function-on is reachable** — it is a
->   Gen3-slice (issue #10) follow-up, not a runbook workaround. Options: build
->   `wmt_chrdev_wifi` + `wlan_gen3` as one combined module, convert one
->   direction of the cross-reference to a runtime callback registry, or make one
->   of them built-in. Track it as a new blocker; do not hand-hack it in the
->   session.
+> **RESOLVED (issue #22).** The former `wmt_chrdev_wifi`↔`wlan_gen3`
+> bidirectional `EXPORT_SYMBOL` cycle was fixed by merging the chardev into
+> `wlan_gen3` (the `/dev/wmtWifi` node and reset FSM are now intra-module). The
+> module set is 3, not 4, and loads in the acyclic order
+> `mtk_btif → mtk_stp_wmt_soc → wlan_gen3`; `depmod` emits a valid `modules.dep`
+> so `modprobe` also works. `wmt_chrdev_wifi.ko` no longer exists as a separate
+> module.
 
 Load the **WMT core** first — this is enough for C2's pre-firmware/first-query
-capture and does not depend on the cycle above:
+capture and does not depend on the Wi-Fi datapath:
 
 ```sh
 K=$(ls -d /lib/modules/*/updates | head -1)   # gemini kver dir (not `uname -r`)
@@ -222,8 +211,8 @@ insmod "$K/mtk_stp_wmt_soc.ko"   # needs 9 symbols from mtk_btif; creates /dev/w
 ls -l /dev/wmtdetect /dev/stpwmt # expect both present
 ```
 
-Only once the datapath cycle is fixed:
-`insmod …/wmt_chrdev_wifi.ko` + `…/wlan_gen3.ko` (order per the fix).
+Then the Wi-Fi datapath (single module now; `/dev/wmtWifi` appears on load):
+`insmod "$K/wlan_gen3.ko"` (or `modprobe wlan_gen3` — modules.dep is valid).
 
 - **Risk:** loading `mtk_stp_wmt_soc` registers the WMT core but powers nothing
   by itself (the A4 daemon change removes the always-power-on probe; function

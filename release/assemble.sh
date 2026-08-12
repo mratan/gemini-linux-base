@@ -54,7 +54,7 @@ ROMv3_patch_1_1_hdr.bin	46472	8982bba207df136fe56be1b9d5f394d89128b3fd41977a8741
 WIFI_RAM_CODE_6797	451904	c28c50efd411c591372b3a57a46cb99709db56e6cd86d65022af2baa88d840a6
 WMT_SOC.cfg	80	f4a59b622a4e0c1470e475ce33f3edae43b27f1fbdeba54dc7cf07503d132880"
 
-KO_NAMES="mtk_btif mtk_stp_wmt_soc wmt_chrdev_wifi wlan_gen3"
+KO_NAMES="mtk_btif mtk_stp_wmt_soc wlan_gen3"
 
 # ---- defaults --------------------------------------------------------------
 KERNEL_DIR=""
@@ -143,14 +143,12 @@ log "      gemini kernel release: $KVER"
 
 MODINSTDIR="$MOD_OV/lib/modules/$KVER/updates"
 if [ -n "$KBUILD" ] && [ -z "$MODULES_KO" ]; then
-    # Proper modules_install (copies .ko + runs postprocessing). depmod is
-    # skipped on purpose: wmt_chrdev_wifi and wlan_gen3 form a bidirectional
-    # EXPORT_SYMBOL cycle, so depmod refuses to emit modules.dep. That is a
-    # KNOWN integration finding (issue #11 report): on-device the datapath
-    # modules must be loaded by explicit `insmod` in the supervised bring-up,
-    # NOT via modprobe dependency resolution. See RUNBOOK.md step 4.
+    # Proper modules_install (copies .ko + runs postprocessing). The former
+    # wmt_chrdev_wifi<->wlan_gen3 EXPORT_SYMBOL cycle was resolved in issue #22
+    # (chardev merged into wlan_gen3), so depmod now emits a valid modules.dep
+    # with the acyclic order mtk_btif -> mtk_stp_wmt_soc -> wlan_gen3.
     make -C "$KBUILD" M="$MODULES_SRC" ARCH=arm64 CROSS_COMPILE="$CROSS_COMPILE" \
-        INSTALL_MOD_PATH="$MOD_OV" DEPMOD=/bin/true modules_install
+        INSTALL_MOD_PATH="$MOD_OV" modules_install
 else
     mkdir -p "$MODINSTDIR"
     for k in "${KO_FILES[@]}"; do cp "$k" "$MODINSTDIR/"; done
@@ -293,9 +291,9 @@ MANIFEST="$OUT/MANIFEST.txt"
         vm="$(modinfo -F vermagic "$f" 2>/dev/null || echo '?')"
         echo "  $m.ko  $(sha "$f")  [vermagic: $vm]"
     done
-    echo "# NOTE: wmt_chrdev_wifi <-> wlan_gen3 form a bidirectional EXPORT_SYMBOL"
-    echo "#       cycle; load by explicit insmod in the supervised bring-up, not"
-    echo "#       modprobe (depmod cannot emit modules.dep). See RUNBOOK.md step 4."
+    echo "# NOTE: module set is mtk_btif -> mtk_stp_wmt_soc -> wlan_gen3 (acyclic);"
+    echo "#       wmt_chrdev_wifi was merged into wlan_gen3 (issue #22). modprobe"
+    echo "#       ordering works via the generated modules.dep. See RUNBOOK.md step 4."
     echo
     echo "## CONSYS firmware payload  (/lib/firmware)  — authoritative catalog hashes"
     while IFS=$'\t' read -r name size want; do
