@@ -1,0 +1,92 @@
+diff --git a/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts b/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
+index 0eccc52de..f3b9ad89d 100644
+--- a/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
++++ b/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
+@@ -1730,3 +1730,87 @@ pins-ctrl {
+ 		};
+ 	};
+ };
++
++/*
++ * ============================================================================
++ * Right-port USB-C mux — static/sysfs HDMI vs USB-host selection
++ * (Track 3, Slice VS2; tracker issue #16, parent #12).
++ *
++ * The right USB-C port is a hardware mux: its pins carry EITHER HDMI TMDS
++ * (from the SiI9024A added in VS1) OR USB-2 host — NEVER BOTH. Three SoC
++ * GPIOs drive it (evidence: vendor ubports-3.18
++ * drivers/misc/mediatek/usb_c/fusb302/usb_typec.c; aeon_gpio names below):
++ *
++ *   GPIO70  sw_en     (fusb301a_sw_en)   OTG/HDMI lane-mux enable
++ *   GPIO71  sw_sel    (fusb301a_sw_sel)  CC orientation (CC1=low / CC2=high)
++ *   GPIO72  sw7226_en (sw7226_en)        MASTER select: low = HDMI, high = USB
++ *
++ * Vendor values: USB host = {sw_en=1, sw_sel=0, sw7226=1};
++ *                HDMI     = {sw_en=0, sw_sel=<CC orient>, sw7226=0}.
++ *
++ * MUTUAL EXCLUSION: GPIO72 (sw7226_en) is the master interlock; there is no
++ * value of it that routes both HDMI and USB, so the two are mutually exclusive
++ * by construction. The gemini-rightport-mux driver owns all three lines and
++ * applies exactly one mode at a time, so a running USB-host session and HDMI
++ * out cannot coexist on this port. Do not expect a right-port USB dongle
++ * (e.g. the Wi-Fi/ethernet fallback) while HDMI is selected. See ADR-0003 /
++ * CONTEXT.md "Right-port mux" and docs/external-display-vs2-rightport-mux.md.
++ *
++ * DECOUPLED FROM TYPE-C: the mode is a DT default + a sysfs write, NOT driven
++ * by CC attach or HPD (ADR-0003). Automatic HPD-gated switching (replicating
++ * the vendor fusb300_eint_work, including CC1/CC2 orientation on sw_sel) is
++ * tracker #19, not implemented here.
++ *
++ * These three lines were bring-up gpio-hogs in the right-port-host slice
++ * (0014, forcing USB host); they are disabled just below so this driver can
++ * own them, and the driver defaults to usb-host to preserve that behaviour.
++ * usb1_drvvbus (GPIO94) stays a hog — it is VBUS, driven high in both vendor
++ * modes, and is not part of the lane mux.
++ * ============================================================================
++ */
++
++/* Release GPIO70/71/72 from the bring-up hogs so the mux driver can claim them. */
++&sw7226_en_hog {
++	status = "disabled";
++};
++
++&fusb301a_sw_en_hog {
++	status = "disabled";
++};
++
++&fusb301a_sw_sel_hog {
++	status = "disabled";
++};
++
++/ {
++	rightport_mux: rightport-mux {
++		compatible = "planet,gemini-rightport-mux";
++		sw-en-gpios = <&pio 70 GPIO_ACTIVE_HIGH>;
++		sw-sel-gpios = <&pio 71 GPIO_ACTIVE_HIGH>;
++		sw7226-en-gpios = <&pio 72 GPIO_ACTIVE_HIGH>;
++		pinctrl-names = "hdmi", "usb-host";
++		pinctrl-0 = <&rightport_mux_pins>;
++		pinctrl-1 = <&rightport_mux_pins>;
++		/* Default to USB host: preserves the pre-VS2 right-port behaviour. */
++		planet,default-mode = "usb-host";
++	};
++};
++
++&pio {
++	/*
++	 * Right-port mux control pins as plain GPIO function. Both the "hdmi"
++	 * and "usb-host" pinctrl states use this single group: upstream
++	 * pinctrl-mt6797 implements pinmux only (no pinconf/output-value), so
++	 * the two modes are pinmux-identical (all three pins = GPIO function)
++	 * and differ solely in the output VALUES the driver drives on them —
++	 * same convention as the dpi/hdmi pin groups added in VS1. pinmux only:
++	 * bias/drive from the vendor DTS is left as the bootloader set it.
++	 */
++	rightport_mux_pins: rightport-mux-pins {
++		pins-mux {
++			pinmux = <MT6797_GPIO70__FUNC_GPIO70>,
++				 <MT6797_GPIO71__FUNC_GPIO71>,
++				 <MT6797_GPIO72__FUNC_GPIO72>;
++		};
++	};
++};
