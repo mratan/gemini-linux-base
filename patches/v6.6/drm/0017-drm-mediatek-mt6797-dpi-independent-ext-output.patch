@@ -1,0 +1,53 @@
+diff --git a/drivers/gpu/drm/mediatek/mtk_drm_drv.c b/drivers/gpu/drm/mediatek/mtk_drm_drv.c
+index 633612393..b1c0fee35 100644
+--- a/drivers/gpu/drm/mediatek/mtk_drm_drv.c
++++ b/drivers/gpu/drm/mediatek/mtk_drm_drv.c
+@@ -159,6 +159,30 @@ static const unsigned int mt6797_mtk_ddp_main[] = {
+ 	DDP_COMPONENT_DSI0,
+ };
+ 
++/*
++ * External display path (HDMI via the SiI9024A on DPI0), an INDEPENDENT second
++ * output that shares nothing with the primary DSI path above. Per the vendor
++ * 3.18 ddp_path.c external scenario (module_list_scenario DDP_SCENARIO_SUB_...):
++ * OVL1 -> RDMA1 -> DPI, i.e. a separate overlay + RDMA feeding DPI0 (vendor
++ * EXTD_RDMA_DPI mode). This mirrors the MT8173 ext path (OVL1 ... RDMA1 ->
++ * DPI0), the direct mainline template.
++ *
++ * PORTING NOTE (MT8173 template divergence): on MT8173 RDMA1 drives DPI0 via a
++ * direct mmsys mux; on MT6797 DISP_DPI0_SEL_IN offers {UFOE, RDMA0, DSC} and
++ * RDMA1_SOUT offers {UFOE, DSC} (vendor ddp_path.c sel_in_map/sel_out_map), so
++ * the physical RDMA1->DPI hop needs a UFOE (or DSC) pass-through stage that this
++ * minimal path does not yet program. The mmsys ext routing table + that hop are
++ * deferred to the on-device routing slice; the components below are kept
++ * status="disabled" in the DT until then, so this array never builds a CRTC and
++ * the working DSI path is untouched (mtk_drm_crtc_create() skips a path whose
++ * nodes are disabled).
++ */
++static const unsigned int mt6797_mtk_ddp_ext[] = {
++	DDP_COMPONENT_OVL1,
++	DDP_COMPONENT_RDMA1,
++	DDP_COMPONENT_DPI0,
++};
++
+ static const unsigned int mt8183_mtk_ddp_main[] = {
+ 	DDP_COMPONENT_OVL0,
+ 	DDP_COMPONENT_OVL_2L0,
+@@ -291,6 +315,8 @@ static const struct mtk_mmsys_driver_data mt8173_mmsys_driver_data = {
+ static const struct mtk_mmsys_driver_data mt6797_mmsys_driver_data = {
+ 	.main_path = mt6797_mtk_ddp_main,
+ 	.main_len = ARRAY_SIZE(mt6797_mtk_ddp_main),
++	.ext_path = mt6797_mtk_ddp_ext,
++	.ext_len = ARRAY_SIZE(mt6797_mtk_ddp_ext),
+ 	.mmsys_dev_num = 1,
+ };
+ 
+@@ -811,6 +837,8 @@ static const struct of_device_id mtk_ddp_comp_dt_ids[] = {
+ 	  .data = (void *)MTK_DISP_WDMA },
+ 	{ .compatible = "mediatek,mt2701-dpi",
+ 	  .data = (void *)MTK_DPI },
++	{ .compatible = "mediatek,mt6797-dpi",
++	  .data = (void *)MTK_DPI },
+ 	{ .compatible = "mediatek,mt8167-dsi",
+ 	  .data = (void *)MTK_DSI },
+ 	{ .compatible = "mediatek,mt8173-dpi",

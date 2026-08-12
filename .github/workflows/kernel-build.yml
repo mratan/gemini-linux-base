@@ -66,6 +66,49 @@ jobs:
           BUILD_NN="${{ github.run_number }}" \
             ./scripts/build.sh build
 
+      # Track 3 / Slice VS1 (tracker issue #13): DT-binding seam for the new
+      # External-display nodes. Validate the SiI9024A bridge (sil,sii9022 on
+      # I2C3), the MT6797 DPI encoder (mediatek,mt6797-dpi) and the HDMI
+      # connector against their upstream schemas with `dtbs_check`, so wiring
+      # errors surface Device-free. Scoped via DT_SCHEMA_FILES to just these
+      # schemas: the pre-existing MT6797 display nodes (ovl/rdma/dsi/... whose
+      # compatibles are not yet in mainline bindings) are out of this slice's
+      # scope and would otherwise drown the signal. Fails the build if any of
+      # the new nodes reports a schema error.
+      - name: dtbs_check — External-display nodes (sii9022 + mt6797 DPI)
+        run: |
+          python3 -m pip install --break-system-packages --quiet dtschema yamllint
+          # Ensure the dtschema console scripts are reachable; without dt-validate
+          # on PATH `make CHECK_DTBS=y` silently skips validation (a false pass),
+          # so assert it resolves before trusting the gate.
+          export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
+          command -v dt-validate >/dev/null || { echo "dt-validate not found after pip install"; exit 1; }
+          cd "$GITHUB_WORKSPACE/linux-6.6"
+          dtb=arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dtb
+          fail=0
+          for sch in \
+              display/bridge/sil,sii9022.yaml \
+              display/mediatek/mediatek,dpi.yaml \
+              connector/hdmi-connector.yaml ; do
+            echo "== dtbs_check schema: $sch =="
+            rm -f "$dtb"
+            out=$(make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+                       CHECK_DTBS=y DT_SCHEMA_FILES="$sch" \
+                       mediatek/mt6797-gemini-pda.dtb 2>&1)
+            # dtbs_check prints one line per validation failure, tagged with the
+            # offending DTB path + node. Any such line for our DTB is a failure.
+            nodeerr=$(echo "$out" | grep -E "mt6797-gemini-pda\.dtb:.*(dpi@1401e000|hdmi-bridge@39|sii9022|/connector|hdmi_connector)" || true)
+            if [ -n "$nodeerr" ]; then
+              echo "$nodeerr"
+              echo "FAIL: schema errors for new nodes under $sch"
+              fail=1
+            else
+              echo "  ok"
+            fi
+          done
+          if [ "$fail" != 0 ]; then exit 1; fi
+          echo "dtbs_check passed for the new External-display nodes"
+
       # Slices 5 & 9 (tracker issues #6, #10): the vendored connectivity
       # modules — WMT core, BTIF, Wi-Fi chardev and the Gen3 WLAN driver —
       # must compile and pass modpost against the kernel built above, on

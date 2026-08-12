@@ -1,0 +1,76 @@
+diff --git a/arch/arm64/boot/dts/mediatek/mt6797.dtsi b/arch/arm64/boot/dts/mediatek/mt6797.dtsi
+index 672a89d2c..64d05eb67 100644
+--- a/arch/arm64/boot/dts/mediatek/mt6797.dtsi
++++ b/arch/arm64/boot/dts/mediatek/mt6797.dtsi
+@@ -587,6 +587,36 @@ disp_dither0: disp-dither0@14018000 {
+ 		clocks = <&mmsys CLK_MM_DISP_DITHER>;
+ 		status = "disabled";
+ 	};
++		/*
++		 * OVL1 and RDMA1 form the external-display (HDMI/DPI0) pipe,
++		 * independent of the OVL0/RDMA0 primary DSI pipe. Addresses and
++		 * IRQs from the vendor 3.18 dispsys node (mt6797.dts dispsys@
++		 * 14000000): disp_ovl1@1400c000 IRQ GIC_SPI 214, disp_rdma1@
++		 * 14010000 IRQ GIC_SPI 218. Kept disabled until the on-device
++		 * External display slice; the working DSI path never references
++		 * them. Same compat strings as OVL0/RDMA0 (per-SoC, not
++		 * per-instance); the board /aliases disambiguate the instance.
++		 */
++		disp_ovl1: disp-ovl1@1400c000 {
++			compatible = "mediatek,mt6797-disp-ovl";
++			reg = <0 0x1400c000 0 0x1000>;
++			interrupts = <GIC_SPI 214 IRQ_TYPE_LEVEL_LOW>;
++			power-domains = <&scpsys MT6797_POWER_DOMAIN_MM>;
++			clocks = <&mmsys CLK_MM_DISP_OVL1>;
++			mediatek,larb = <&larb0>;
++			status = "disabled";
++		};
++		disp_rdma1: disp-rdma1@14010000 {
++			compatible = "mediatek,mt6797-disp-rdma";
++			reg = <0 0x14010000 0 0x1000>;
++			interrupts = <GIC_SPI 218 IRQ_TYPE_LEVEL_LOW>;
++			power-domains = <&scpsys MT6797_POWER_DOMAIN_MM>;
++			clocks = <&mmsys CLK_MM_DISP_RDMA1>;
++			mediatek,larb = <&larb0>;
++			width-in-pixel = <1440>;
++			fifo-size = <1536>;
++			status = "disabled";
++		};
+ 	mutex: mutex@1401f000 {
+ 		compatible = "mediatek,mt6797-disp-mutex";
+ 		reg = <0 0x1401f000 0 0x1000>;
+@@ -613,6 +643,34 @@ dsi0_out: endpoint {
+ 		};
+ 	};
+ 
++	/*
++	 * DPI0 (parallel RGB) — the External display source feeding the on-board
++	 * SiI9024A HDMI transmitter. reg/IRQ from the vendor dispsys node
++	 * (disp_dpi0@1401e000, IRQ GIC_SPI 231). Clocks: the vendor ddp_dpi.c
++	 * clocks DPI0 from TVDPLL via the dpi0_sel mux, so "pll" = CLK_APMIXED_TVDPLL
++	 * and "pixel" = CLK_MM_DPI_INTERFACE_CLOCK (parent dpi0_sel->TVDPLL, per
++	 * clk-mt6797-mm.c GATE_MM1), "engine" = CLK_MM_DPI_MM_CLOCK (parent mm_sel,
++	 * the register/bus clock). TODO: verify the pixel/engine assignment and
++	 * whether an assigned-clock-parents (dpi0_sel -> a tvdpll divider) is needed
++	 * on hardware. Kept disabled until the on-device External display slice.
++	 */
++	dpi0: dpi@1401e000 {
++		compatible = "mediatek,mt6797-dpi";
++		reg = <0 0x1401e000 0 0x1000>;
++		interrupts = <GIC_SPI 231 IRQ_TYPE_LEVEL_LOW>;
++		power-domains = <&scpsys MT6797_POWER_DOMAIN_MM>;
++		clocks = <&mmsys CLK_MM_DPI_INTERFACE_CLOCK>,
++			 <&mmsys CLK_MM_DPI_MM_CLOCK>,
++			 <&apmixedsys CLK_APMIXED_TVDPLL>;
++		clock-names = "pixel", "engine", "pll";
++		status = "disabled";
++
++		port {
++			dpi0_out: endpoint {
++			};
++		};
++	};
++
+ 	mipi_tx0: mipi-dphy@10215000 {
+ 		compatible = "mediatek,mt6797-mipi-tx";
+ 		reg = <0 0x10215000 0 0x90>;
