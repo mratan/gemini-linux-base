@@ -1,0 +1,96 @@
+# Track 2 (GPU/panfrost) — device-tree schema gate for the Mali GPU node.
+# gemini_linux tracker issue #7.
+#
+# These GPU patches are UNPROVEN by design (no hardware). The acceptance
+# gate is "compiles green + dtbs_check clean + values cited", NOT "GPU
+# works". This workflow is the dtbs_check half of that gate: it builds the
+# Gemini DTB, validates it against the in-tree DT bindings (which include
+# the Mali binding this slice patches), and FAILS if any schema issue
+# references the new GPU-track nodes (the Mali node, its OPP table, or the
+# vgpu supply). Separate workflow so it cannot disturb the shared
+# kernel-build / connectivity CI other tracks depend on.
+#
+# Method: build a schema bundle from Documentation/devicetree/bindings with
+# dt-mk-schema and validate the built .dtb with dt-validate. This is the
+# same engine `make dtbs_check` uses, invoked directly to avoid kbuild's
+# single-dtb CHECK_DTBS target (whose path handling is version-fragile).
+name: gpu-dtbs-check
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  dtbs-check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      ARCH: arm64
+      CROSS_COMPILE: aarch64-linux-gnu-
+    steps:
+      - name: Check out project tree
+        uses: actions/checkout@v4
+
+      - name: Install build + dt-schema dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-aarch64-linux-gnu flex bison bc libssl-dev libelf-dev \
+            kmod cpio rsync python3-pip python3-venv yamllint
+          python3 -m venv "$HOME/dtsvenv"
+          "$HOME/dtsvenv/bin/pip" install --quiet dtschema
+          echo "$HOME/dtsvenv/bin" >> "$GITHUB_PATH"
+
+      - name: Fetch vanilla Linux v6.6 (the pinned kernel base)
+        run: |
+          git clone --depth 1 --branch v6.6 \
+            https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git \
+            "$GITHUB_WORKSPACE/linux-6.6"
+
+      - name: Apply project patches
+        run: |
+          LINUX_SRC="$GITHUB_WORKSPACE/linux-6.6" \
+          PATCHES_DIR="$GITHUB_WORKSPACE/patches/v6.6" \
+            ./scripts/build.sh patch
+
+      - name: Generate .config (defconfig + fragments)
+        run: |
+          LINUX_SRC="$GITHUB_WORKSPACE/linux-6.6" \
+          CONFIG_FRAGMENTS="$GITHUB_WORKSPACE/configs" \
+            ./scripts/build.sh config
+
+      - name: Build the Gemini DTB
+        run: |
+          cd "$GITHUB_WORKSPACE/linux-6.6"
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- dtbs
+
+      - name: Build the in-tree DT-binding schema bundle
+        run: |
+          cd "$GITHUB_WORKSPACE/linux-6.6"
+          dt-validate --version
+          # Bundle every in-tree binding (includes patches/v6.6/gpu/0001's
+          # Mali change and regulator/0001's RT5735 change) so `select`
+          # matching resolves the GPU compatible correctly.
+          dt-mk-schema -j Documentation/devicetree/bindings \
+            > "$GITHUB_WORKSPACE/schemas.json"
+
+      - name: dtbs_check + gate on GPU-track nodes
+        run: |
+          cd "$GITHUB_WORKSPACE/linux-6.6"
+          DTB=arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dtb
+          dt-validate -s "$GITHUB_WORKSPACE/schemas.json" "$DTB" \
+            2>&1 | tee "$GITHUB_WORKSPACE/dtbs_check.log" || true
+          # dt-validate prints "<dtb>: <node> (<compat>): <message>" per
+          # issue. Fail if any references the nodes this slice adds.
+          if grep -E 'gpu@13040000|opp-table-gpu|regulator@60' \
+               "$GITHUB_WORKSPACE/dtbs_check.log"; then
+            echo "::error::dtbs_check reported schema issues on GPU-track nodes"
+            exit 1
+          fi
+          echo "gpu@13040000, opp-table-gpu and regulator@60 are dtbs_check-clean."
+          {
+            echo '## GPU dtbs_check';
+            echo 'No schema issues on the Mali node, its OPP table, or the vgpu supply.';
+          } >> "$GITHUB_STEP_SUMMARY"
