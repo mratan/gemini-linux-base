@@ -95,10 +95,14 @@ candidates="$ROOTDEV$named$other"
 log "candidate partitions:$candidates (image path: $ROOTIMG)"
 
 # --- probe candidates, strictly read-only ----------------------------------
+# ro alone is NOT enough for the safety guarantee: an ext4 ro mount still
+# REPLAYS a dirty journal onto the block device. noload forbids that, so a
+# probe provably writes nothing — on the device, the partition being probed
+# is the one holding the Gemian reference rootfs (ADR-0002).
 found=""
 for dev in $candidates; do
     [ -b "/dev/$dev" ] || { log "/dev/$dev: no such block device"; continue; }
-    if ! mount -o ro "/dev/$dev" /host 2>/dev/null; then
+    if ! mount -o ro,noload "/dev/$dev" /host 2>/dev/null; then
         log "/dev/$dev: not mountable read-only, skipping"
         continue
     fi
@@ -108,7 +112,7 @@ for dev in $candidates; do
         continue
     fi
     log "/dev/$dev: found $ROOTIMG, validating (read-only)"
-    if ! mount -o loop,ro "/host$ROOTIMG" /newroot 2>/dev/null; then
+    if ! mount -o loop,ro,noload "/host$ROOTIMG" /newroot 2>/dev/null; then
         log "/dev/$dev: $ROOTIMG is not a mountable filesystem image"
         umount /host
         continue
@@ -125,9 +129,12 @@ done
 [ -n "$found" ] || rescue "no partition carries a valid $ROOTIMG"
 
 # --- commit: this is the single write-enabling transition ------------------
+# Fresh rw mounts (not remounts): a noload mount cannot be remounted rw, and
+# the rw mount is where any pending journal replay legitimately happens.
 log "/dev/$found validated; committing pivot"
 umount /newroot || rescue "could not release read-only validation mount"
-mount -o remount,rw /host || rescue "host partition will not remount rw"
+umount /host || rescue "could not release read-only probe mount"
+mount "/dev/$found" /host || rescue "host partition will not mount rw"
 mount -o loop "/host$ROOTIMG" /newroot || rescue "rw loop mount failed (host is rw!)"
 [ -x "/newroot$NEWINIT" ] || rescue "lost $NEWINIT after rw mount (host is rw!)"
 
