@@ -47,9 +47,14 @@ devmem_init() {
     return 1
 }
 
-dm() { # dm <addr>  -> prints value or READ-FAILED
+dm() { # dm <addr>  -> prints "0x…" value or READ-FAILED
     [ -n "$DEVMEM" ] || { echo "READ-FAILED"; return 1; }
-    $DEVMEM "$1" 2>/dev/null || echo "READ-FAILED"
+    # normalize output: plain devmem prints "0x00000112"; devmem2 prints
+    # a multi-line "Value at address …: 0x112" -- extract the last hex
+    # token either way so callers can do arithmetic on it.
+    _out=$($DEVMEM "$1" 2>/dev/null) || { echo "READ-FAILED"; return 1; }
+    _v=$(printf '%s\n' "$_out" | grep -oE '0x[0-9A-Fa-f]+' | tail -1)
+    if [ -n "$_v" ]; then echo "$_v"; else echo "READ-FAILED"; return 1; fi
 }
 
 emit() { # emit <seqpoint> <name> <addr> <value>

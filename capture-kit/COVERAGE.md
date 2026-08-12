@@ -14,26 +14,26 @@ sequence points. Line references: `P` = `patches/0002-capture-full-…​.patch`
 
 | Plan row (group / register) | Kernel side | Script side | Notes |
 |---|---|---|---|
-| MCU exec: CONSYS_CPUPCR 0x18070160, ≥32 samples @~1 ms | P:224 (table row), P:428 burst fn, P:484 burst at mcu-reset-release | L:114 (single row), L:201 `cpupcr_burst()` (kernel-hook preferred, devmem fallback) | Burst fires in-kernel at the decisive point (reset-release), 32×`usleep_range(950,1050)`; also operator-triggerable (`cpupcr <tag>`) |
-| Identity: chip ID 0x18070008 (0x0279) | P:222 | L:112 | gated on CONN power (both sides) |
-| Identity: HW_VER (0x18070000, expect 0x8A00) + FW_VER 0x18070004 | P:220–221 | L:110–111 | |
-| Identity: MCU_CFG_ACR 0x18070110 | P:223 | L:113 | |
-| Power: SPM_CONN_PWR_CON **0x1000632C** (golden 0x10D) | P:199 | L:91 | stale 0x10006280 additionally captured (P:200, L:92) per the plan's stale-define-trap note — capture, never poke |
-| Power: SPM_PWR_STATUS 0x10006180 / 2ND 0x10006184 (bit 1) | P:197–198 | L:89–90; also the gate in `conn_powered()` L:63 | |
-| Power: SPM_PWRON_CONFG_EN 0x10006000 | P:196 | L:88 | |
-| Bus protect: INFRA_TOPAXI_PROT_EN 0x10001220 / PROTECTSTA1 0x10001228 (bits 17\|18) | P:201–202 | L:93–94 | |
-| AP↔CONN misc: 0x10001f00 (bit 11 lead) | P:203 | L:95 | also every HARVEST-SNAP line (patch 0001, H35 format) |
-| AP↔CONN misc: TOPCKGEN 0x10001350 sleep mask (bit 8) | P:205 | L:97 | |
-| AP↔CONN misc: WDT SWSYSRST 0x10007018 (bit 12) | P:206; assert/release **events** P:462/P:482 | L:98 | CAPTURE-MCU-RST event lines = the plan's "MCU reset assert/release" event row |
-| EMI: CONSYS_EMI_MAPPING 0x10001340 | P:204 | L:96 | |
+| MCU exec: CONSYS_CPUPCR 0x18070160, ≥32 samples @~1 ms | P:224 (table row), P:428 burst fn, P:484 burst at mcu-reset-release | L:119 (single row), L:206 `cpupcr_burst()` (kernel-hook preferred, devmem fallback) | Burst fires in-kernel at the decisive point (reset-release), 32×`usleep_range(950,1050)`; also operator-triggerable (`cpupcr <tag>`) |
+| Identity: chip ID 0x18070008 (0x0279) | P:222 | L:117 | gated on CONN power (both sides) |
+| Identity: HW_VER (0x18070000, expect 0x8A00) + FW_VER 0x18070004 | P:220–221 | L:115–116 | |
+| Identity: MCU_CFG_ACR 0x18070110 | P:223 | L:118 | |
+| Power: SPM_CONN_PWR_CON **0x1000632C** (golden 0x10D) | P:199 | L:96 | stale 0x10006280 additionally captured (P:200, L:97) per the plan's stale-define-trap note — capture, never poke |
+| Power: SPM_PWR_STATUS 0x10006180 / 2ND 0x10006184 (bit 1) | P:197–198 | L:94–95; also the gate in `conn_powered()` L:68 | |
+| Power: SPM_PWRON_CONFG_EN 0x10006000 | P:196 | L:93 | |
+| Bus protect: INFRA_TOPAXI_PROT_EN 0x10001220 / PROTECTSTA1 0x10001228 (bits 17\|18) | P:201–202 | L:98–99 | |
+| AP↔CONN misc: 0x10001f00 (bit 11 lead) | P:203 | L:100 | also every HARVEST-SNAP line (patch 0001, H35 format) |
+| AP↔CONN misc: TOPCKGEN 0x10001350 sleep mask (bit 8) | P:205 | L:102 | |
+| AP↔CONN misc: WDT SWSYSRST 0x10007018 (bit 12) | P:206; assert/release **events** P:462/P:482 | L:103 | CAPTURE-MCU-RST event lines = the plan's "MCU reset assert/release" event row |
+| EMI: CONSYS_EMI_MAPPING 0x10001340 | P:204 | L:101 | |
 | EMI: reserved-memory phys base | `CAPTURE-EMI: … gConEmiPhyBase` (P:~340) | — (kernel only; not a devmem-reachable symbol) | |
-| EMI: hash/first-64-bytes of 343 KB ctrl window | P:333–357: CRC32 over 343 KiB + 64-byte hexdump | L:178–190: first 64 bytes via devmem | kernel gives the hash; script gives an independent word-level read |
-| BTIF: full block 0x1100C000 — IER, IIR, FIFOCTRL, LSR, FAKELCR, SLEEP_EN, DMA_EN, RTOCNT, TRI_LVL (golden 0x18), WAK +0x64, WAT_TIME, HANDSHAKE (golden 0x3) | P:233–243 | L:127–146 | FIFOCTRL is write-only (shares 0x8 with IIR on read) — recorded as `BTIF_IIR_FIFOCTRL`, documented in both sources |
-| BTIF: DMA enables | BTIF_DMA_EN P:238 + APDMA TX/RX EN + INT_EN P:246–249 | L:132, L:152–160 | APDMA rows gated on CLK_INFRA_AP_DMA (INFRA_CG_STA1 bit 18) |
-| BTIF: CLK_INFRA_BTIF gate state | INFRA_CG_STA0 0x10001090 row (P:207-area) + gating logic | L:70 `btif_ungated()`, row L:99 | gate register itself captured, per "capture, don't re-poke" |
-| Clock/XO: PMIC DCXO CW00 (bit 5 XO_WCN) | P:257 via `pwrap_read` | L:165 → delegated to kernel hook (devmem cannot reach pwrap targets) | the row the plan's kernel-side hook requirement exists for |
-| Clock/XO: pwrap DCXO_CONN bridge regs | P:209–213 | L:100–104 | |
-| Clock/XO: VCN LDO states (MT6351 0x0A52/0x0A0C/0x0A92) + RG_VCN28_ON_CTRL | P:258–260 (`pwrap_read`; ON_CTRL bit lives in LDO_VCN28_CON0, comment P:259) | L:165–174 → kernel hook | addresses verified against `upmu_hw.h` in the gemian tree |
+| EMI: hash/first-64-bytes of 343 KB ctrl window | P:333–357: CRC32 over 343 KiB + 64-byte hexdump | L:183–197: first 64 bytes via devmem | kernel gives the hash; script gives an independent word-level read |
+| BTIF: full block 0x1100C000 — IER, IIR, FIFOCTRL, LSR, FAKELCR, SLEEP_EN, DMA_EN, RTOCNT, TRI_LVL (golden 0x18), WAK +0x64, WAT_TIME, HANDSHAKE (golden 0x3) | P:233–243 | L:132–151 | FIFOCTRL is write-only (shares 0x8 with IIR on read) — recorded as `BTIF_IIR_FIFOCTRL`, documented in both sources |
+| BTIF: DMA enables | BTIF_DMA_EN P:238 + APDMA TX/RX EN + INT_EN P:246–249 | L:137, L:157–165 | APDMA rows gated on CLK_INFRA_AP_DMA (INFRA_CG_STA1 bit 18) |
+| BTIF: CLK_INFRA_BTIF gate state | INFRA_CG_STA0 0x10001090 row (P:207-area) + gating logic | L:75 `btif_ungated()`, row L:104 | gate register itself captured, per "capture, don't re-poke" |
+| Clock/XO: PMIC DCXO CW00 (bit 5 XO_WCN) | P:257 via `pwrap_read` | L:170 → delegated to kernel hook (devmem cannot reach pwrap targets) | the row the plan's kernel-side hook requirement exists for |
+| Clock/XO: pwrap DCXO_CONN bridge regs | P:209–213 | L:105–109 | |
+| Clock/XO: VCN LDO states (MT6351 0x0A52/0x0A0C/0x0A92) + RG_VCN28_ON_CTRL | P:258–260 (`pwrap_read`; ON_CTRL bit lives in LDO_VCN28_CON0, comment P:259) | L:170–179 → kernel hook | addresses verified against `upmu_hw.h` in the gemian tree |
 | Timing: uptime timestamps of power-on, MCU reset release, first BTIF TX, first RX byte | printk timestamps on: reg_ctrl entry (HARVEST-SNAP + CAPTURE-SNAP-BEGIN), CAPTURE-MCU-RST release (P:482), HARVEST-BTIF-TX / HARVEST-BTIF-RX first lines (patch 0001) | dmesg harvested by every capture script | golden latency reference: ROM answers ~50 ms after release |
 
 ## Sequence points ("sampled at defined sequence points, not just once")
