@@ -1,0 +1,4 @@
+# build outputs — CI produces these; only sources live in git
+build/
+# binaries staged into the overlay by `make install` (CI artifact carries them)
+rootfs-overlay/usr/sbin/

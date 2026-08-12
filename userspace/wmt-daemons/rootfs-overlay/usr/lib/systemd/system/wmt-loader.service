@@ -1,0 +1,25 @@
+# WMT bring-up step 1 of 2 — mirrors the vendor (Android init.rc) order:
+# wmt_loader runs once, before wmt_launcher, to read the CONSYS SoC chip id
+# from /dev/wmtdetect and publish it to the WMT stub; wmt_launcher's chip-id
+# query returns this value.
+#
+# INERT BY DEFAULT: shipped disabled, no [Install]-time enablement is
+# performed by Slice 10 assembly. See the README next to this unit.
+
+[Unit]
+Description=MediaTek WMT loader (CONSYS chip-id handshake)
+# The connectivity kernel modules create /dev/wmtdetect; modprobe them first
+# in the supervised bring-up session (or add a modules-load.d entry then).
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/wmt_loader
+# The daemon itself bounds its wait for /dev/wmtdetect (default 10 s,
+# override with WMT_DEV_WAIT_SEC); keep a generous outer bound anyway.
+TimeoutStartSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

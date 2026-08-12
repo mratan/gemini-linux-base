@@ -1,0 +1,24 @@
+# WMT bring-up step 2 of 2 — mirrors the vendor (Android init.rc) order:
+# wmt_launcher starts after wmt_loader succeeded and then stays up servicing
+# kernel WMT upcalls (STP mode set, ROM-patch search on "srh_patch").
+# -p points at the staged firmware dir (/lib/firmware carries the WMT ROM
+# patches, WIFI_RAM_CODE_6797 and WMT_SOC.cfg per 04-docs/PAYLOAD-CATALOG.md;
+# Android used /vendor/firmware).
+#
+# INERT BY DEFAULT: shipped disabled, no [Install]-time enablement is
+# performed by Slice 10 assembly. See the README next to this unit.
+
+[Unit]
+Description=MediaTek WMT launcher (STP config + ROM patch offer)
+Requires=wmt-loader.service
+After=wmt-loader.service
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/wmt_launcher -p /lib/firmware
+Restart=no
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

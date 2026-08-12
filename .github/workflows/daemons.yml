@@ -1,0 +1,60 @@
+# Slice 7 (issue #8): native WMT daemons — build, unit-test, smoke-test.
+# Scoped to this slice's branch; deliberately does NOT touch the kernel
+# workflows (kernel-build.yml, packaging.yml) and runs no kernel build.
+name: wmt-daemons
+
+on:
+  push:
+    branches: [slice7-daemons]
+  workflow_dispatch:
+
+jobs:
+  daemons:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: userspace/wmt-daemons
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cross toolchain and qemu-user
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -qy gcc-aarch64-linux-gnu qemu-user-static
+
+      - name: Host unit tests (parse logic, x86)
+        run: make test
+
+      - name: Cross-build daemons (aarch64 glibc)
+        run: |
+          make all
+          file build/wmt_loader build/wmt_launcher
+          file build/wmt_loader | grep -q 'ARM aarch64'
+          file build/wmt_launcher | grep -q 'ARM aarch64'
+
+      - name: Graceful-failure smoke test (qemu-user aarch64, no dev nodes)
+        run: |
+          ./tests/smoke-no-devnodes.sh build \
+            qemu-aarch64-static -L /usr/aarch64-linux-gnu
+
+      - name: Stage rootfs overlay
+        run: |
+          make install DESTDIR=rootfs-overlay
+          # sanity: units + binaries all present in the overlay
+          test -f rootfs-overlay/usr/sbin/wmt_loader
+          test -f rootfs-overlay/usr/sbin/wmt_launcher
+          test -f rootfs-overlay/usr/lib/systemd/system/wmt-loader.service
+          test -f rootfs-overlay/usr/lib/systemd/system/wmt-launcher.service
+          # inert-by-default: no enablement symlinks may sneak in
+          test ! -d rootfs-overlay/etc/systemd/system/multi-user.target.wants
+          sha256sum rootfs-overlay/usr/sbin/wmt_loader rootfs-overlay/usr/sbin/wmt_launcher
+
+      - name: Upload artifact (Slice 10 input)
+        uses: actions/upload-artifact@v4
+        with:
+          name: wmt-daemons-rootfs-overlay
+          path: |
+            userspace/wmt-daemons/rootfs-overlay/
+            userspace/wmt-daemons/PROVENANCE.md
+            userspace/wmt-daemons/README.md
+          if-no-files-found: error
