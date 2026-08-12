@@ -115,14 +115,17 @@ cat /etc/gemini-experimental-release 2>/dev/null
 EOF
 
 # Overlays (Slice 10): copy each --overlay tree over the staging root,
-# root-owned. -d preserves symlinks (e.g. modules_install's tree); mode and
-# timestamps are preserved but ownership becomes root (this script runs as
-# root), so mkfs.ext4 -d records root:root regardless of the overlay's on-disk
-# ownership. Overlays are applied in the order given; later ones win.
+# root-owned. tar (not cp) so that overlaying e.g. lib/modules or lib/firmware
+# extracts THROUGH the merged-usr symlinks (`/lib` -> `usr/lib`) instead of
+# trying to replace the symlink with a directory (--keep-directory-symlink);
+# symlinks and modes inside the overlay are preserved, and extracting as root
+# yields root:root regardless of the overlay's on-disk ownership, so
+# mkfs.ext4 -d records root:root. Overlays are applied in order; later wins.
 for ov in ${OVERLAYS[@]+"${OVERLAYS[@]}"}; do
     [ -d "$ov" ] || { echo "overlay dir not found: $ov" >&2; exit 1; }
     echo "==> [2b/4] overlay: $ov -> rootfs"
-    cp -dR --preserve=mode,timestamps "$ov/." "$TARGET/"
+    ( cd "$ov" && tar -cf - . ) \
+        | tar -C "$TARGET" --keep-directory-symlink -xf -
 done
 
 echo "==> [3/4] Pack ext4 loop image"
