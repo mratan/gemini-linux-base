@@ -1,0 +1,71 @@
+diff --git a/arch/arm64/boot/dts/mediatek/Makefile b/arch/arm64/boot/dts/mediatek/Makefile
+index ffe1ab530..da64c2233 100644
+--- a/arch/arm64/boot/dts/mediatek/Makefile
++++ b/arch/arm64/boot/dts/mediatek/Makefile
+@@ -6,6 +6,7 @@ dtb-$(CONFIG_ARCH_MEDIATEK) += mt6795-evb.dtb
+ dtb-$(CONFIG_ARCH_MEDIATEK) += mt6795-sony-xperia-m5.dtb
+ dtb-$(CONFIG_ARCH_MEDIATEK) += mt6797-evb.dtb
+ dtb-$(CONFIG_ARCH_MEDIATEK) += mt6797-gemini-pda.dtb
++dtb-$(CONFIG_ARCH_MEDIATEK) += mt6797-gemini-pda-hdmi.dtb
+ dtb-$(CONFIG_ARCH_MEDIATEK) += mt6797-x20-dev.dtb
+ dtb-$(CONFIG_ARCH_MEDIATEK) += mt7622-rfb1.dtb
+ dtb-$(CONFIG_ARCH_MEDIATEK) += mt7622-bananapi-bpi-r64.dtb
+diff --git a/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda-hdmi.dts b/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda-hdmi.dts
+new file mode 100644
+index 000000000..ce4ec8574
+--- /dev/null
++++ b/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda-hdmi.dts
+@@ -0,0 +1,53 @@
++// SPDX-License-Identifier: (GPL-2.0 OR MIT)
++/*
++ * Gemini PDA — OPT-IN External-display (HDMI) bring-up variant.
++ *
++ * Track 3 / Slice VS1b. This is a SEPARATE, explicitly opt-in device tree: the
++ * default mt6797-gemini-pda.dtb keeps the whole HDMI/DPI pipe disabled and the
++ * internal DSI panel path untouched. Flash/boot THIS dtb instead only to bring
++ * up the external display.
++ *
++ * It enables the independent second DDP pipe
++ *
++ *	OVL1 -> RDMA1 -> DSC0 (bypass) -> DPI0 -> SiI9024A (sii9022) -> HDMI
++ *
++ * which mediatek-drm then instantiates as a second CRTC. The RDMA1->DPI0 hop
++ * runs through the DSC block in bypass mode because MT6797 has no direct
++ * RDMA1->DPI0 mux (see mt6797_mtk_ddp_ext[] / mmsys_mt6797_routing_table[]).
++ *
++ * The base board .dts is included verbatim; this file only overrides the
++ * status of the external-display components to "okay". Nothing in the internal
++ * panel path is referenced, so the working DSI display is unaffected.
++ */
++
++#include "mt6797-gemini-pda.dts"
++
++/ {
++	model = "Planet Computers Gemini PDA (HDMI bring-up)";
++};
++
++/* External-display DDP pipe: overlay + RDMA + DSC bypass hop + DPI encoder. */
++&disp_ovl1 {
++	status = "okay";
++};
++
++&disp_rdma1 {
++	status = "okay";
++};
++
++&disp_dsc0 {
++	status = "okay";
++};
++
++&dpi0 {
++	status = "okay";
++};
++
++/* SiI9024A HDMI transmitter and the HDMI receptacle it drives. */
++&sii9022 {
++	status = "okay";
++};
++
++&hdmi_connector {
++	status = "okay";
++};

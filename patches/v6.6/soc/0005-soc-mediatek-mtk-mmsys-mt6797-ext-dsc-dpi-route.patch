@@ -1,0 +1,58 @@
+diff --git a/drivers/soc/mediatek/mtk-mmsys.c b/drivers/soc/mediatek/mtk-mmsys.c
+index 7c1956a97..576d2097b 100644
+--- a/drivers/soc/mediatek/mtk-mmsys.c
++++ b/drivers/soc/mediatek/mtk-mmsys.c
+@@ -73,6 +73,30 @@ static const struct mtk_mmsys_driver_data mt6795_mmsys_driver_data = {
+ #define MT6797_OVL0_SOUT_OVL0_VIRTUAL		0x0
+ #define MT6797_OVL0_SEL_IN_OVL0_2L		0x0
+ 
++/*
++ * External-display (HDMI/DPI0) path muxes: OVL1 -> RDMA1 -> DSC -> DPI0
++ * (Slice VS1b). Register offsets from the vendor 3.18 ddp_reg.h, values from
++ * ddp_path.c mout_map/sel_out_map/sel_in_map. sel_in/sel_out registers take
++ * the array INDEX of the chosen source/sink (ddp_connect_path_l writes
++ * (uint16_t)k); mout registers take the OR of the per-sink bit masks.
++ *
++ * There is no direct RDMA1->DPI0 edge on MT6797; the DSC block is used as a
++ * bypass pass-through hop (see mt6797_mtk_ddp_ext[] in mtk_drm_drv.c for why
++ * DSC and not UFOE). DSC config/bypass programming is in the DSC component
++ * (mtk_dsc_config, DISP_REG_DSC_CON); these entries only wire the muxes.
++ */
++#define MT6797_DISP_OVL1_MOUT_EN		0x038
++#define MT6797_DISP_DSC_MOUT_EN			0x044
++#define MT6797_DISP_DSC_SEL_IN			0x078
++#define MT6797_DPI0_SEL_IN			0x084
++#define MT6797_DISP_RDMA1_SOUT_SEL_IN		0x094
++
++#define MT6797_OVL1_MOUT_EN_RDMA1		BIT(0)	/* mout_map[1]: OVL1->RDMA1 = 1<<0 */
++#define MT6797_RDMA1_SOUT_DSC			0x1	/* sel_out_map[4] {UFOE=0,DSC=1} */
++#define MT6797_DSC_SEL_IN_RDMA1			0x1	/* sel_in_map[4] {PATH0=0,RDMA1=1} */
++#define MT6797_DSC_MOUT_EN_DPI0			BIT(2)	/* mout_map[4]: DSC->DPI = 1<<2 */
++#define MT6797_DPI0_SEL_IN_DSC			0x2	/* sel_in_map[9] {UFOE=0,RDMA0=1,DSC=2} */
++
+ static const struct mtk_mmsys_routes mmsys_mt6797_routing_table[] = {
+ 	{
+ 		DDP_COMPONENT_OVL_2L0, DDP_COMPONENT_COLOR0,
+@@ -95,6 +119,22 @@ static const struct mtk_mmsys_routes mmsys_mt6797_routing_table[] = {
+ 	}, {
+ 		DDP_COMPONENT_RDMA0, DDP_COMPONENT_DSI0,
+ 		MT6797_DSI0_SEL_IN, 0x7, MT6797_DSI0_SEL_IN_RDMA0
++	}, {
++		/* External path OVL1 -> RDMA1 -> DSC0 -> DPI0 (Slice VS1b) */
++		DDP_COMPONENT_OVL1, DDP_COMPONENT_RDMA1,
++		MT6797_DISP_OVL1_MOUT_EN, 0x7, MT6797_OVL1_MOUT_EN_RDMA1
++	}, {
++		DDP_COMPONENT_RDMA1, DDP_COMPONENT_DSC0,
++		MT6797_DISP_RDMA1_SOUT_SEL_IN, 0x1, MT6797_RDMA1_SOUT_DSC
++	}, {
++		DDP_COMPONENT_RDMA1, DDP_COMPONENT_DSC0,
++		MT6797_DISP_DSC_SEL_IN, 0x1, MT6797_DSC_SEL_IN_RDMA1
++	}, {
++		DDP_COMPONENT_DSC0, DDP_COMPONENT_DPI0,
++		MT6797_DISP_DSC_MOUT_EN, 0xf, MT6797_DSC_MOUT_EN_DPI0
++	}, {
++		DDP_COMPONENT_DSC0, DDP_COMPONENT_DPI0,
++		MT6797_DPI0_SEL_IN, 0x3, MT6797_DPI0_SEL_IN_DSC
+ 	},
+ };
+ 
