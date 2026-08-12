@@ -27,3 +27,7 @@ FlashToolLinux/history.ini
 # Claude local settings
 .claude/settings.local.json
 docs/firmware-consys/
+
+# capture-kit (issue #9): staging holds the Gemian ramdisk + packed boot
+# image (firmware-adjacent blobs, never committed)
+capture-kit/staging/

@@ -1,0 +1,42 @@
+# Period toolchain for the gemian native 3.18.41 kernel (Reference-slot lineage).
+#
+# Why Debian stretch: the gemian tree's own debian/changelog targets
+# "stretch" and debian/rules builds with the distro default compiler --
+# i.e. the shipped Gemian kernel lineage was built with Debian stretch
+# GCC 6.3.  gcc-aarch64-linux-gnu 6.3.0 from the stretch archive is the
+# same compiler version as a cross toolchain, so this container is
+# period-equivalent to the environment that produced the Reference
+# slot's kernel.  Kernel 3.18 does not build with modern GCC without
+# invasive patches (see mirrored bsg100 kali-harvest-plan.md for what
+# GCC 14 required); we deliberately avoid all of that.
+#
+# Base image: docker.io/debian/eol:stretch (Docker's official EOL
+# archive image; apt sources preconfigured for archive.debian.org).
+# Pin by digest for reproducibility -- record the digest you pulled in
+# capture-kit/BUILD-EVIDENCE.md.  Package integrity: apt verifies every
+# .deb against the SHA256 hashes in the signed archive.debian.org
+# Packages/Release files (Debian archive signing key, checked by apt in
+# the base image).
+FROM docker.io/debian/eol:stretch
+
+# Toolchain + the exact build deps the gemian debian/control lists
+# (python, bc) plus standard kbuild needs.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        gcc-aarch64-linux-gnu \
+        bc \
+        perl \
+        python \
+        kmod \
+        cpio \
+        xz-utils \
+        file \
+    && apt-get clean
+
+# Record toolchain identity inside the image for later audit.
+RUN aarch64-linux-gnu-gcc --version | head -1 > /toolchain-id.txt && \
+    dpkg-query -W -f='${Package} ${Version}\n' \
+        gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu make bc perl python2.7 \
+        >> /toolchain-id.txt && cat /toolchain-id.txt
+
+WORKDIR /src
