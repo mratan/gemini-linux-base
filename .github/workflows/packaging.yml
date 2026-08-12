@@ -50,8 +50,13 @@ jobs:
 
       - name: Fetch stock Debian arm64 kernel + static busybox (QEMU proof bits)
         run: |
+          set -o pipefail   # a failure in the script must not be masked by tee
           sudo bash scripts/ci/fetch-qemu-boot-bits.sh "$RUNNER_TEMP/deb-extract" \
             | tee -a "$GITHUB_ENV"
+          # the env vars must actually be present and valid
+          grep -q '^MODULES_BASE=..*' "$GITHUB_ENV"
+          grep -q '^VMLINUZ=..*' "$GITHUB_ENV"
+          grep -q '^BUSYBOX=..*' "$GITHUB_ENV"
 
       - name: Collect virtio/ext4/loop modules for the QEMU initramfs
         run: |

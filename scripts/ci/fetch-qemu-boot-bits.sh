@@ -22,13 +22,26 @@ mmdebstrap --variant=extract --architectures=arm64 \
     --include=busybox-static,linux-image-arm64 \
     "$SUITE" "$DIR" "$MIRROR" >&2
 
-VMLINUZ="$(ls "$DIR"/boot/vmlinuz-*-arm64 | sort -V | tail -1)"
+VMLINUZ="$(ls "$DIR"/boot/vmlinuz-*-arm64 2>/dev/null | sort -V | tail -1)"
 MODULES_BASE="$(ls -d "$DIR"/usr/lib/modules/*-arm64 "$DIR"/lib/modules/*-arm64 2>/dev/null | sort -V | tail -1)"
 BUSYBOX="$DIR/usr/bin/busybox"
 [ -x "$BUSYBOX" ] || BUSYBOX="$DIR/bin/busybox"
 
-[ -f "$VMLINUZ" ] || { echo "no vmlinuz found under $DIR/boot" >&2; exit 1; }
-[ -f "$MODULES_BASE/modules.dep" ] || { echo "no modules.dep under $MODULES_BASE" >&2; exit 1; }
+[ -n "$VMLINUZ" ] && [ -f "$VMLINUZ" ] || { echo "no vmlinuz found under $DIR/boot" >&2; ls "$DIR/boot" >&2 || true; exit 1; }
+[ -n "$MODULES_BASE" ] || { echo "no modules dir found under $DIR" >&2; exit 1; }
+
+# The extract variant unpacks debs without running maintainer scripts, so
+# depmod never ran and modules.dep does not exist — generate it here. The
+# host depmod handles foreign-arch (arm64) modules fine; without the
+# kernel's System.map it warns about unresolved kernel symbols but still
+# records the module-to-module dependencies we need.
+if [ ! -f "$MODULES_BASE/modules.dep" ]; then
+    KVER="$(basename "$MODULES_BASE")"
+    BASEDIR="${MODULES_BASE%/lib/modules/*}"
+    echo "running depmod -b $BASEDIR $KVER (modules.dep missing in extract)" >&2
+    depmod -b "$BASEDIR" "$KVER" 2>/dev/null || true
+fi
+[ -f "$MODULES_BASE/modules.dep" ] || { echo "no modules.dep under $MODULES_BASE (depmod failed)" >&2; exit 1; }
 [ -f "$BUSYBOX" ] || { echo "no busybox binary found in extract" >&2; exit 1; }
 file "$BUSYBOX" >&2 || true
 
