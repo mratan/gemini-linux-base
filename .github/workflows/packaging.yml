@@ -46,7 +46,9 @@ jobs:
             arch-test debian-archive-keyring gdisk e2fsprogs zstd xz-utils kmod
 
       - name: Build Debian 13 arm64 loop-image rootfs (experimental.img)
-        run: sudo scripts/mkrootfs-loop.sh --out out/experimental.img
+        run: |
+          mkdir -p out   # created unprivileged so later non-sudo steps can write here
+          sudo scripts/mkrootfs-loop.sh --out out/experimental.img
 
       - name: Fetch stock Debian arm64 kernel + static busybox (QEMU proof bits)
         run: |
