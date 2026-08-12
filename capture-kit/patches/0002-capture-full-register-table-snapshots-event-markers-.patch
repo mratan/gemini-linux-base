@@ -1,0 +1,498 @@
+From 3c9d6dcd91dd4d58b7db453f92b29b15a2b02b0e Mon Sep 17 00:00:00 2001
+From: mratan <mattdratan@gmail.com>
+Date: Wed, 12 Aug 2026 09:53:42 -0700
+Subject: [PATCH 2/3] capture: full register-table snapshots + event markers
+ (divergence plan)
+
+Implements every row of DIVERGENCE-DEBUG-PLAN.md's 'What a
+Pre-firmware capture must record' table as kernel-side reads, emitted
+in a normalized field-per-line format (CAPTURE-REG / CAPTURE-PMIC /
+CAPTURE-CPUPCR / CAPTURE-EMI) at the plan's sequence points inside the
+vendor CONSYS bring-up:
+
+- mtk_wcn_consys_hw.c: wmt_capture_regtable() reads the full table
+  (AP-side SPM/INFRA/TOPCKGEN/WDT/pwrap-bridge regs always; CONN-side
+  chip-ID/HW_VER/ACR/CPUPCR gated on SPM_PWR_STATUS+2ND bit1, the
+  bsg100-H16 DEVAPC lesson; BTIF block gated on CLK_INFRA_BTIF, APDMA
+  on CLK_INFRA_AP_DMA; MT6351 VCN LDOs + DCXO_CW00 via exported
+  pwrap_read -- the rows devmem cannot reach; CONSYS EMI ctrl-window
+  CRC32 + first 64 bytes). wmt_capture_cpupcr_burst() takes the >=32
+  samples at ~1ms the plan demands. Hooked at reg_ctrl entry/off,
+  pre-chipid-poll, mcu-reset-release (incl. burst -- the exact window
+  bsg100 never captured) and after-reg-ctrl-on, plus CAPTURE-MCU-RST
+  assert/release event lines at the WDT swsysrst writes.
+- wmt_core.c: per-step CAPTURE-INIT start/result lines for every
+  init_table_* script step (PASS / TX-FAIL / RX-FAIL / EVT-MISMATCH).
+- stp_core.c: CAPTURE-STP-MODE line on every mand<->full transition.
+- btif_plat.c: CAPTURE-BTIF-INIT full host-register dump at
+  hal_btif_hw_init, CAPTURE-BTIF-FIFO-CLR markers at FIFO clears.
+
+All reads; the only writes are printk. Compiles clean with the period
+GCC 6.3 stretch container (banner #1 SMP PREEMPT, symbols verified in
+System.map).
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ drivers/misc/mediatek/btif/common/btif_plat.c |  14 +
+ .../common/common_main/core/stp_core.c        |   4 +
+ .../common/common_main/core/wmt_core.c        |   9 +
+ .../common_main/mt6797/mtk_wcn_consys_hw.c    | 296 ++++++++++++++++++
+ 4 files changed, 323 insertions(+)
+
+diff --git a/drivers/misc/mediatek/btif/common/btif_plat.c b/drivers/misc/mediatek/btif/common/btif_plat.c
+index e1fe1454f..4a8b58d6b 100644
+--- a/drivers/misc/mediatek/btif/common/btif_plat.c
++++ b/drivers/misc/mediatek/btif/common/btif_plat.c
+@@ -494,10 +494,12 @@ int hal_btif_hw_init(P_MTK_BTIF_INFO_STR p_btif)
+ /*disable internal loopback test*/
+ 
+ /*set Rx FIFO clear bit to 1*/
++	pr_info("CAPTURE-BTIF-FIFO-CLR: rx (hw_init)\n");
+ 	BTIF_SET_BIT(BTIF_FIFOCTRL(base), BTIF_FIFOCTRL_CLR_RX);
+ /*clear Rx FIFO clear bit to 0*/
+ 	BTIF_CLR_BIT(BTIF_FIFOCTRL(base), BTIF_FIFOCTRL_CLR_RX);
+ /*set Tx FIFO clear bit to 1*/
++	pr_info("CAPTURE-BTIF-FIFO-CLR: tx (hw_init)\n");
+ 	BTIF_SET_BIT(BTIF_FIFOCTRL(base), BTIF_FIFOCTRL_CLR_TX);
+ /*clear Tx FIFO clear bit to 0*/
+ 	BTIF_CLR_BIT(BTIF_FIFOCTRL(base), BTIF_FIFOCTRL_CLR_TX);
+@@ -517,6 +519,16 @@ int hal_btif_hw_init(P_MTK_BTIF_INFO_STR p_btif)
+ /*enable Rx IER by default*/
+ 	hal_btif_rx_ier_ctrl(p_btif, true);
+ 
++	/* CAPTURE: full BTIF host register state right after the vendor's
++	 * own hw init -- the CONN-side peer init reference the divergence
++	 * plan wants (diffs against the ported stack's BTIF init). */
++	pr_info("CAPTURE-BTIF-INIT: IER=0x%08x IIR=0x%08x FAKELCR=0x%08x LSR=0x%08x SLEEP_EN=0x%08x DMA_EN=0x%08x RTOCNT=0x%08x TRI_LVL=0x%08x WAT_TIME=0x%08x HANDSHAKE=0x%08x\n",
++		BTIF_READ32(BTIF_IER(base)), BTIF_READ32(BTIF_IIR(base)),
++		BTIF_READ32(BTIF_FAKELCR(base)), BTIF_READ32(BTIF_LSR(base)),
++		BTIF_READ32(BTIF_SLEEP_EN(base)), BTIF_READ32(BTIF_DMA_EN(base)),
++		BTIF_READ32(BTIF_RTOCNT(base)), BTIF_READ32(BTIF_TRI_LVL(base)),
++		BTIF_READ32(BTIF_WAT_TIME(base)), BTIF_READ32(BTIF_HANDSHAKE(base)));
++
+ 	i_ret = 0;
+ 	return i_ret;
+ }
+@@ -656,6 +668,7 @@ static int btif_rx_fifo_reset(P_MTK_BTIF_INFO_STR p_btif)
+ 	unsigned long base = p_btif->base;
+ 
+ /*set Rx FIFO clear bit to 1*/
++	pr_info("CAPTURE-BTIF-FIFO-CLR: rx (fifo_reset)\n");
+ 	BTIF_SET_BIT(BTIF_FIFOCTRL(base), BTIF_FIFOCTRL_CLR_RX);
+ 
+ /*clear Rx FIFO clear bit to 0*/
+@@ -683,6 +696,7 @@ static int btif_tx_fifo_reset(P_MTK_BTIF_INFO_STR p_btif)
+ 	unsigned long base = p_btif->base;
+ 
+ /*set Tx FIFO clear bit to 1*/
++	pr_info("CAPTURE-BTIF-FIFO-CLR: tx (fifo_reset)\n");
+ 	BTIF_SET_BIT(BTIF_FIFOCTRL(base), BTIF_FIFOCTRL_CLR_TX);
+ 
+ /*clear Tx FIFO clear bit to 0*/
+diff --git a/drivers/misc/mediatek/connectivity/common/common_main/core/stp_core.c b/drivers/misc/mediatek/connectivity/common/common_main/core/stp_core.c
+index bfba57cc9..abd3e4bd8 100644
+--- a/drivers/misc/mediatek/connectivity/common/common_main/core/stp_core.c
++++ b/drivers/misc/mediatek/connectivity/common/common_main/core/stp_core.c
+@@ -3008,6 +3008,10 @@ EXPORT_SYMBOL(mtk_wcn_stp_is_rxqueue_empty);
+ 
+ void mtk_wcn_stp_set_mode(UINT32 mode)
+ {
++	/* CAPTURE: mand <-> full mode transitions (divergence-debug plan
++	 * event instrumentation). Bit meanings: see the mode helpers below. */
++	pr_info("CAPTURE-STP-MODE: old=0x%08x new=0x%08x\n",
++		STP_SUPPORT_PROTOCOL(stp_core_ctx), mode);
+ 	STP_SET_SUPPORT_PROTOCOL(stp_core_ctx, mode);
+ 	STP_DBG_FUNC("STP_SUPPORT_PROTOCOL = %08x\n", STP_SUPPORT_PROTOCOL(stp_core_ctx));
+ }
+diff --git a/drivers/misc/mediatek/connectivity/common/common_main/core/wmt_core.c b/drivers/misc/mediatek/connectivity/common/common_main/core/wmt_core.c
+index 3aa3bebdb..f8724e234 100644
+--- a/drivers/misc/mediatek/connectivity/common/common_main/core/wmt_core.c
++++ b/drivers/misc/mediatek/connectivity/common/common_main/core/wmt_core.c
+@@ -648,12 +648,15 @@ INT32 wmt_core_init_script(struct init_script *script, INT32 count)
+ 
+ 	for (i = 0; i < count; i++) {
+ 		WMT_DBG_FUNC("WMT-CORE: init_script operation %s start\n", script[i].str);
++		pr_info("CAPTURE-INIT: step=\"%s\" start\n", script[i].str);
+ 		/* CMD */
+ 		/* iRet = (*kal_stp_tx)(script[i].cmd, script[i].cmdSz, &u4Res); */
+ 		iRet = wmt_core_tx(script[i].cmd, script[i].cmdSz, &u4Res, MTK_WCN_BOOL_FALSE);
+ 		if (iRet || (u4Res != script[i].cmdSz)) {
+ 			WMT_ERR_FUNC("WMT-CORE: write (%s) iRet(%d) cmd len err(%d, %d)\n",
+ 				     script[i].str, iRet, u4Res, script[i].cmdSz);
++			pr_info("CAPTURE-INIT: step=\"%s\" result=TX-FAIL iRet=%d written=%d\n",
++				script[i].str, iRet, u4Res);
+ 			break;
+ 		}
+ 		/* EVENT BUF */
+@@ -663,6 +666,8 @@ INT32 wmt_core_init_script(struct init_script *script, INT32 count)
+ 		if (iRet || (u4Res != script[i].evtSz)) {
+ 			WMT_ERR_FUNC("WMT-CORE: read (%s) iRet(%d) evt len err(rx:%d, exp:%d)\n",
+ 				     script[i].str, iRet, u4Res, script[i].evtSz);
++			pr_info("CAPTURE-INIT: step=\"%s\" result=RX-FAIL iRet=%d rx=%d exp=%d\n",
++				script[i].str, iRet, u4Res, script[i].evtSz);
+ 			mtk_wcn_stp_dbg_dump_package();
+ 			break;
+ 		}
+@@ -677,13 +682,17 @@ INT32 wmt_core_init_script(struct init_script *script, INT32 count)
+ 					("WMT-CORE:exp(%d):[%02X,%02X,%02X,%02X,%02X]\n",
+ 					 script[i].evtSz, script[i].evt[0], script[i].evt[1], script[i].evt[2],
+ 					 script[i].evt[3], script[i].evt[4]);
++				pr_info("CAPTURE-INIT: step=\"%s\" result=EVT-MISMATCH\n",
++					script[i].str);
+ 				mtk_wcn_stp_dbg_dump_package();
+ 				break;
+ 			}
+ 		}
+ 		WMT_DBG_FUNC("init_script operation %s ok\n", script[i].str);
++		pr_info("CAPTURE-INIT: step=\"%s\" result=PASS\n", script[i].str);
+ 	}
+ 
++	pr_info("CAPTURE-INIT: script-done completed=%d of %d\n", i, count);
+ 	return (i == count) ? 0 : -1;
+ }
+ 
+diff --git a/drivers/misc/mediatek/connectivity/common/common_main/mt6797/mtk_wcn_consys_hw.c b/drivers/misc/mediatek/connectivity/common/common_main/mt6797/mtk_wcn_consys_hw.c
+index d06792165..56eeaf83e 100644
+--- a/drivers/misc/mediatek/connectivity/common/common_main/mt6797/mtk_wcn_consys_hw.c
++++ b/drivers/misc/mediatek/connectivity/common/common_main/mt6797/mtk_wcn_consys_hw.c
+@@ -303,6 +303,291 @@ static VOID harvest_snap(const PINT8 tag, int mcu_powered)
+ 		tag, v1f00, cpupcr, pwr, ack, acks);
+ }
+ 
++/* ====================================================================
++ * Capture kit (gemini_linux tracker issue #9).
++ *
++ * Full register-table snapshots implementing the
++ * "What a Pre-firmware capture must record" table of
++ * 04-docs/DIVERGENCE-DEBUG-PLAN.md, emitted at defined sequence
++ * points in the vendor CONSYS bring-up so C0/C1 captures diff
++ * mechanically against C2 (the ported stack on the 6.6 Base tree).
++ *
++ * Output format (one register per line, greppable, normalizes to the
++ * plan's "register, sequence-point, value" table):
++ *   CAPTURE-REG: <seq-point> <NAME> 0x<phys> = 0x<val>
++ *   CAPTURE-REG: <seq-point> <NAME> 0x<phys> = SKIPPED-<why>
++ *   CAPTURE-PMIC: <seq-point> <NAME> 0x<pmic-adr> = 0x<val16>
++ *   CAPTURE-CPUPCR: <seq-point> sample=<i> = 0x<val>
++ *   CAPTURE-EMI: <seq-point> ...
++ *   CAPTURE-MCU-RST: assert|release
++ *
++ * Read-only by construction: every access is a read; CONN-domain and
++ * BTIF/APDMA reads are gated on the power/clock state that makes them
++ * safe (DEVAPC lesson from bsg100 H16, see harvest_snap above).
++ * ==================================================================== */
++#include <linux/crc32.h>
++#include <linux/vmalloc.h>
++
++struct wmt_cap_reg {
++	const char *name;
++	UINT32 phys;
++};
++
++/* AP-side registers: always safe to read. Addresses and expected
++ * values source-cited in DIVERGENCE-DEBUG-PLAN.md and the mirrored
++ * bsg100 consys-golden-harvest.sh / blockers.md B-21. */
++static const struct wmt_cap_reg wmt_cap_ap_regs[] = {
++	{"SPM_PWRON_CONFG_EN",       0x10006000},
++	{"SPM_PWR_STATUS",           0x10006180},
++	{"SPM_PWR_STATUS_2ND",       0x10006184},
++	{"SPM_CONN_PWR_CON",         0x1000632c}, /* golden-on 0x10D, SRAM_PDN bit8 SET */
++	{"SPM_CONN_PWR_CON_STALE",   0x10006280}, /* the stale-define trap; capture, don't poke */
++	{"INFRA_TOPAXI_PROT_EN",     0x10001220}, /* CONN bits 17|18 */
++	{"INFRA_TOPAXI_PROT_STA1",   0x10001228},
++	{"AP2CONN_OSC_EN",           0x10001f00}, /* golden 0x6D403A00; bit11 unresolved lead */
++	{"CONSYS_EMI_MAPPING",       0x10001340},
++	{"CONN2AP_SLEEP_MASK",       0x10001350}, /* bit 8 */
++	{"WDT_SWSYSRST",             0x10007018}, /* bit 12 = CONSYS CPU reset */
++	{"INFRA_CG_STA0",            0x10001090}, /* bit31 = CLK_INFRA_BTIF gate state */
++	{"INFRA_CG_STA1",            0x10001094}, /* bit18 = CLK_INFRA_AP_DMA gate state */
++	{"PWRAP_DCXO_ENABLE",        0x1000d18c},
++	{"PWRAP_DCXO_CONN_ADR0",     0x1000d190},
++	{"PWRAP_DCXO_CONN_WDATA0",   0x1000d194},
++	{"PWRAP_DCXO_CONN_ADR1",     0x1000d198},
++	{"PWRAP_DCXO_CONN_WDATA1",   0x1000d19c},
++};
++
++/* CONN-domain registers: only readable while SPM_PWR_STATUS/2ND bit 1
++ * report the CONN MTCMOS on (DEVAPC violation + eventual hard reset
++ * otherwise -- bsg100 H16). */
++static const struct wmt_cap_reg wmt_cap_conn_regs[] = {
++	{"CONSYS_HW_VER",            0x18070000}, /* expect 0x8A00 */
++	{"CONSYS_FW_VER",            0x18070004},
++	{"CONSYS_CHIP_ID",           0x18070008}, /* expect 0x0279 */
++	{"MCU_CFG_ACR",              0x18070110},
++	{"CONSYS_CPUPCR",            0x18070160},
++};
++
++/* BTIF host block + APDMA BTIF channels: reads need CLK_INFRA_BTIF /
++ * CLK_INFRA_AP_DMA ungated (bus hang otherwise). Offset 0x8 is IIR on
++ * read; FIFOCTRL shares the offset but is write-only. BTIF_WAK (+0x64)
++ * is documented write-only; the read is best-effort and the golden
++ * harvest script read it too. */
++static const struct wmt_cap_reg wmt_cap_btif_regs[] = {
++	{"BTIF_IER",                 0x1100c004},
++	{"BTIF_IIR_FIFOCTRL",        0x1100c008},
++	{"BTIF_FAKELCR",             0x1100c00c},
++	{"BTIF_LSR",                 0x1100c014},
++	{"BTIF_SLEEP_EN",            0x1100c048},
++	{"BTIF_DMA_EN",              0x1100c04c},
++	{"BTIF_RTOCNT",              0x1100c054},
++	{"BTIF_TRI_LVL",             0x1100c060}, /* golden 0x18 */
++	{"BTIF_WAK",                 0x1100c064},
++	{"BTIF_WAT_TIME",            0x1100c068},
++	{"BTIF_HANDSHAKE",           0x1100c06c}, /* golden 0x3 */
++};
++static const struct wmt_cap_reg wmt_cap_apdma_regs[] = {
++	{"APDMA_BTIF_TX_INT_EN",     0x11000884},
++	{"APDMA_BTIF_TX_EN",         0x11000888},
++	{"APDMA_BTIF_RX_INT_EN",     0x11000904},
++	{"APDMA_BTIF_RX_EN",         0x11000908},
++};
++
++/* MT6351 PMIC registers over pwrap (not memory-mapped; devmem cannot
++ * reach these -- the reason this must be kernel-side). Addresses:
++ * upmu_hw.h MT6351_LDO_VCN*_CON0; DCXO_CW00 0x7000 per the mirrored
++ * bsg100 golden harvest script (bit 5 = XO_WCN). */
++static const struct wmt_cap_reg wmt_cap_pmic_regs[] = {
++	{"PMIC_DCXO_CW00",           0x7000},
++	{"PMIC_LDO_VCN18_CON0",      0x0a52},
++	{"PMIC_LDO_VCN28_CON0",      0x0a0c}, /* RG_VCN28_ON_CTRL lives here */
++	{"PMIC_LDO_VCN33_CON0",      0x0a92},
++};
++
++extern s32 pwrap_read(u32 adr, u32 *rdata); /* mt_pmic_wrap.c, EXPORT_SYMBOL */
++
++#define WMT_CAP_PAGES 16
++struct wmt_cap_page_ent {
++	UINT32 page;
++	VOID __iomem *virt;
++};
++static struct wmt_cap_page_ent wmt_cap_pages[WMT_CAP_PAGES];
++
++static VOID __iomem *wmt_cap_map(UINT32 phys)
++{
++	UINT32 page = phys & ~0xFFFU;
++	INT32 i;
++
++	for (i = 0; i < WMT_CAP_PAGES; i++) {
++		if (wmt_cap_pages[i].virt && wmt_cap_pages[i].page == page)
++			return wmt_cap_pages[i].virt + (phys & 0xFFF);
++		if (!wmt_cap_pages[i].virt) {
++			wmt_cap_pages[i].virt = ioremap_nocache(page, 0x1000);
++			wmt_cap_pages[i].page = page;
++			if (!wmt_cap_pages[i].virt)
++				return NULL;
++			return wmt_cap_pages[i].virt + (phys & 0xFFF);
++		}
++	}
++	return NULL;
++}
++
++static INT32 wmt_cap_read(UINT32 phys, UINT32 *val)
++{
++	VOID __iomem *v = wmt_cap_map(phys);
++
++	if (!v)
++		return -1;
++	*val = CONSYS_REG_READ(v);
++	return 0;
++}
++
++static VOID wmt_cap_emit(const char *sp, const struct wmt_cap_reg *r)
++{
++	UINT32 val = 0;
++
++	if (wmt_cap_read(r->phys, &val))
++		pr_info("CAPTURE-REG: %s %s 0x%08x = SKIPPED-MAP-FAILED\n",
++			sp, r->name, r->phys);
++	else
++		pr_info("CAPTURE-REG: %s %s 0x%08x = 0x%08x\n",
++			sp, r->name, r->phys, val);
++}
++
++static VOID wmt_cap_skip(const char *sp, const struct wmt_cap_reg *r,
++			 const char *why)
++{
++	pr_info("CAPTURE-REG: %s %s 0x%08x = SKIPPED-%s\n",
++		sp, r->name, r->phys, why);
++}
++
++static INT32 wmt_cap_conn_powered(VOID)
++{
++	UINT32 sta = 0, sta2 = 0;
++
++	if (wmt_cap_read(0x10006180, &sta) || wmt_cap_read(0x10006184, &sta2))
++		return 0;
++	return ((sta & 0x2) && (sta2 & 0x2)) ? 1 : 0;
++}
++
++/* CONSYS EMI ctrl window: 343 KiB at gConEmiPhyBase + 0x80000 (bsg100
++ * research.md; untested-hypothesis row of the plan's table). First 64
++ * bytes hexdumped + CRC32 of the whole window. */
++#define WMT_CAP_EMI_CTRL_OFF  0x80000
++#define WMT_CAP_EMI_CTRL_LEN  (343 * 1024)
++
++static VOID wmt_cap_emi(const char *sp)
++{
++	VOID __iomem *win;
++	PUINT8 buf;
++
++	if (!gConEmiPhyBase) {
++		pr_info("CAPTURE-EMI: %s gConEmiPhyBase = UNSET\n", sp);
++		return;
++	}
++	pr_info("CAPTURE-EMI: %s gConEmiPhyBase = 0x%08x\n",
++		sp, (UINT32) gConEmiPhyBase);
++	win = ioremap_nocache(gConEmiPhyBase + WMT_CAP_EMI_CTRL_OFF,
++			      WMT_CAP_EMI_CTRL_LEN);
++	if (!win) {
++		pr_info("CAPTURE-EMI: %s ctrlwin = SKIPPED-MAP-FAILED\n", sp);
++		return;
++	}
++	buf = vmalloc(WMT_CAP_EMI_CTRL_LEN);
++	if (buf) {
++		memcpy_fromio(buf, win, WMT_CAP_EMI_CTRL_LEN);
++		pr_info("CAPTURE-EMI: %s ctrlwin_crc32 = 0x%08x len=%d\n",
++			sp, crc32_le(0, buf, WMT_CAP_EMI_CTRL_LEN),
++			WMT_CAP_EMI_CTRL_LEN);
++		print_hex_dump(KERN_INFO, "CAPTURE-EMI: ", DUMP_PREFIX_OFFSET,
++			       16, 1, buf, 64, false);
++		vfree(buf);
++	} else {
++		pr_info("CAPTURE-EMI: %s ctrlwin = SKIPPED-NOMEM\n", sp);
++	}
++	iounmap(win);
++}
++
++/* Full register-table snapshot at one sequence point. Callable from
++ * the bring-up path here and from the /proc/driver/wmt_capture hook in
++ * wmt_detect.c (both built-in). */
++VOID wmt_capture_regtable(const char *sp)
++{
++	UINT32 cg0 = 0, cg1 = 0;
++	INT32 conn_on, i;
++
++	pr_info("CAPTURE-SNAP-BEGIN: %s\n", sp);
++
++	for (i = 0; i < (INT32) ARRAY_SIZE(wmt_cap_ap_regs); i++)
++		wmt_cap_emit(sp, &wmt_cap_ap_regs[i]);
++
++	conn_on = wmt_cap_conn_powered();
++	pr_info("CAPTURE-REG: %s CONN_POWERED - = %d\n", sp, conn_on);
++	for (i = 0; i < (INT32) ARRAY_SIZE(wmt_cap_conn_regs); i++) {
++		if (conn_on)
++			wmt_cap_emit(sp, &wmt_cap_conn_regs[i]);
++		else
++			wmt_cap_skip(sp, &wmt_cap_conn_regs[i],
++				     "CONN-UNPOWERED");
++	}
++
++	/* MTK CG status: bit set = clock gated */
++	wmt_cap_read(0x10001090, &cg0);
++	wmt_cap_read(0x10001094, &cg1);
++	for (i = 0; i < (INT32) ARRAY_SIZE(wmt_cap_btif_regs); i++) {
++		if (!(cg0 & (1U << 31)))
++			wmt_cap_emit(sp, &wmt_cap_btif_regs[i]);
++		else
++			wmt_cap_skip(sp, &wmt_cap_btif_regs[i],
++				     "BTIF-CLK-GATED");
++	}
++	for (i = 0; i < (INT32) ARRAY_SIZE(wmt_cap_apdma_regs); i++) {
++		if (!(cg1 & (1U << 18)))
++			wmt_cap_emit(sp, &wmt_cap_apdma_regs[i]);
++		else
++			wmt_cap_skip(sp, &wmt_cap_apdma_regs[i],
++				     "APDMA-CLK-GATED");
++	}
++
++	for (i = 0; i < (INT32) ARRAY_SIZE(wmt_cap_pmic_regs); i++) {
++		UINT32 val = 0;
++
++		if (pwrap_read(wmt_cap_pmic_regs[i].phys, &val))
++			pr_info("CAPTURE-PMIC: %s %s 0x%04x = READ-FAILED\n",
++				sp, wmt_cap_pmic_regs[i].name,
++				wmt_cap_pmic_regs[i].phys);
++		else
++			pr_info("CAPTURE-PMIC: %s %s 0x%04x = 0x%04x\n",
++				sp, wmt_cap_pmic_regs[i].name,
++				wmt_cap_pmic_regs[i].phys, val);
++	}
++
++	wmt_cap_emi(sp);
++	pr_info("CAPTURE-SNAP-END: %s\n", sp);
++}
++
++/* CPUPCR burst: >=32 samples at ~1 ms spacing (the plan's MCU
++ * execution discriminator: golden steady 0x0009997A vs abnormal
++ * 0x55AA55xx sleep-spin). Process context only (sleeps). */
++VOID wmt_capture_cpupcr_burst(const char *sp, INT32 n)
++{
++	UINT32 val;
++	INT32 i;
++
++	if (!wmt_cap_conn_powered()) {
++		pr_info("CAPTURE-CPUPCR: %s = SKIPPED-CONN-UNPOWERED\n", sp);
++		return;
++	}
++	for (i = 0; i < n; i++) {
++		if (wmt_cap_read(0x18070160, &val))
++			break;
++		pr_info("CAPTURE-CPUPCR: %s sample=%02d = 0x%08x\n",
++			sp, i, val);
++		usleep_range(950, 1050);
++	}
++}
++/* ==================== end capture kit ==================== */
++
+ INT32 mtk_wcn_consys_hw_reg_ctrl(UINT32 on, UINT32 co_clock_type)
+ {
+ 	INT32 iRet = -1;
+@@ -315,6 +600,7 @@ INT32 mtk_wcn_consys_hw_reg_ctrl(UINT32 on, UINT32 co_clock_type)
+ 
+ 	WMT_PLAT_DBG_FUNC("CONSYS-HW-REG-CTRL(0x%08x),start\n", on);
+ 	harvest_snap(on ? "reg_ctrl-on-entry" : "reg_ctrl-off-entry", on ? 0 : 1);
++	wmt_capture_regtable(on ? "reg_ctrl-on-entry" : "reg_ctrl-off-entry");
+ 
+ 	if (on) {
+ 		WMT_PLAT_DBG_FUNC("++\n");
+@@ -364,6 +650,7 @@ INT32 mtk_wcn_consys_hw_reg_ctrl(UINT32 on, UINT32 co_clock_type)
+ 				 CONSYS_REG_READ(conn_reg.ap_rgu_base + CONSYS_CPU_SW_RST_OFFSET) |
+ 				 CONSYS_CPU_SW_RST_BIT | CONSYS_CPU_SW_RST_CTRL_KEY);*/
+ 		mtk_wdt_swsysret_config((1 << 12), 1);
++		pr_info("CAPTURE-MCU-RST: assert\n");
+ 		WMT_PLAT_INFO_FUNC("reg dump:CONSYS_CPU_SW_RST_REG(0x%x)\n",
+ 				  CONSYS_REG_READ(conn_reg.ap_rgu_base + CONSYS_CPU_SW_RST_OFFSET));
+ 		/*turn on SPM clock gating enable PWRON_CONFG_EN  0x10006000  32'h0b160001 */
+@@ -441,6 +728,7 @@ INT32 mtk_wcn_consys_hw_reg_ctrl(UINT32 on, UINT32 co_clock_type)
+ #endif /* defined(CONFIG_MTK_CLKMGR) */
+ #endif
+ 		harvest_snap("pre-chipid-poll", 1);
++		wmt_capture_regtable("pre-chipid-poll");
+ 		/*12.poll CONNSYS CHIP ID until chipid is returned  0x18070008 */
+ 		while (retry-- > 0) {
+ 			consysHwChipId = CONSYS_REG_READ(conn_reg.mcu_base + CONSYS_CHIP_ID_OFFSET);
+@@ -523,6 +811,13 @@ INT32 mtk_wcn_consys_hw_reg_ctrl(UINT32 on, UINT32 co_clock_type)
+ 				 (CONSYS_REG_READ(conn_reg.ap_rgu_base + CONSYS_CPU_SW_RST_OFFSET) &
+ 				 ~CONSYS_CPU_SW_RST_BIT) | CONSYS_CPU_SW_RST_CTRL_KEY);*/
+ 		mtk_wdt_swsysret_config((1 << 12), 0);
++		/* Step 16 done: the CONSYS MCU ROM starts executing NOW.
++		 * This is the exact window bsg100 never captured (B-21
++		 * postmortem): ROM register state between MCU-reset-release
++		 * and the first WMT traffic. Full table + CPUPCR burst. */
++		pr_info("CAPTURE-MCU-RST: release\n");
++		wmt_capture_regtable("mcu-reset-release");
++		wmt_capture_cpupcr_burst("mcu-reset-release", 32);
+ #else /*use HADRCODE, maybe no use.. */
+ 		/*3.assert CONNSYS CPU SW reset  0x10007018  "[12]=1'b1  [31:24]=8'h88 (key)" */
+ 		CONSYS_REG_WRITE(CONSYS_CPU_SW_RST_REG,
+@@ -835,6 +1130,7 @@ INT32 mtk_wcn_consys_hw_pwr_on(UINT32 co_clock_type)
+ 	}
+ 	iRet += mtk_wcn_consys_hw_reg_ctrl(1, co_clock_type);
+ 	harvest_snap("after-reg-ctrl-on", 1);
++	wmt_capture_regtable("after-reg-ctrl-on");
+ 	iRet += mtk_wcn_consys_hw_gpio_ctrl(1);
+ #if CONSYS_ENALBE_SET_JTAG
+ 	if (gJtagCtrl)
+-- 
+2.55.0
+

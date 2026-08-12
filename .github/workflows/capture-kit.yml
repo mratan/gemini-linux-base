@@ -1,0 +1,41 @@
+# Capture kit (issue #9) — cheap checks only.
+# The full containerized 3.18 build is local-only (see
+# capture-kit/BUILD-EVIDENCE.md); CI just keeps the scripts shell-clean
+# and proves the patch series still applies to the upstream gemian tree.
+name: capture-kit
+
+on:
+  push:
+    branches: [slice8-capture-kit]
+  workflow_dispatch:
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck capture-kit scripts
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q shellcheck
+          # POSIX sh scripts; SC1091 (sourced lib not followed) is expected.
+          shellcheck -s sh -e SC1091 \
+            capture-kit/build.sh \
+            capture-kit/apply-patches.sh \
+            capture-kit/pack-boot2-compat.sh \
+            capture-kit/device-scripts/*.sh
+
+  patch-apply:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: clone gemian native tree (shallow)
+        run: |
+          git clone --depth 1 --branch native \
+            https://github.com/gemian/gemini-linux-kernel-3.18 /tmp/gemian-3.18
+      - name: apply capture-kit patch series
+        run: |
+          cd /tmp/gemian-3.18
+          git config user.name ci
+          git config user.email ci@invalid
+          git am "$GITHUB_WORKSPACE"/capture-kit/patches/*.patch
+          git log --oneline -4
