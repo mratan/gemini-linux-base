@@ -1,0 +1,148 @@
+#!/bin/sh
+# Gemini PDA Experimental-slot initramfs /init (ADR-0002, tracker #5).
+#
+# Job: find the partition that carries the Gemian reference rootfs AND our
+# Debian loop-image file sitting beside it, loop-mount the image, and
+# switch_root into it. The partition itself is never the root filesystem —
+# ADR-0002: the Gemian rootfs on that partition must never be touched.
+#
+# Discovery strategy (documented in PACKAGING.md):
+#   1. gemini.rootdev=<devname> on the kernel cmdline, if given, is tried
+#      first (devname relative to /dev, e.g. gemini.rootdev=vda1);
+#   2. GPT partitions whose partition NAME is "linux" (read from the kernel's
+#      PARTNAME= uevent field — this matches the device's real GPT entry and
+#      the synthetic QEMU test disk identically, with no device-path
+#      hardcoding);
+#   3. any remaining partition, as a fallback.
+# Each candidate is mounted READ-ONLY and probed for the image file
+# (gemini.rootimg=, default /experimental.img). Everything stays read-only
+# until the pivot is committed; the ONLY write-enabling action in this
+# script is the remount-rw of the host partition immediately before
+# switch_root, after the image has been found and validated. On ANY failure
+# before that point we drop to a rescue shell with nothing writable.
+#
+# Runs under busybox ash. Built by scripts/mkinitramfs.py.
+
+MARK_PIVOT="GEMINI-INITRAMFS-PIVOT-OK"
+MARK_RESCUE="GEMINI-INITRAMFS-RESCUE"
+
+ROOTIMG=/experimental.img   # path of the loop image inside the host partition
+ROOTDEV=                    # optional explicit device (devname under /dev)
+NEWINIT=/sbin/init          # init to exec inside the loop rootfs
+FORCE_RESCUE=
+
+log() { echo "gemini-init: $*"; }
+
+rescue() {
+    log "$MARK_RESCUE: $*"
+    # Fail safe: detach anything we probed, read-only mounts only.
+    umount /newroot 2>/dev/null
+    umount /host 2>/dev/null
+    log "dropping to rescue shell (nothing was written); busybox applets in /bin"
+    exec setsid cttyhack sh || exec sh
+}
+
+# --- pseudo-filesystems (RAM only, no disk writes) -------------------------
+mount -t proc proc /proc || true
+mount -t sysfs sysfs /sys || true
+mount -t devtmpfs devtmpfs /dev || true
+
+# --- optional modules (QEMU test kernels need virtio/ext4/loop; the device
+#     kernel has everything built in and ships an empty preload dir) --------
+for m in $(ls /lib/modules/preload/*.ko 2>/dev/null | sort); do
+    insmod "$m" 2>/dev/null || log "insmod $m failed (may be built-in)"
+done
+
+# --- kernel cmdline --------------------------------------------------------
+for tok in $(cat /proc/cmdline); do
+    case "$tok" in
+        gemini.rootimg=*) ROOTIMG="${tok#gemini.rootimg=}" ;;
+        gemini.rootdev=*) ROOTDEV="${tok#gemini.rootdev=}" ;;
+        gemini.init=*)    NEWINIT="${tok#gemini.init=}" ;;
+        gemini.rescue*)   FORCE_RESCUE=1 ;;
+    esac
+done
+[ -n "$FORCE_RESCUE" ] && rescue "rescue requested on cmdline"
+
+# --- build candidate list: explicit dev, then PARTNAME=linux, then rest ----
+# Retries for up to ~15s: mmc/virtio partition uevents can lag /init.
+scan_partitions() {
+    named=""; other=""
+    for ue in /sys/class/block/*/uevent; do
+        [ -e "$ue" ] || continue
+        devname=""; devtype=""; partname=""
+        while IFS='=' read -r k v; do
+            case "$k" in
+                DEVNAME)  devname="$v" ;;
+                DEVTYPE)  devtype="$v" ;;
+                PARTNAME) partname="$v" ;;
+            esac
+        done < "$ue"
+        [ "$devtype" = "partition" ] || continue
+        if [ "$partname" = "linux" ]; then
+            named="$named $devname"
+        else
+            other="$other $devname"
+        fi
+    done
+}
+n=0
+scan_partitions
+while [ -z "$named$other" ] && [ "$n" -lt 15 ]; do
+    sleep 1; n=$((n + 1)); scan_partitions
+done
+candidates="$ROOTDEV$named$other"
+log "candidate partitions:$candidates (image path: $ROOTIMG)"
+
+# --- probe candidates, strictly read-only ----------------------------------
+found=""
+for dev in $candidates; do
+    [ -b "/dev/$dev" ] || { log "/dev/$dev: no such block device"; continue; }
+    if ! mount -o ro "/dev/$dev" /host 2>/dev/null; then
+        log "/dev/$dev: not mountable read-only, skipping"
+        continue
+    fi
+    if [ ! -f "/host$ROOTIMG" ]; then
+        log "/dev/$dev: no $ROOTIMG here, skipping"
+        umount /host
+        continue
+    fi
+    log "/dev/$dev: found $ROOTIMG, validating (read-only)"
+    if ! mount -o loop,ro "/host$ROOTIMG" /newroot 2>/dev/null; then
+        log "/dev/$dev: $ROOTIMG is not a mountable filesystem image"
+        umount /host
+        continue
+    fi
+    if [ ! -x "/newroot$NEWINIT" ]; then
+        log "/dev/$dev: image has no executable $NEWINIT"
+        umount /newroot
+        umount /host
+        continue
+    fi
+    found="$dev"
+    break
+done
+[ -n "$found" ] || rescue "no partition carries a valid $ROOTIMG"
+
+# --- commit: this is the single write-enabling transition ------------------
+log "/dev/$found validated; committing pivot"
+umount /newroot || rescue "could not release read-only validation mount"
+mount -o remount,rw /host || rescue "host partition will not remount rw"
+mount -o loop "/host$ROOTIMG" /newroot || rescue "rw loop mount failed (host is rw!)"
+[ -x "/newroot$NEWINIT" ] || rescue "lost $NEWINIT after rw mount (host is rw!)"
+
+# Keep the host partition reachable from the new root: the loop device's
+# backing file lives there. /host must exist in the rootfs (mkrootfs-loop.sh
+# creates it).
+if [ -d /newroot/host ]; then
+    mount -o move /host /newroot/host || log "warning: could not move /host mount"
+else
+    log "warning: rootfs has no /host mountpoint; host partition mount stays behind"
+fi
+mount -o move /dev /newroot/dev 2>/dev/null || true
+umount /proc 2>/dev/null || true
+umount /sys 2>/dev/null || true
+
+log "$MARK_PIVOT: switching root to $ROOTIMG on /dev/$found"
+exec switch_root /newroot "$NEWINIT"
+rescue "switch_root returned"

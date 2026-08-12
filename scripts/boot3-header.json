@@ -1,0 +1,23 @@
+{
+  "_comment": [
+    "Android v0 boot image header spec for the Gemini PDA Experimental slot",
+    "(boot3, ADR-0002). Field values are plain facts extracted from the",
+    "known-good stock/debian reference boot images (local flash-set, header",
+    "hex-inspected 2026-08-12) and match boot.md 'Android boot image header':",
+    "kernel_addr 0x40080000, ramdisk_addr 0x45000000, second_addr 0x40f00000,",
+    "tags_addr 0x44000000, page 2048, v0 header. No vendor code or blobs are",
+    "needed at pack time. Note LK IGNORES kernel_addr and always loads at",
+    "dram_base+0x80000; the kernel must be CONFIG_RELOCATABLE=y. The header",
+    "cmdline below is the known-good debian_boot value; the project kernel",
+    "overrides it anyway via CONFIG_CMDLINE_FORCE=y (gemini-cmdline.config)."
+  ],
+  "page_size": 2048,
+  "kernel_addr": "0x40080000",
+  "ramdisk_addr": "0x45000000",
+  "second_addr": "0x40f00000",
+  "tags_addr": "0x44000000",
+  "header_version": 0,
+  "os_version": 0,
+  "name": "",
+  "cmdline": "bootopt=64S3,32N2,64N2 log_buf_len=4M"
+}

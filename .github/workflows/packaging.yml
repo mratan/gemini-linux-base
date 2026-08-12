@@ -1,0 +1,137 @@
+# Experimental-slot packaging pipeline (mratan fork — gemini_linux tracker
+# issue #5, "Slice 4", ADR-0002). Owned by the slice4-packaging workstream;
+# kernel-build.yml is a separate workstream and is not touched here.
+#
+# Proves, without the device:
+#   * boot3 boot-image packer round-trips byte-exactly (bootimg-roundtrip);
+#   * the Debian 13 arm64 loop-image rootfs builds from script and boots to
+#     a shell in QEMU via the busybox initramfs pivot (Test A);
+#   * with the loop image absent the initramfs fails safe: rescue shell and
+#     a byte-identical disk afterwards (Test B).
+#
+# Everything QEMU boots here is a STOCK Debian arm64 kernel — the gemini
+# kernel is never rebuilt or booted in this workflow (CI wall-time, and the
+# initramfs logic is kernel-agnostic). All published artifacts are staged
+# and NOT-YET-FLASHED.
+name: packaging
+
+on:
+  push:
+    branches: [slice4-packaging]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bootimg-roundtrip:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Boot image pack/unpack round-trip (synthetic fixtures)
+        run: python3 scripts/test-bootimg-roundtrip.py
+
+  rootfs-qemu-proof:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build/test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-arm qemu-user-static binfmt-support mmdebstrap \
+            debian-archive-keyring gdisk e2fsprogs zstd xz-utils
+
+      - name: Build Debian 13 arm64 loop-image rootfs (experimental.img)
+        run: sudo scripts/mkrootfs-loop.sh --out out/experimental.img
+
+      - name: Fetch stock Debian arm64 kernel + static busybox (QEMU proof bits)
+        run: |
+          sudo bash scripts/ci/fetch-qemu-boot-bits.sh "$RUNNER_TEMP/deb-extract" \
+            | tee -a "$GITHUB_ENV"
+
+      - name: Collect virtio/ext4/loop modules for the QEMU initramfs
+        run: |
+          python3 scripts/ci/collect-modules.py \
+            --modules-base "$MODULES_BASE" --out out/preload \
+            pci-host-generic virtio_pci virtio_blk loop crc32c_generic ext4
+
+      - name: Build initramfs images (QEMU-test + device variants)
+        run: |
+          python3 scripts/mkinitramfs.py --busybox "$BUSYBOX" \
+            --init initramfs/init --modules-dir out/preload \
+            --out out/initramfs-qemu.cpio.gz
+          # Device variant: same init, no preload modules (the gemini 6.6
+          # config has devtmpfs/ext4/loop built in via arm64 defconfig).
+          python3 scripts/mkinitramfs.py --busybox "$BUSYBOX" \
+            --init initramfs/init \
+            --out out/initramfs-gemini.cpio.gz
+
+      - name: Build synthetic disks (fake Gemian tree +/- loop image)
+        run: |
+          scripts/mksynthetic-disk.sh --out out/diskA.img --image out/experimental.img
+          scripts/mksynthetic-disk.sh --out out/diskB.img --no-image
+
+      - name: "Test A: initramfs finds image, pivots, rootfs reaches a shell"
+        run: |
+          scripts/ci/run-qemu-test.sh \
+            --kernel "$VMLINUZ" --initrd out/initramfs-qemu.cpio.gz \
+            --disk out/diskA.img --timeout 1800 --log out/testA-serial.log \
+            --append loglevel=7 \
+            --marker GEMINI-INITRAMFS-PIVOT-OK \
+            --marker GEMINI-ROOTFS-SHELL-OK \
+            --marker GEMINI-LOGIN-SHELL-OK \
+            --forbid GEMINI-INITRAMFS-RESCUE \
+            --forbid GEMINI-DECOY-INIT-VIOLATION
+
+      - name: "Test B: image absent -> rescue shell, disk byte-identical (fail-safe)"
+        run: |
+          sha_before=$(sha256sum out/diskB.img | cut -d' ' -f1)
+          scripts/ci/run-qemu-test.sh \
+            --kernel "$VMLINUZ" --initrd out/initramfs-qemu.cpio.gz \
+            --disk out/diskB.img --timeout 900 --log out/testB-serial.log \
+            --append loglevel=7 \
+            --marker GEMINI-INITRAMFS-RESCUE \
+            --forbid GEMINI-INITRAMFS-PIVOT-OK \
+            --forbid GEMINI-DECOY-INIT-VIOLATION
+          sha_after=$(sha256sum out/diskB.img | cut -d' ' -f1)
+          echo "before: $sha_before"
+          echo "after:  $sha_after"
+          if [ "$sha_before" != "$sha_after" ]; then
+            echo "FAIL: synthetic disk changed during the fail-safe run" \
+                 "(the initramfs wrote to the partition holding the fake" \
+                 "Gemian rootfs — ADR-0002 violation)"
+            exit 1
+          fi
+          echo "PASS: disk checksum unchanged — fail-safe path wrote nothing"
+
+      - name: Stage artifacts (hashed, NOT-YET-FLASHED)
+        run: |
+          mkdir -p stage
+          sha256sum out/experimental.img out/initramfs-gemini.cpio.gz \
+                    out/initramfs-qemu.cpio.gz | sed 's|out/||' > stage/SHA256SUMS
+          xz -T0 -c out/experimental.img > stage/experimental.img.xz
+          cp out/initramfs-gemini.cpio.gz out/initramfs-qemu.cpio.gz stage/
+          cp out/testA-serial.log out/testB-serial.log stage/
+          cat > stage/NOT-YET-FLASHED.txt <<'EOF'
+          These are STAGED artifacts for the Gemini PDA Experimental slot
+          (ADR-0002: kernel -> boot3, rootfs -> loop-image file on the
+          `linux` partition BESIDE the Gemian rootfs). Nothing here has been
+          flashed; no flashing happens during the remote-only period. The
+          Gemian reference slot (boot2 + the `linux` partition's own rootfs)
+          must never be written, resized or reformatted. See PACKAGING.md.
+          EOF
+          { echo '## Packaging artifacts (SHA-256 of uncompressed files)'
+            echo '```'; cat stage/SHA256SUMS; echo '```'
+            echo 'Status: NOT-YET-FLASHED (see NOT-YET-FLASHED.txt)'; } \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: gemini-packaging-${{ github.run_number }}-${{ github.sha }}
+          path: stage/
+          if-no-files-found: error
