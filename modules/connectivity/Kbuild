@@ -35,6 +35,117 @@ mtk_btif-y := \
 	btif/btif_plat.o \
 	btif/btif_dma_plat.o
 
+# Wi-Fi chardev gate (/dev/wmtWifi — userspace writes '1' to power Wi-Fi on)
+obj-m += wmt_chrdev_wifi.o
+wmt_chrdev_wifi-y := wlan/wmt_chrdev_wifi.o
+CFLAGS_wlan/wmt_chrdev_wifi.o := -DCREATE_NODE_DYNAMIC=1
+
+# Gen3 WLAN driver — the driver actually built for CONSYS_6797 (MT6630-class
+# core, SDIO-like AHB HIF). Object list mirrors the vendor gen3 Makefile's
+# MT6797 selection. NOTE: gen2 is deliberately NOT vendored into this tree at
+# all (CONTEXT.md: gen3, not gen2, despite older notes) — nothing here may
+# reference wlan/gen2.
+WLAN_GEN3_CFLAGS := \
+	-UMT6620 -UMT6628 -UMT5931 -UMT6630 \
+	-DLINUX -DMT6797 \
+	-DCFG_SUPPORT_DEBUG_FS=0 \
+	-DWLAN_INCLUDE_PROC \
+	-DCFG_SUPPORT_AGPS_ASSIST=1 \
+	-DCFG_SUPPORT_TSF_USING_BOOTTIME=1 \
+	-DARP_MONITER_ENABLE=1 \
+	-DCFG_SUPPORT_CHNL_CONFLICT_REVISE=1 \
+	-DCFG_SUPPORT_AEE=0 \
+	-DBUILD_QA_DBG=0 \
+	-DCFG_SUPPORT_PASSPOINT=0 -DCFG_HS20_DEBUG=0 -DCFG_ENABLE_GTK_FRAME_FILTER=0 \
+	-DCFG_MET_PACKET_TRACE_SUPPORT=0 \
+	-DCFG_SPM_WORKAROUND_FOR_HOTSPOT=0 \
+	-DDBG=0 \
+	-DFW_CFG_SUPPORT \
+	-I$(src)/wlan/gen3/os \
+	-I$(src)/wlan/gen3/os/linux/include \
+	-I$(src)/wlan/gen3/os/linux/hif/ahb_sdioLike/include \
+	-I$(src)/wlan/gen3/include \
+	-I$(src)/wlan/gen3/include/nic \
+	-I$(src)/wlan/gen3/include/mgmt
+
+obj-m += wlan_gen3.o
+wlan_gen3-y := \
+	wlan/gen3/common/dump.o \
+	wlan/gen3/common/wlan_lib.o \
+	wlan/gen3/common/wlan_oid.o \
+	wlan/gen3/common/wlan_bow.o \
+	wlan/gen3/common/debug.o \
+	wlan/gen3/common/wlan_p2p.o \
+	wlan/gen3/common/fwcfg.o \
+	wlan/gen3/nic/nic.o \
+	wlan/gen3/nic/nic_tx.o \
+	wlan/gen3/nic/nic_rx.o \
+	wlan/gen3/nic/nic_pwr_mgt.o \
+	wlan/gen3/nic/nic_rate.o \
+	wlan/gen3/nic/cmd_buf.o \
+	wlan/gen3/nic/que_mgt.o \
+	wlan/gen3/nic/nic_cmd_event.o \
+	wlan/gen3/nic/p2p_nic.o \
+	wlan/gen3/os/linux/gl_init.o \
+	wlan/gen3/os/linux/gl_kal.o \
+	wlan/gen3/os/linux/gl_bow.o \
+	wlan/gen3/os/linux/gl_wext.o \
+	wlan/gen3/os/linux/gl_wext_priv.o \
+	wlan/gen3/os/linux/gl_rst.o \
+	wlan/gen3/os/linux/gl_cfg80211.o \
+	wlan/gen3/os/linux/gl_vendor.o \
+	wlan/gen3/os/linux/platform.o \
+	wlan/gen3/os/linux/gl_p2p.o \
+	wlan/gen3/os/linux/gl_p2p_cfg80211.o \
+	wlan/gen3/os/linux/gl_p2p_init.o \
+	wlan/gen3/os/linux/gl_p2p_kal.o \
+	wlan/gen3/os/linux/gl_proc.o \
+	wlan/gen3/os/linux/hif/ahb_sdioLike/arm.o \
+	wlan/gen3/os/linux/hif/ahb_sdioLike/ahb.o \
+	wlan/gen3/os/linux/hif/ahb_sdioLike/ahb_pdma.o \
+	wlan/gen3/os/linux/hif/ahb_sdioLike/sdio_bus_driver.o \
+	wlan/gen3/os/linux/plat/mt6797/plat_priv.o \
+	wlan/gen3/mgmt/ais_fsm.o \
+	wlan/gen3/mgmt/aaa_fsm.o \
+	wlan/gen3/mgmt/assoc.o \
+	wlan/gen3/mgmt/auth.o \
+	wlan/gen3/mgmt/bss.o \
+	wlan/gen3/mgmt/cnm.o \
+	wlan/gen3/mgmt/cnm_timer.o \
+	wlan/gen3/mgmt/cnm_mem.o \
+	wlan/gen3/mgmt/hem_mbox.o \
+	wlan/gen3/mgmt/mib.o \
+	wlan/gen3/mgmt/privacy.o \
+	wlan/gen3/mgmt/rate.o \
+	wlan/gen3/mgmt/rlm.o \
+	wlan/gen3/mgmt/rlm_domain.o \
+	wlan/gen3/mgmt/rlm_obss.o \
+	wlan/gen3/mgmt/rlm_protection.o \
+	wlan/gen3/mgmt/rsn.o \
+	wlan/gen3/mgmt/saa_fsm.o \
+	wlan/gen3/mgmt/scan.o \
+	wlan/gen3/mgmt/scan_fsm.o \
+	wlan/gen3/mgmt/swcr.o \
+	wlan/gen3/mgmt/roaming_fsm.o \
+	wlan/gen3/mgmt/tkip_mic.o \
+	wlan/gen3/mgmt/hs20.o \
+	wlan/gen3/mgmt/tdls.o \
+	wlan/gen3/mgmt/stats.o \
+	wlan/gen3/mgmt/p2p_dev_fsm.o \
+	wlan/gen3/mgmt/p2p_dev_state.o \
+	wlan/gen3/mgmt/p2p_role_fsm.o \
+	wlan/gen3/mgmt/p2p_role_state.o \
+	wlan/gen3/mgmt/p2p_func.o \
+	wlan/gen3/mgmt/p2p_scan.o \
+	wlan/gen3/mgmt/p2p_ie.o \
+	wlan/gen3/mgmt/p2p_rlm.o \
+	wlan/gen3/mgmt/p2p_assoc.o \
+	wlan/gen3/mgmt/p2p_bss.o \
+	wlan/gen3/mgmt/p2p_rlm_obss.o \
+	wlan/gen3/mgmt/wapi.o
+
+$(foreach o,$(wlan_gen3-y),$(eval CFLAGS_$(o) := $(WLAN_GEN3_CFLAGS)))
+
 # WMT core + STP + SoC platform glue, as one module (keeps the vendor's
 # intra-stack symbol web internal; exports stay available for wlan gen3)
 obj-m += mtk_stp_wmt_soc.o

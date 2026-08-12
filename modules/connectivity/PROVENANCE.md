@@ -7,7 +7,7 @@ Slice 5 (tracker issue #6 on mratan/gemini-linux), vendored 2026-08-12.
 | Source repo | https://gitlab.com/ubports/porting/community-ports/android9/planet-geminipda/kernel-planet-geminipda |
 | Branch | `halium-9.0` (Linux 3.18.60, the Port source per CONTEXT.md/ADR-0001) |
 | Commit | `28ffb22d8891b795c0d8847a3a29cf37eced6baa` |
-| Copied trees | `drivers/misc/mediatek/connectivity/common/common_main` → `common_main/`; `drivers/misc/mediatek/connectivity/common/common_detect` → `common_detect/`; `drivers/misc/mediatek/btif/common` → `btif/` |
+| Copied trees | `drivers/misc/mediatek/connectivity/common/common_main` → `common_main/`; `.../common/common_detect` → `common_detect/`; `drivers/misc/mediatek/btif/common` → `btif/`; `.../connectivity/wlan/gen3` → `wlan/gen3/` and `.../wlan/wmt_chrdev_wifi.c` → `wlan/` (Slice 9) |
 | Config baseline | `arch/arm64/configs/k97v1_64_bsp_defconfig` (the Gemini's own defconfig: `CONFIG_MTK_BTIF=y`, `CONFIG_MTK_COMBO=y`, `CONFIG_MTK_COMBO_CHIP_CONSYS_6797=y`; `CONFIG_MTK_CLKMGR` and `CONFIG_MTK_LM_MODE` unset — both facts encoded in Kbuild flags/shims) |
 
 `shim/include/` holds two kinds of files, distinguishable by header comment:
@@ -26,6 +26,20 @@ and the LTE-coex `wmt_idc` path are excluded; from `common_detect`, only
 `wmt_gpio.c` (gpio_ctrl_info table) are built — the rest (wmt_detect char
 device, drv_init tree) waits until the daemons/gen3 slices need
 `/dev/wmtdetect`.
+
+### Gen3 WLAN (Slice 9, tracker issue #10)
+
+`wlan/gen3/` object selection mirrors the vendor gen3 Makefile for
+`WLAN_CHIP_ID=MT6797`: the `ahb_sdioLike/` HIF and `plat/mt6797/` are built;
+the SDIO HIF (`os/linux/hif/sdio/`) is not. **gen2 is not vendored at all** —
+the tree contains only `wlan/gen3/`, which is the strongest form of the "no
+gen2 built anywhere" guard (issue #10); the Kbuild header states the rule.
+`configs/gemini-wlan-gen3.config` enables the cfg80211 features the driver
+hard-requires (`NL80211_TESTMODE`, `CFG80211_WEXT`). `wlan/gen3/lint/` was
+dropped (vendor static-analysis noise, not built).
+
+Modules produced (all pass modpost against the Base tree kernel):
+`mtk_btif.ko`, `mtk_stp_wmt_soc.ko`, `wmt_chrdev_wifi.ko`, `wlan_gen3.ko`.
 
 All 6.6-compatibility modifications to vendored sources are logged in
 `API-CHURN-LOG.md` — one entry per change, tagged mechanical/semantic and

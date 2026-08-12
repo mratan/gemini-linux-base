@@ -128,3 +128,96 @@ introduced by the port.
 - `wmt_idc.c` (LTE coexistence) — `WMT_IDC_SUPPORT=0`, matches vendor flag;
   pulls eccci headers otherwise.
 - `common_detect/` — vendored, not yet built (see PROVENANCE.md).
+
+---
+
+# Gen3 WLAN driver → Linux 6.6 (Slice 9 / tracker issue #10)
+
+The Gen3 WLAN driver (`wlan/gen3/`, the driver the vendor builds for
+CONSYS_6797 — MT6630-class core, SDIO-like AHB HIF) + the Wi-Fi chardev
+(`wlan/wmt_chrdev_wifi.c`), vendored from the same UBports tree/commit as the
+WMT core (see PROVENANCE.md). Object list mirrors the vendor gen3 Makefile's
+`WLAN_CHIP_ID=MT6797` selection (HIF `ahb_sdioLike/`, `plat/mt6797/`); the
+SDIO HIF and gen2 are excluded. **gen2 is not vendored into the tree at all**
+(the strongest form of "no gen2 built" — there is nothing to build), and the
+Kbuild header documents the rule. Config fragment `configs/gemini-wlan-gen3.config`
+enables the cfg80211 features the driver requires (`NL80211_TESTMODE`,
+`CFG80211_WEXT`). Tags as above ([mechanical]/[semantic], [frank-w]/[novel]).
+
+## Mechanical
+
+- **G1 [frank-w] ftrace_event.h → trace_events.h** (v4.14). `gl_kal.h`.
+- **G2 [novel] ACPI_STATE_D0..D3 macro collision** — the kernel's
+  `<acpi/actypes.h>` (pulled transitively on 6.6) `#define`s these, clashing
+  with the driver's private enum; `#undef` before the enum. `wlan_def.h`.
+- **G3/G10 [frank-w] sched.h split** — `sched_clock()` →
+  `<linux/sched/clock.h>`; `struct sched_param` → `<uapi/linux/sched/types.h>`;
+  `sched_show_task()`/`show_stack()` → `<linux/sched/debug.h>`. Multiple files.
+- **G4 [frank-w] set_fs()/KERNEL_DS removed (v5.10)** — file IO via
+  `kernel_read()`/`kernel_write()` (kernel buffers, no addr-limit override);
+  direct `f_op->read` and `vfs_read/write` call sites converted.
+  `gl_kal.c`, `platform.c`.
+- **G5 [frank-w] timer_setup() (v4.15)** — `init_timer()`+`.data` gone; OSAL
+  timer trampoline recovers the glue via `from_timer()`. `gl_kal.c`.
+- **G6 [frank-w] net_device.last_rx removed (v4.11)** — assignment dropped.
+- **G9 [novel] MODULE_SUPPORTED_DEVICE removed (v5.12)** — dropped. `gl_init.c`.
+- **G15 [novel] ndo_select_queue** — lost `accel_priv` (v4.19) and the
+  `select_queue_fallback_t` (v5.2); now `(dev, skb, sb_dev)`. `gl_init.c`.
+- **G17 [novel] hardened-usercopy false positive** — `count + 1` (size_t) can
+  overflow, so the compiler couldn't prove the `copy_from_user` dest bound
+  (`__bad_copy_to`); added an explicit clamp to `sizeof(buf) - 1`. `gl_proc.c`.
+- **strnicmp → strncasecmp**, **ioremap_nocache → ioremap**,
+  **class_create(THIS_MODULE,) → class_create()**,
+  **dma_zalloc_coherent → dma_alloc_coherent**,
+  **access_ok(VERIFY_*, …) → access_ok(…)** (v5.0) — as in the WMT section.
+
+## Semantic — read before on-device work
+
+- **G8 [frank-w] iwpriv handler fields** — `iw_handler_def`'s
+  `.num_private/.private/.private_args/.num_private_args` exist only under
+  `CONFIG_WEXT_PRIV` (a select-only symbol, off in our config); wrapped in
+  `#ifdef CONFIG_WEXT_PRIV`. **Consequence: iwpriv commands are unavailable in
+  the default build** (standard wext + nl80211 unaffected). `gl_wext.c`.
+- **G11 [frank-w] cfg80211_roamed_bss → cfg80211_roamed** (v4.12) with a
+  `struct cfg80211_roam_info`; bss/ie fields moved under `links[0]` in the
+  v6.0 MLO rework. `gl_kal.c`.
+- **G12 [frank-w] cfg80211_ops key/iface/station churn** — `add_key`/`get_key`/
+  `del_key`/`set_default_key` gained `int link_id` (v6.0); `change_virtual_intf`
+  dropped `u32 *flags` (v4.1); `add_virtual_intf` gained `unsigned char
+  name_assign_type` (v4.1); `del_station` takes `struct station_del_parameters *`
+  (v4.4); `tdls_mgmt` gained `int link_id`, `stop_ap`/`set_bitrate_mask` gained
+  `link_id` (v6.0/v5.19). The driver is non-MLO so link_id is accepted and
+  ignored. Applied across `gl_cfg80211.c`, `gl_p2p_cfg80211.c`, and headers.
+- **G13 [frank-w] mgmt_frame_register → update_mgmt_frame_registrations** (v5.8)
+  — the per-frame-type callback became a bitmask (`mgmt_frame_regs`);
+  translated back into the PROBE_REQ/ACTION filter logic. Both AIS and P2P.
+- **G14 [frank-w] WIPHY_FLAG_SUPPORTS_SCHED_SCAN removed (v3.15)** — advertised
+  via `wiphy->max_sched_scan_reqs = 1` instead. `gl_init.c`.
+- **G16 [novel] STATION_INFO_* → BIT_ULL(NL80211_STA_INFO_*)** (v4.0 filled
+  bitmap); `ASSOC_REQ_IES` has no NL80211 filled bit — `assoc_req_ies` is
+  passed directly to `cfg80211_new_sta`. `gl_cfg80211.c`, `gl_p2p_*`.
+- **G18 [novel] cross-module EXPORT_SYMBOL** — `gConEmiPhyBase`,
+  `mtk_wcn_consys_hw_wifi_paldo_ctrl` (both in the WMT module, consumed by the
+  gen3 AHB HIF) and `g_IsNeedDoChipReset` (gen3, consumed by the chardev) are
+  now exported so the four modules link.
+- **G19 [novel] sched_setscheduler unexported (v5.9)** — the Wi-Fi kthread
+  priority set uses `sched_set_fifo_low()` (exported); **the vendor's exact
+  numeric priority/policy is not reproduced**, only "elevated RT". `gl_init.c`.
+- **Also: station_parameters.ht_capa/vht_capa/supported_rates moved into
+  `link_sta_params`** (v5.19); **cfg80211_disconnected** gained
+  `locally_generated` (v4.1); **cfg80211_sched_scan_stopped/_stop** gained
+  `u64 reqid` (v4.11); **cfg80211_vendor_event_alloc** gained `wdev` (v4.1);
+  **nla_parse_nested** gained an `extack` arg (v4.12);
+  **sched_scan_request.interval → scan_plans[0].interval** (v4.4);
+  **sockaddr.sa_data** is now a flexible array (zero the whole struct).
+- **N9 [novel] CPU-boost hint no-op** — `kalBoostCpu()` used the MTK PPM driver
+  (`mach/mt_ppm_api.h`), absent mainline; now a no-op (throughput hint only,
+  not correctness). `plat/mt6797/plat_priv.c`.
+
+## Tracked warnings (gen3, not silenced — all pre-existing vendor quality)
+
+Clean-build inventory 2026-08-12: 42 total, dominated by enum-conversion (7),
+discarded-qualifiers (4), int-conversion (3), address (3); plus
+memset-elt-size (2) and stringop-overread (1) worth a look during runtime
+bring-up. None introduced by the port; runtime behavior is out of scope for
+this slice.
