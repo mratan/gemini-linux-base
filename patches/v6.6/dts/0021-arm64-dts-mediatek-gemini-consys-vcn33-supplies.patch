@@ -1,0 +1,20 @@
+arm64: dts: mediatek: gemini: add VCN33 supplies to the consys node
+
+The vendored WMT platform code (modules/connectivity, tracker issue #6)
+powers VCN33_BT / VCN33_WIFI through the regulator API on BT/Wi-Fi
+function-on (consys_hw_bt_vcn33_ctrl / consys_hw_wifi_vcn33_ctrl); the
+node so far only carried the vcn18/vcn28 supplies the CONSYS spike needed
+for chip-ID. Wire the remaining two rails from the existing mt6351
+regulator node so regulator_get("vcn33_bt"/"vcn33_wifi") resolves.
+
+--- a/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
++++ b/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
+@@ -1356,6 +1356,8 @@
+ 		clock-names = "btif";
+ 		vcn18-supply = <&mt6351_vcn18_reg>;
+ 		vcn28-supply = <&mt6351_vcn28_reg>;
++		vcn33_bt-supply = <&mt6351_vcn33_bt_reg>;
++		vcn33_wifi-supply = <&mt6351_vcn33_wifi_reg>;
+ 		memory-region = <&consys_mem>;
+ 	};
+ };

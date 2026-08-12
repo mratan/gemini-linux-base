@@ -67,12 +67,23 @@ for what was vendored). Tags: **[mechanical]** = same behavior, new spelling;
   the CONSYS EMI window runs unprotected. bsg100 tested and eliminated
   EMI-MPU as a G2b factor (blockers.md B-21 #247), and their 6.6 builds ran
   without it; acceptable for bring-up, revisit for hardening.
-- **N2 [novel] ⚠ MT6351 VCN ON_CTRL stubs** (`shim/include/upmu_common.h`) —
-  `pmic_set_register_value(MT6351_PMIC_RG_VCN18/28/33_ON_CTRL*)` compiles to
-  a `pr_warn_once` stub. **RG_VCN28_ON_CTRL=1-before-enable is on the
-  divergence-debug plan's not-yet-eliminated list — these MUST be wired to
-  real pwrap writes (Base tree regulator driver or direct regmap) before any
-  on-device CONSYS test.** Tracked as the top follow-up of this slice.
+- **N2 [novel] MT6351 VCN ON_CTRL — WIRED (was stub)**
+  (`shim/mt6351_pmic.c`, `shim/include/upmu_common.h`) —
+  `pmic_set_register_value()` now performs real writes through the mainline
+  pwrap driver's regmap (same access path as the Base tree's mt6351 VCN
+  regulator driver). Register addr/mask/shift verbatim from vendor
+  `mt6797/include/mach/upmu_hw.h`: VCN18 0x0A52, VCN28 0x0A0C,
+  VCN33_BT 0x0A98, VCN33_WIFI 0x0A9A — all bit 3. The one live call on the
+  non-legacy path is `consys_vcn28_hw_mode_ctrl()` → RG_VCN28_ON_CTRL (the
+  B-21 suspect bit); the others sit in CONFIG_MTK_PMIC_LEGACY branches this
+  port doesn't compile, wired anyway for completeness. Every write logs to
+  dmesg. The VCN18/28/33 rails themselves go through the regulator API
+  (vendor non-legacy path) against the Base tree's mt6351 driver — supply
+  names verified to match dts/0013, and dts/0021 (new) adds the previously
+  missing vcn33_bt/vcn33_wifi supplies to the consys node.
+  Runtime caveat for the bring-up slice: the Base tree's spike driver
+  (soc/0003) binds the same `mediatek,mt6797-consys` node — exactly one of
+  spike/vendor-WMT may be enabled in a given build.
 - **N3 [novel] RTC 32k GPS clock stub** (`shim/include/mtk_rtc.h`) —
   `rtc_gpio_enable_32k(RTC_GPIO_USER_GPS)` no-op; GPS is out of scope for
   the Prototype. Wi-Fi/BT paths never call it.

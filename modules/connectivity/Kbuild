@@ -62,4 +62,5 @@ mtk_stp_wmt_soc-y := \
 	common_main/platform/mtk_wcn_consys_hw.o \
 	common_detect/mtk_wcn_stub_alps.o \
 	common_detect/wmt_gpio.o \
-	shim/consys_stubs.o
+	shim/consys_stubs.o \
+	shim/mt6351_pmic.o
