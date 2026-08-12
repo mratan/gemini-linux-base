@@ -1,0 +1,32 @@
+drm/panfrost: add mediatek,mt6797-mali compatible
+
+Track 2 (GPU/panfrost) staging, UNPROVEN — gemini_linux tracker #7.
+
+Add the MT6797 SoC compatible to panfrost's of_match, pointing at
+default_data (single "mali" supply; the MFG power domain attached via the
+generic single-domain path). Placed before the generic arm,mali-t880
+fallback so the SoC-specific compatible wins. The four Mali shader-core
+domains would need an mt8192-style multi-domain compatible with pm_domain
+names and a relaxed power-domains maxItems in the binding — deferred as a
+known UNPROVEN follow-up; single-MFG-domain attach is enough to probe.
+
+Signed-off-by: mratan <mattdratan@gmail.com>
+
+diff --git a/drivers/gpu/drm/panfrost/panfrost_drv.c b/drivers/gpu/drm/panfrost/panfrost_drv.c
+index a2ab99698..6fb5930d5 100644
+--- a/drivers/gpu/drm/panfrost/panfrost_drv.c
++++ b/drivers/gpu/drm/panfrost/panfrost_drv.c
+@@ -709,6 +709,13 @@ static const struct of_device_id dt_match[] = {
+ 	{ .compatible = "arm,mali-t880", .data = &default_data, },
+ 	{ .compatible = "arm,mali-bifrost", .data = &default_data, },
+ 	{ .compatible = "arm,mali-valhall-jm", .data = &default_data, },
++	/*
++	 * MT6797 (Gemini PDA, Mali Midgard). Single "mali" supply and the
++	 * MFG power domain via generic attach (default_data). Placed before
++	 * the generic arm,mali-t880 fallback so the SoC compatible wins.
++	 * gemini_linux tracker #7 (Track 2, UNPROVEN).
++	 */
++	{ .compatible = "mediatek,mt6797-mali", .data = &default_data },
+ 	{ .compatible = "mediatek,mt8183-mali", .data = &mediatek_mt8183_data },
+ 	{ .compatible = "mediatek,mt8183b-mali", .data = &mediatek_mt8183_b_data },
+ 	{ .compatible = "mediatek,mt8186-mali", .data = &mediatek_mt8186_data },

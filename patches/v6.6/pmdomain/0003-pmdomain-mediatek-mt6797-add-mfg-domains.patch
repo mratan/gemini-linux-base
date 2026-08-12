@@ -1,0 +1,150 @@
+pmdomain: mediatek: mt6797: add MFG (GPU) power domains
+
+Track 2 (GPU/panfrost) staging, UNPROVEN — gemini_linux tracker #7.
+
+Populate the MFG main domain and the four Mali shader-core domains
+(MFG_CORE0..3) in scp_domain_data_mt6797[], and add the MFG hierarchy to
+scp_subdomain_mt6797[]. MFG_ASYNC was already present (it gates the "mfg"
+clock); this extends the same table rather than adding a parallel driver,
+so panfrost has a power-domain to attach to.
+
+All register values are derived from the vendor 3.18 runtime power-gating
+driver ubports-3.18 drivers/clk/mediatek/clk-mt6797-pg.c (the file the
+base tree's CONN comment already names as the authoritative runtime path):
+
+  ctl_offs   MFG   0x338  (MFG_PWR_CON,        pg.c:140)
+             CORE0 0x340  (MFG_CORE0_PWR_CON,  pg.c:142)
+             CORE1 0x344  (MFG_CORE1_PWR_CON,  pg.c:143)
+             CORE2 0x348  (MFG_CORE2_PWR_CON,  pg.c:144)
+             CORE3 0x34c  (MFG_CORE3_PWR_CON,  pg.c:145)
+  sta_mask   MFG   BIT(12) (MFG_PWR_STA_MASK,       pg.c:210)
+             CORE0 BIT(11) (MFG_CORE0_PWR_STA_MASK, pg.c:209)
+             CORE1 BIT(10) (MFG_CORE1_PWR_STA_MASK, pg.c:208)
+             CORE2 BIT(9)  (MFG_CORE2_PWR_STA_MASK, pg.c:207)
+             CORE3 BIT(8)  (MFG_CORE3_PWR_STA_MASK, pg.c:206)
+  hierarchy  mfg_async -> mfg -> core0..3
+             (power-on order pg.c:2654-2659)
+
+Deliberate deviations, each justified (see the in-code comment for full
+detail):
+
+ * sram_pdn_bits/ack = 0. mt6797 keeps MFG SRAM in a SEPARATE register
+   (MFG_SRAM_CON 0x33C, pg.c:141; main PDN/ACK 0x3<<0 / 0x3<<16 pg.c:239-240;
+   each core polls its ACK BIT(20..23) from MFG_SRAM_CON pg.c:231-238,935-937).
+   The mainline scpsys SRAM engine reads PDN and ACK from ctl_offs only, so a
+   cross-register ACK cannot be expressed; driving it would poll the wrong
+   address and hang. SRAM is left at reset state — a KNOWN device-free gap.
+
+ * bus_prot_mask = 0. The vendor MFG TOPAXI protection (BIT(21),
+   MFG_PROT_MASK pg.c:195) is COMMENTED OUT in the runtime path (pg.c:444-447);
+   the working vendor stack does not apply it, so neither do we.
+
+ * caps = MTK_SCPD_KEEP_DEFAULT_OFF on all five (Track-2 safety, not a hw
+   value). scpsys otherwise powers every populated domain on at probe;
+   powering MFG on an untested path risks the MM-domain-style bus wedge
+   (blockers.md B-13) and would regress the display/Wi-Fi boot sharing this
+   provider. Off-until-consumer (same cap the base tree uses for CONN) means
+   adding these entries cannot regress non-GPU boot.
+
+UNPROVEN: no device has powered these domains. Gate is compile-clean in CI.
+
+Signed-off-by: mratan <mattdratan@gmail.com>
+
+diff --git a/drivers/pmdomain/mediatek/mtk-scpsys.c b/drivers/pmdomain/mediatek/mtk-scpsys.c
+index e8cb91069..c972619f5 100644
+--- a/drivers/pmdomain/mediatek/mtk-scpsys.c
++++ b/drivers/pmdomain/mediatek/mtk-scpsys.c
+@@ -842,6 +842,80 @@ static const struct scp_domain_data scp_domain_data_mt6797[] = {
+ 		.sram_pdn_ack_bits = 0,
+ 		.clk_id = {CLK_MFG},
+ 	},
++	/*
++	 * MFG (Mali GPU top) and its four shader-core domains. Register
++	 * data from the vendor clk-mt6797-pg.c (the file the base tree's
++	 * CONN comment identifies as the authoritative runtime power path):
++	 *   ctl_offs  MFG 0x338, CORE0..3 0x340/0x344/0x348/0x34c (pg.c:140-145)
++	 *   sta_mask  MFG BIT(12), CORE0..3 BIT(11)/BIT(10)/BIT(9)/BIT(8)
++	 *             (MFG*_PWR_STA_MASK, pg.c:206-210)
++	 *   hierarchy mfg_async -> mfg -> core0..3 (pg.c power-on order 2654)
++	 *
++	 * sram_pdn_bits/ack are 0: mt6797 keeps MFG SRAM in a SEPARATE
++	 * register (MFG_SRAM_CON 0x33C, pg.c:141) that the single-register
++	 * scpsys SRAM engine cannot reach (main PDN/ACK 0x3<<0 / 0x3<<16;
++	 * each core polls its ACK BIT(20..23) from MFG_SRAM_CON, pg.c:231-240,
++	 * 935-937). Driving an ACK that lives in another register would poll
++	 * the wrong address and hang, so SRAM is left in its reset state --
++	 * a known device-free gap (UNPROVEN), not a probe blocker.
++	 *
++	 * bus_prot_mask = 0: the vendor MFG TOPAXI protection (BIT(21),
++	 * MFG_PROT_MASK pg.c:195) is COMMENTED OUT in the runtime path
++	 * (pg.c:444-447), i.e. the working vendor stack does not apply it.
++	 *
++	 * caps = MTK_SCPD_KEEP_DEFAULT_OFF (Track-2 safety, not a hw value):
++	 * scpsys otherwise powers every populated domain on at probe, and
++	 * powering MFG on an untested path risks the MM-domain-style bus
++	 * wedge (blockers.md B-13) that would regress the display/Wi-Fi boot
++	 * sharing this provider. Leaving them off until panfrost (a module,
++	 * absent from the boot path) attaches means adding these entries
++	 * cannot regress non-GPU boot.
++	 */
++	[MT6797_POWER_DOMAIN_MFG] = {
++		.name = "mfg",
++		.sta_mask = BIT(12),
++		.ctl_offs = 0x338,
++		.sram_pdn_bits = 0,
++		.sram_pdn_ack_bits = 0,
++		.clk_id = {CLK_NONE},
++		.caps = MTK_SCPD_KEEP_DEFAULT_OFF,
++	},
++	[MT6797_POWER_DOMAIN_MFG_CORE0] = {
++		.name = "mfg_core0",
++		.sta_mask = BIT(11),
++		.ctl_offs = 0x340,
++		.sram_pdn_bits = 0,
++		.sram_pdn_ack_bits = 0,
++		.clk_id = {CLK_NONE},
++		.caps = MTK_SCPD_KEEP_DEFAULT_OFF,
++	},
++	[MT6797_POWER_DOMAIN_MFG_CORE1] = {
++		.name = "mfg_core1",
++		.sta_mask = BIT(10),
++		.ctl_offs = 0x344,
++		.sram_pdn_bits = 0,
++		.sram_pdn_ack_bits = 0,
++		.clk_id = {CLK_NONE},
++		.caps = MTK_SCPD_KEEP_DEFAULT_OFF,
++	},
++	[MT6797_POWER_DOMAIN_MFG_CORE2] = {
++		.name = "mfg_core2",
++		.sta_mask = BIT(9),
++		.ctl_offs = 0x348,
++		.sram_pdn_bits = 0,
++		.sram_pdn_ack_bits = 0,
++		.clk_id = {CLK_NONE},
++		.caps = MTK_SCPD_KEEP_DEFAULT_OFF,
++	},
++	[MT6797_POWER_DOMAIN_MFG_CORE3] = {
++		.name = "mfg_core3",
++		.sta_mask = BIT(8),
++		.ctl_offs = 0x34c,
++		.sram_pdn_bits = 0,
++		.sram_pdn_ack_bits = 0,
++		.clk_id = {CLK_NONE},
++		.caps = MTK_SCPD_KEEP_DEFAULT_OFF,
++	},
+ 	[MT6797_POWER_DOMAIN_MJC] = {
+ 		.name = "mjc",
+ 		.sta_mask = BIT(20),
+@@ -900,6 +974,12 @@ static const struct scp_subdomain scp_subdomain_mt6797[] = {
+ 	{MT6797_POWER_DOMAIN_MM, MT6797_POWER_DOMAIN_ISP},
+ 	{MT6797_POWER_DOMAIN_MM, MT6797_POWER_DOMAIN_VENC},
+ 	{MT6797_POWER_DOMAIN_MM, MT6797_POWER_DOMAIN_MJC},
++	/* GPU hierarchy: mfg_async -> mfg -> mfg_core0..3 (pg.c:2654) */
++	{MT6797_POWER_DOMAIN_MFG_ASYNC, MT6797_POWER_DOMAIN_MFG},
++	{MT6797_POWER_DOMAIN_MFG, MT6797_POWER_DOMAIN_MFG_CORE0},
++	{MT6797_POWER_DOMAIN_MFG, MT6797_POWER_DOMAIN_MFG_CORE1},
++	{MT6797_POWER_DOMAIN_MFG, MT6797_POWER_DOMAIN_MFG_CORE2},
++	{MT6797_POWER_DOMAIN_MFG, MT6797_POWER_DOMAIN_MFG_CORE3},
+ };
+ 
+ /*

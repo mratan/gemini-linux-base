@@ -1,0 +1,40 @@
+dt-bindings: gpu: mali-midgard: add mediatek,mt6797-mali
+
+Track 2 (GPU/panfrost) staging, UNPROVEN — gemini_linux tracker #7.
+
+The MT6797 (Helio X20/X27) integrates a Midgard-class Mali. Add a binding
+entry so the Gemini PDA GPU node validates under dtbs_check: SoC compatible
+"mediatek,mt6797-mali" with the generic "arm,mali-t880" fallback (already in
+the panfrost of_match table, and already present here as a commented
+placeholder — this promotes it to a real, matchable const).
+
+Model choice, FLAGGED FOR OWNER REVIEW: our project notes call this a
+Mali-T880 MP4, but the vendor 3.18 DTS (ubports-3.18
+arch/arm64/boot/dts/mt6797.dts, node mali@13040000) labels the GPU
+"arm,malit860"/"arm,mali-t86x". Panfrost identifies the actual GPU at runtime
+from the GPU_ID register, so the fallback string is used only for driver
+match + this schema check, never for capability; the T880-vs-T860 die is
+immaterial to probe and unconfirmed without reading the part on hardware. We
+use arm,mali-t880 per the project's stated target; arm,mali-t860 is the
+vendor-DTS-consistent alternative (both resolve to panfrost default_data).
+
+Signed-off-by: mratan <mattdratan@gmail.com>
+
+diff --git a/Documentation/devicetree/bindings/gpu/arm,mali-midgard.yaml b/Documentation/devicetree/bindings/gpu/arm,mali-midgard.yaml
+index ca02baba5..4e79871a2 100644
+--- a/Documentation/devicetree/bindings/gpu/arm,mali-midgard.yaml
++++ b/Documentation/devicetree/bindings/gpu/arm,mali-midgard.yaml
+@@ -44,9 +44,12 @@ properties:
+           - enum:
+               - rockchip,rk3399-mali
+           - const: arm,mali-t860
++      - items:
++          - enum:
++              - mediatek,mt6797-mali
++          - const: arm,mali-t880
+ 
+           # "arm,mali-t830"
+-          # "arm,mali-t880"
+ 
+   reg:
+     maxItems: 1
