@@ -78,6 +78,11 @@ jobs:
       - name: dtbs_check — External-display nodes (sii9022 + mt6797 DPI)
         run: |
           python3 -m pip install --break-system-packages --quiet dtschema yamllint
+          # Ensure the dtschema console scripts are reachable; without dt-validate
+          # on PATH `make CHECK_DTBS=y` silently skips validation (a false pass),
+          # so assert it resolves before trusting the gate.
+          export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
+          command -v dt-validate >/dev/null || { echo "dt-validate not found after pip install"; exit 1; }
           cd "$GITHUB_WORKSPACE/linux-6.6"
           dtb=arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dtb
           fail=0
