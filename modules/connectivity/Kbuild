@@ -1,0 +1,65 @@
+# Out-of-tree build of the vendored MT6797 CONSYS connectivity stack
+# (WMT core + BTIF) against the Linux 6.6 Base tree.
+#
+# Source provenance: see PROVENANCE.md. Object lists mirror the vendor
+# 3.18 Makefiles' CONFIG_MTK_COMBO=y + CONSYS_6797 selection (external-chip
+# ICs, SDIO/UART transports, and the LTE-coex IDC path are excluded).
+# Every 6.6-compatibility change to the sources is logged in API-CHURN-LOG.md.
+
+ccflags-y := \
+	-I$(src)/shim/include \
+	-I$(src)/common_main/include \
+	-I$(src)/common_main/core/include \
+	-I$(src)/common_main/linux/include \
+	-I$(src)/common_main/platform/include \
+	-I$(src)/common_detect \
+	-I$(src)/btif/inc \
+	-I$(src)/btif/plat_inc
+
+# Vendor build flags for the CONSYS/SoC path (from the 3.18 Makefiles),
+# minus -Werror: warnings in ported code are tracked, not silenced.
+ccflags-y += \
+	-DWMT_PLAT_ALPS=1 \
+	-DWMT_UART_RX_MODE_WORK=0 \
+	-DWMT_SDIO_MODE=1 \
+	-DWMT_CREATE_NODE_DYNAMIC=1 \
+	-DMTK_WCN_WMT_STP_EXP_SYMBOL_ABSTRACT \
+	-DWMT_IDC_SUPPORT=0 \
+	-DCONFIG_ARCH_MT6797
+
+# BTIF transport (AP<->CONSYS on-chip channel)
+obj-m += mtk_btif.o
+mtk_btif-y := \
+	btif/mtk_btif.o \
+	btif/mtk_btif_exp.o \
+	btif/btif_plat.o \
+	btif/btif_dma_plat.o
+
+# WMT core + STP + SoC platform glue, as one module (keeps the vendor's
+# intra-stack symbol web internal; exports stay available for wlan gen3)
+obj-m += mtk_stp_wmt_soc.o
+mtk_stp_wmt_soc-y := \
+	common_main/core/wmt_core.o \
+	common_main/core/wmt_ctrl.o \
+	common_main/core/wmt_func.o \
+	common_main/core/wmt_lib.o \
+	common_main/core/wmt_conf.o \
+	common_main/core/wmt_exp.o \
+	common_main/core/wmt_ic_soc.o \
+	common_main/core/stp_exp.o \
+	common_main/core/stp_core.o \
+	common_main/core/psm_core.o \
+	common_main/core/btm_core.o \
+	common_main/linux/osal.o \
+	common_main/linux/stp_dbg.o \
+	common_main/linux/stp_dbg_soc.o \
+	common_main/linux/wmt_dbg.o \
+	common_main/linux/wmt_dev.o \
+	common_main/linux/bgw_desense.o \
+	common_main/linux/stp_btif.o \
+	common_main/platform/mt6797.o \
+	common_main/platform/wmt_plat_alps.o \
+	common_main/platform/mtk_wcn_consys_hw.o \
+	common_detect/mtk_wcn_stub_alps.o \
+	common_detect/wmt_gpio.o \
+	shim/consys_stubs.o

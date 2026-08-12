@@ -66,6 +66,13 @@ jobs:
           BUILD_NN="${{ github.run_number }}" \
             ./scripts/build.sh build
 
+      # Slice 5 (tracker issue #6): the vendored WMT core + BTIF must compile
+      # and pass modpost against the kernel built above, on every change.
+      - name: Build connectivity modules (WMT core + BTIF)
+        run: |
+          make -C "$GITHUB_WORKSPACE/linux-6.6" \
+            M="$GITHUB_WORKSPACE/modules/connectivity" modules
+
       - name: Collect and hash artifacts
         run: |
           mkdir -p "$GITHUB_WORKSPACE/out"
@@ -74,8 +81,9 @@ jobs:
           cp "$GITHUB_WORKSPACE/linux-6.6/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dtb" \
              "$GITHUB_WORKSPACE/out/"
           cp "$GITHUB_WORKSPACE/linux-6.6/.config" "$GITHUB_WORKSPACE/out/kernel.config"
+          cp "$GITHUB_WORKSPACE"/modules/connectivity/*.ko "$GITHUB_WORKSPACE/out/"
           cd "$GITHUB_WORKSPACE/out"
-          sha256sum Image.gz mt6797-gemini-pda.dtb kernel.config | tee SHA256SUMS
+          sha256sum Image.gz mt6797-gemini-pda.dtb kernel.config *.ko | tee SHA256SUMS
           { echo '## Kernel build artifacts (SHA-256)'; echo '```'; cat SHA256SUMS; echo '```'; } \
             >> "$GITHUB_STEP_SUMMARY"
 
