@@ -34,8 +34,11 @@ done
     || { echo "usage: see header" >&2; exit 2; }
 
 : > "$LOG"
+# -nic none: the default virtio-net NIC would demand the iPXE option ROM
+# (efi-virtio.rom), which Ubuntu's qemu-system-arm does not ship; the tests
+# need no network. Same reason for romfile= on the disk device.
 qemu-system-aarch64 \
-    -machine virt -cpu max -smp 2 -m 1024 \
+    -machine virt -cpu max -smp 2 -m 1024 -nic none \
     -display none -serial "file:$LOG" -monitor none \
     -kernel "$KERNEL" -initrd "$INITRD" \
     -append "console=ttyAMA0 panic=-1 $APPEND" \
