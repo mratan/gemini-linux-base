@@ -66,9 +66,12 @@ jobs:
           BUILD_NN="${{ github.run_number }}" \
             ./scripts/build.sh build
 
-      # Slice 5 (tracker issue #6): the vendored WMT core + BTIF must compile
-      # and pass modpost against the kernel built above, on every change.
-      - name: Build connectivity modules (WMT core + BTIF)
+      # Slices 5 & 9 (tracker issues #6, #10): the vendored connectivity
+      # modules — WMT core, BTIF, Wi-Fi chardev and the Gen3 WLAN driver —
+      # must compile and pass modpost against the kernel built above, on
+      # every change. (The gen3 config fragment in configs/ is merged by the
+      # config step above, enabling NL80211_TESTMODE / WEXT that gen3 needs.)
+      - name: Build connectivity modules (WMT core + BTIF + Gen3 WLAN)
         run: |
           make -C "$GITHUB_WORKSPACE/linux-6.6" \
             M="$GITHUB_WORKSPACE/modules/connectivity" modules

@@ -66,6 +66,7 @@ static INT32 mtk_wmt_remove(struct platform_device *pdev);
 UINT8 __iomem *pEmibaseaddr;
 UINT64 gConEmiSize;
 phys_addr_t gConEmiPhyBase;
+EXPORT_SYMBOL(gConEmiPhyBase);
 
 P_WMT_CONSYS_IC_OPS wmt_consys_ic_ops;
 
@@ -283,6 +284,8 @@ INT32 mtk_wcn_consys_hw_wifi_paldo_ctrl(UINT32 enable)
 		wmt_consys_ic_ops->consys_ic_hw_wifi_vcn33_ctrl(enable);
 	return 0;
 }
+/* consumed by wlan_gen3's AHB HIF (API-CHURN-LOG.md G18) */
+EXPORT_SYMBOL(mtk_wcn_consys_hw_wifi_paldo_ctrl);
 
 INT32 mtk_wcn_consys_hw_vcn28_ctrl(UINT32 enable)
 {
