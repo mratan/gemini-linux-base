@@ -1,9 +1,15 @@
+arm64: dts: mediatek: gemini: right-port mux select — rebased to 0025
+
+VS2 right-port mux node/pinctrl. Renumbered from 0024 and re-based to append
+after the panfrost GPU node (0024), resolving the shared board-dts EOF-anchor
+collision between the two 0024 patches. No functional change vs the VS2 branch.
+
 diff --git a/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts b/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
-index 0eccc52de..f3b9ad89d 100644
+index 46be5851b..116e56fca 100644
 --- a/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
 +++ b/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
-@@ -1730,3 +1730,87 @@ pins-ctrl {
- 		};
+@@ -1856,3 +1856,87 @@ vgpu: regulator@60 {
+ 		regulator-boot-on;
  	};
  };
 +
