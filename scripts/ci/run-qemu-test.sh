@@ -39,7 +39,8 @@ qemu-system-aarch64 \
     -display none -serial "file:$LOG" -monitor none \
     -kernel "$KERNEL" -initrd "$INITRD" \
     -append "console=ttyAMA0 panic=-1 $APPEND" \
-    -drive "file=$DISK,format=raw,if=virtio" \
+    -drive "file=$DISK,format=raw,if=none,id=hd0" \
+    -device "virtio-blk-pci,drive=hd0,romfile=" \
     -no-reboot &
 QPID=$!
 cleanup() { kill -9 "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; }
