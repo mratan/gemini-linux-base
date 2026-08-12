@@ -1,0 +1,75 @@
+# CI baseline build (mratan fork — gemini_linux tracker issue #2, "Slice 1").
+#
+# Builds the unmodified Base tree pipeline from a clean checkout on every push:
+# vanilla kernel.org v6.6 + patches/v6.6/ (scripts/build.sh patch) + configs/
+# fragments (scripts/build.sh config), cross-compiled for arm64, publishing
+# hashed artifacts (Image.gz + mt6797-gemini-pda.dtb + .config + SHA256SUMS).
+name: kernel-build
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    env:
+      ARCH: arm64
+      CROSS_COMPILE: aarch64-linux-gnu-
+    steps:
+      - name: Check out project tree
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-aarch64-linux-gnu flex bison bc libssl-dev libelf-dev \
+            kmod cpio rsync
+
+      - name: Fetch vanilla Linux v6.6 (the pinned kernel base)
+        run: |
+          git clone --depth 1 --branch v6.6 \
+            https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git \
+            "$GITHUB_WORKSPACE/linux-6.6"
+
+      - name: Apply project patches (scripts/build.sh patch)
+        run: |
+          LINUX_SRC="$GITHUB_WORKSPACE/linux-6.6" \
+          PATCHES_DIR="$GITHUB_WORKSPACE/patches/v6.6" \
+            ./scripts/build.sh patch
+
+      - name: Generate .config (defconfig + fragments)
+        run: |
+          LINUX_SRC="$GITHUB_WORKSPACE/linux-6.6" \
+          CONFIG_FRAGMENTS="$GITHUB_WORKSPACE/configs" \
+            ./scripts/build.sh config
+
+      - name: Build Image.gz + dtbs + modules
+        run: |
+          LINUX_SRC="$GITHUB_WORKSPACE/linux-6.6" \
+          BUILD_NN="${{ github.run_number }}" \
+            ./scripts/build.sh build
+
+      - name: Collect and hash artifacts
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          cp "$GITHUB_WORKSPACE/linux-6.6/arch/arm64/boot/Image.gz" \
+             "$GITHUB_WORKSPACE/out/"
+          cp "$GITHUB_WORKSPACE/linux-6.6/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dtb" \
+             "$GITHUB_WORKSPACE/out/"
+          cp "$GITHUB_WORKSPACE/linux-6.6/.config" "$GITHUB_WORKSPACE/out/kernel.config"
+          cd "$GITHUB_WORKSPACE/out"
+          sha256sum Image.gz mt6797-gemini-pda.dtb kernel.config | tee SHA256SUMS
+          { echo '## Kernel build artifacts (SHA-256)'; echo '```'; cat SHA256SUMS; echo '```'; } \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: gemini-kernel-${{ github.run_number }}-${{ github.sha }}
+          path: out/
+          if-no-files-found: error
