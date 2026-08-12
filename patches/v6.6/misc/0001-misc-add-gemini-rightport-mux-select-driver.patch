@@ -1,0 +1,353 @@
+diff --git a/Documentation/devicetree/bindings/misc/planet,gemini-rightport-mux.yaml b/Documentation/devicetree/bindings/misc/planet,gemini-rightport-mux.yaml
+new file mode 100644
+index 000000000..2841d8d9f
+--- /dev/null
++++ b/Documentation/devicetree/bindings/misc/planet,gemini-rightport-mux.yaml
+@@ -0,0 +1,79 @@
++# SPDX-License-Identifier: GPL-2.0-only OR BSD-2-Clause
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/misc/planet,gemini-rightport-mux.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: Planet Gemini PDA right-port USB-C HDMI/USB-host mux
++
++maintainers:
++  - Gemini PDA Linux Project <gemini-linux@users.noreply.github.com>
++
++description: |
++  The Planet Gemini PDA's right USB-C port is a hardware mux: its pins carry
++  EITHER HDMI TMDS (from the on-board SiI9024A transmitter) OR USB-2 host,
++  never both. Three SoC GPIOs drive the mux; sw7226-en is the master select
++  (low = HDMI, high = USB), so HDMI-out and right-port USB host are mutually
++  exclusive. The near-term selection is static (a DT default) plus a runtime
++  sysfs "mode" attribute, deliberately decoupled from the Type-C/fusb302 CC
++  state machine.
++
++properties:
++  compatible:
++    const: planet,gemini-rightport-mux
++
++  sw-en-gpios:
++    maxItems: 1
++    description: |
++      OTG/HDMI lane-mux enable (vendor fusb301a_sw_en, GPIO70). Driven low for
++      HDMI, high for USB host.
++
++  sw-sel-gpios:
++    maxItems: 1
++    description: |
++      Lane orientation select (vendor fusb301a_sw_sel, GPIO71); the CC
++      orientation in HDMI mode (CC1 = low, CC2 = high). Static selection uses
++      the CC1 default; CC-driven orientation is part of HPD-gated switching.
++
++  sw7226-en-gpios:
++    maxItems: 1
++    description: |
++      Master mux select and USB VBUS load-switch enable (vendor sw7226_en,
++      GPIO72). Low routes HDMI, high routes USB host — the mutual-exclusion
++      interlock.
++
++  planet,default-mode:
++    $ref: /schemas/types.yaml#/definitions/string
++    enum: [ hdmi, usb-host ]
++    default: usb-host
++    description: |
++      Mux mode applied at probe. Defaults to usb-host to preserve the
++      right-port host bring-up behaviour.
++
++  pinctrl-names:
++    items:
++      - const: hdmi
++      - const: usb-host
++
++  pinctrl-0: true
++  pinctrl-1: true
++
++required:
++  - compatible
++  - sw-en-gpios
++  - sw-sel-gpios
++  - sw7226-en-gpios
++
++additionalProperties: false
++
++examples:
++  - |
++    #include <dt-bindings/gpio/gpio.h>
++
++    rightport-mux {
++        compatible = "planet,gemini-rightport-mux";
++        sw-en-gpios = <&pio 70 GPIO_ACTIVE_HIGH>;
++        sw-sel-gpios = <&pio 71 GPIO_ACTIVE_HIGH>;
++        sw7226-en-gpios = <&pio 72 GPIO_ACTIVE_HIGH>;
++        planet,default-mode = "usb-host";
++    };
+diff --git a/drivers/misc/Kconfig b/drivers/misc/Kconfig
+index cadd4a820..2d45c9520 100644
+--- a/drivers/misc/Kconfig
++++ b/drivers/misc/Kconfig
+@@ -562,6 +562,21 @@ config TPS6594_PFSM
+ 	  This driver can also be built as a module.  If so, the module
+ 	  will be called tps6594-pfsm.
+ 
++config GEMINI_RIGHTPORT_MUX
++	tristate "Planet Gemini PDA right-port USB-C HDMI/USB-host mux"
++	depends on GPIOLIB
++	depends on OF
++	help
++	  Static/sysfs selection driver for the Planet Gemini PDA's right
++	  USB-C port hardware mux, which routes the port to EITHER the on-board
++	  SiI9024A HDMI transmitter OR USB-2 host — never both. Drives the three
++	  mux GPIOs (sw_en/sw_sel/sw7226_en) and exposes a "mode" sysfs attribute
++	  (hdmi / usb-host). Decoupled from the Type-C state machine; HPD-gated
++	  automatic switching is not implemented here.
++
++	  If unsure, say N. If built as a module it is called
++	  gemini-rightport-mux.
++
+ source "drivers/misc/c2port/Kconfig"
+ source "drivers/misc/eeprom/Kconfig"
+ source "drivers/misc/cb710/Kconfig"
+diff --git a/drivers/misc/Makefile b/drivers/misc/Makefile
+index f2a4d1ff6..4fed2985a 100644
+--- a/drivers/misc/Makefile
++++ b/drivers/misc/Makefile
+@@ -67,3 +67,4 @@ obj-$(CONFIG_TMR_MANAGER)      += xilinx_tmr_manager.o
+ obj-$(CONFIG_TMR_INJECT)	+= xilinx_tmr_inject.o
+ obj-$(CONFIG_TPS6594_ESM)	+= tps6594-esm.o
+ obj-$(CONFIG_TPS6594_PFSM)	+= tps6594-pfsm.o
++obj-$(CONFIG_GEMINI_RIGHTPORT_MUX)	+= gemini-rightport-mux.o
+diff --git a/drivers/misc/gemini-rightport-mux.c b/drivers/misc/gemini-rightport-mux.c
+new file mode 100644
+index 000000000..8379053bf
+--- /dev/null
++++ b/drivers/misc/gemini-rightport-mux.c
+@@ -0,0 +1,227 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Planet Gemini PDA right-port USB-C mux — static/sysfs selection.
++ *
++ * The Gemini's right USB-C port is a hardware mux: its pins carry EITHER
++ * HDMI TMDS (from the on-board SiI9024A transmitter) OR USB-2 host, never
++ * both. The mux is driven by three SoC GPIOs (evidence: vendor 3.18
++ * drivers/misc/mediatek/usb_c/fusb302/usb_typec.c, fusb300_gpio_init /
++ * fusb300_eint_work; aeon_gpio names in parentheses):
++ *
++ *   sw-en     GPIO70  (fusb301a_sw_en)   OTG/HDMI lane-mux enable
++ *   sw-sel    GPIO71  (fusb301a_sw_sel)  CC orientation (CC1=0 / CC2=1)
++ *   sw7226-en GPIO72  (sw7226_en)        master select: low = HDMI, high = USB
++ *
++ * The vendor drives them as (logical/active-high values):
++ *   USB host : sw_en=1, sw_sel=0, sw7226=1
++ *   HDMI     : sw_en=0, sw_sel=<CC orientation>, sw7226=0
++ *
++ * GPIO72 (sw7226_en) is the master interlock — low routes HDMI, high routes
++ * USB — so HDMI-out and right-port USB host are mutually exclusive by
++ * construction: this driver owns all three lines and applies exactly one
++ * mode at a time under a mutex, and there is no GPIO72 value that selects
++ * both. See ADR-0003 and CONTEXT.md ("Right-port mux").
++ *
++ * This is the near-term static/sysfs selection (PRD #12 user story 15,
++ * tracker #16), DELIBERATELY DECOUPLED from the Type-C/fusb302 state machine:
++ * the mode is chosen by DT default + a sysfs write, not by CC attach/HPD.
++ * Automatic HPD-gated switching (vendor CC-attach -> 5 ms settle -> read
++ * sil9022 HPD -> mux, replicating fusb300_eint_work, including the CC1/CC2
++ * orientation on sw_sel) is out of scope here — that is tracker #19.
++ *
++ * Select the mode at runtime via sysfs:
++ *   cat  /sys/.../mode          -> "hdmi" or "usb-host"
++ *   echo hdmi     > .../mode    -> route the right port to HDMI out
++ *   echo usb-host > .../mode    -> route the right port to USB-2 host
++ */
++
++#include <linux/gpio/consumer.h>
++#include <linux/mod_devicetable.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/pinctrl/consumer.h>
++#include <linux/platform_device.h>
++#include <linux/property.h>
++#include <linux/sysfs.h>
++
++enum rpmux_mode {
++	RPMUX_USB_HOST = 0,
++	RPMUX_HDMI = 1,
++};
++
++static const char *const rpmux_mode_name[] = {
++	[RPMUX_USB_HOST] = "usb-host",
++	[RPMUX_HDMI] = "hdmi",
++};
++
++struct rpmux {
++	struct device *dev;
++	struct mutex lock;		/* serialises mode changes */
++	struct gpio_desc *sw_en;	/* GPIO70 fusb301a_sw_en */
++	struct gpio_desc *sw_sel;	/* GPIO71 fusb301a_sw_sel (CC orientation) */
++	struct gpio_desc *sw7226_en;	/* GPIO72 sw7226_en (low=HDMI, high=USB) */
++	struct pinctrl *pinctrl;
++	struct pinctrl_state *pins_hdmi;
++	struct pinctrl_state *pins_usb;
++	enum rpmux_mode mode;
++};
++
++/*
++ * Drive all three lines to the requested mode, then select the matching
++ * pinctrl state. Caller holds rp->lock. Because sw7226_en is the master
++ * interlock this is the single point that enforces HDMI/USB mutual exclusion.
++ */
++static void rpmux_apply(struct rpmux *rp, enum rpmux_mode mode)
++{
++	struct pinctrl_state *pins;
++
++	if (mode == RPMUX_HDMI) {
++		/* HDMI: master low, lane-mux enable low, CC1 orientation. */
++		gpiod_set_value_cansleep(rp->sw7226_en, 0);
++		gpiod_set_value_cansleep(rp->sw_en, 0);
++		gpiod_set_value_cansleep(rp->sw_sel, 0);
++		pins = rp->pins_hdmi;
++	} else {
++		/* USB host: master high, lane-mux enable high, sel low. */
++		gpiod_set_value_cansleep(rp->sw_en, 1);
++		gpiod_set_value_cansleep(rp->sw_sel, 0);
++		gpiod_set_value_cansleep(rp->sw7226_en, 1);
++		pins = rp->pins_usb;
++	}
++
++	if (rp->pinctrl && pins)
++		pinctrl_select_state(rp->pinctrl, pins);
++
++	rp->mode = mode;
++}
++
++static ssize_t mode_show(struct device *dev, struct device_attribute *attr,
++			 char *buf)
++{
++	struct rpmux *rp = dev_get_drvdata(dev);
++
++	return sysfs_emit(buf, "%s\n", rpmux_mode_name[rp->mode]);
++}
++
++static ssize_t mode_store(struct device *dev, struct device_attribute *attr,
++			  const char *buf, size_t count)
++{
++	struct rpmux *rp = dev_get_drvdata(dev);
++	int mode;
++
++	mode = sysfs_match_string(rpmux_mode_name, buf);
++	if (mode < 0)
++		return mode;
++
++	mutex_lock(&rp->lock);
++	rpmux_apply(rp, mode);
++	mutex_unlock(&rp->lock);
++
++	dev_info(dev, "right port -> %s\n", rpmux_mode_name[mode]);
++	return count;
++}
++static DEVICE_ATTR_RW(mode);
++
++static struct attribute *rpmux_attrs[] = {
++	&dev_attr_mode.attr,
++	NULL,
++};
++ATTRIBUTE_GROUPS(rpmux);
++
++static int rpmux_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	const char *def = "usb-host";
++	enum rpmux_mode mode;
++	struct rpmux *rp;
++	int ret;
++
++	rp = devm_kzalloc(dev, sizeof(*rp), GFP_KERNEL);
++	if (!rp)
++		return -ENOMEM;
++
++	rp->dev = dev;
++	mutex_init(&rp->lock);
++
++	/*
++	 * Request the three lines as outputs. Their initial output value is
++	 * set from the DT default mode a few lines below; GPIOD_ASIS here just
++	 * claims them (they were freed from their bring-up gpio-hogs in the
++	 * board DTS so this driver can own them).
++	 */
++	rp->sw_en = devm_gpiod_get(dev, "sw-en", GPIOD_ASIS);
++	if (IS_ERR(rp->sw_en))
++		return dev_err_probe(dev, PTR_ERR(rp->sw_en), "sw-en gpio\n");
++
++	rp->sw_sel = devm_gpiod_get(dev, "sw-sel", GPIOD_ASIS);
++	if (IS_ERR(rp->sw_sel))
++		return dev_err_probe(dev, PTR_ERR(rp->sw_sel), "sw-sel gpio\n");
++
++	rp->sw7226_en = devm_gpiod_get(dev, "sw7226-en", GPIOD_ASIS);
++	if (IS_ERR(rp->sw7226_en))
++		return dev_err_probe(dev, PTR_ERR(rp->sw7226_en),
++				     "sw7226-en gpio\n");
++
++	/* Optional pinctrl states (both mux the pins to plain GPIO function). */
++	rp->pinctrl = devm_pinctrl_get(dev);
++	if (IS_ERR(rp->pinctrl)) {
++		rp->pinctrl = NULL;
++	} else {
++		rp->pins_hdmi = pinctrl_lookup_state(rp->pinctrl, "hdmi");
++		if (IS_ERR(rp->pins_hdmi))
++			rp->pins_hdmi = NULL;
++		rp->pins_usb = pinctrl_lookup_state(rp->pinctrl, "usb-host");
++		if (IS_ERR(rp->pins_usb))
++			rp->pins_usb = NULL;
++	}
++
++	/* Default mode: preserve the historical right-port-host bring-up. */
++	device_property_read_string(dev, "planet,default-mode", &def);
++	mode = sysfs_match_string(rpmux_mode_name, def);
++	if (mode < 0) {
++		dev_warn(dev, "bad planet,default-mode \"%s\", using usb-host\n",
++			 def);
++		mode = RPMUX_USB_HOST;
++	}
++
++	mutex_lock(&rp->lock);
++	rpmux_apply(rp, mode);
++	mutex_unlock(&rp->lock);
++
++	platform_set_drvdata(pdev, rp);
++
++	ret = device_add_groups(dev, rpmux_groups);
++	if (ret)
++		return ret;
++
++	dev_info(dev, "right-port mux ready (default %s); HDMI-out and USB host are mutually exclusive\n",
++		 rpmux_mode_name[mode]);
++	return 0;
++}
++
++static int rpmux_remove(struct platform_device *pdev)
++{
++	device_remove_groups(&pdev->dev, rpmux_groups);
++	return 0;
++}
++
++static const struct of_device_id rpmux_of_match[] = {
++	{ .compatible = "planet,gemini-rightport-mux" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, rpmux_of_match);
++
++static struct platform_driver rpmux_driver = {
++	.driver = {
++		.name = "gemini-rightport-mux",
++		.of_match_table = rpmux_of_match,
++	},
++	.probe = rpmux_probe,
++	.remove = rpmux_remove,
++};
++module_platform_driver(rpmux_driver);
++
++MODULE_AUTHOR("Gemini PDA Linux Project");
++MODULE_DESCRIPTION("Planet Gemini PDA right-port USB-C HDMI/USB-host mux select");
++MODULE_LICENSE("GPL");
