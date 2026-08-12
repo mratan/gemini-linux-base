@@ -36,6 +36,22 @@
 #                            hashes so the deliverable's firmware identity is
 #                            pinned regardless of mode.
 #
+# Release qualification (audit F2/F3, issue #24):
+#   --verify-modules-dep   after staging, run depmod on the overlay (works for
+#                          the prebuilt --modules-ko path too) and PROVE that
+#                          `modprobe -n --show-depends` resolves all three
+#                          modules in the acyclic order mtk_btif ->
+#                          mtk_stp_wmt_soc -> wlan_gen3. FAILS CLOSED on any
+#                          missing/cyclic/unresolvable dependency.
+#   --release-qualified    stamp `release_qualified: yes` in the manifest.
+#                          Requires --verify-modules-dep to pass; a synthetic /
+#                          placeholder run can NOT set it (green != flash-ready
+#                          unless the modules.dep proof held).
+#   --kernel-provenance S  record which kernel-build run/commit produced the
+#                          Image.gz + DTB + .ko this manifest pins.
+# depmod always generates modules.dep into the overlay so the shipped rootfs
+# can `modprobe` by name; --verify-modules-dep additionally asserts it.
+#
 # Rootfs build (mkrootfs-loop.sh -> mmdebstrap + mkfs.ext4 -d) needs root;
 # run it in CI / rootless-podman / with --build-rootfs under fakeroot-root.
 # Without --build-rootfs the script still builds the boot3 image, stages the
@@ -71,6 +87,9 @@ OUT="$REPO/release/out"
 BUILD_ROOTFS=0
 CROSS_COMPILE="${CROSS_COMPILE:-aarch64-linux-}"
 KVER=""
+VERIFY_MODULES_DEP=0
+RELEASE_QUALIFIED=0
+KERNEL_PROVENANCE=""
 
 usage() { sed -n '2,60p' "$0"; exit "${1:-0}"; }
 
@@ -90,6 +109,9 @@ while [ $# -gt 0 ]; do
         --build-rootfs) BUILD_ROOTFS=1; shift ;;
         --cross-compile) CROSS_COMPILE="$2"; shift 2 ;;
         --kver) KVER="$2"; shift 2 ;;
+        --verify-modules-dep) VERIFY_MODULES_DEP=1; shift ;;
+        --release-qualified) RELEASE_QUALIFIED=1; shift ;;
+        --kernel-provenance) KERNEL_PROVENANCE="$2"; shift 2 ;;
         -h|--help) usage 0 ;;
         *) echo "unknown arg: $1" >&2; usage 2 ;;
     esac
@@ -157,6 +179,47 @@ for m in $KO_NAMES; do
     [ -f "$MODINSTDIR/$m.ko" ] || die "module not staged: $MODINSTDIR/$m.ko"
 done
 log "      staged $(echo $KO_NAMES | wc -w) modules under /lib/modules/$KVER/updates"
+
+# ---- depmod on the STAGED overlay (audit finding F2) -----------------------
+# The prebuilt --modules-ko path used by release.yml previously only COPIED the
+# .ko and never ran depmod, so the shipped modules.dep was unproven. Run depmod
+# here for BOTH paths: it writes modules.dep{,.bin} into the overlay (so the
+# rootfs can `modprobe` by name on the device), and with --verify-modules-dep
+# we PROVE the acyclic load order resolves. depmod derives deps from the .ko
+# symbol tables, so it works on prebuilt modules just as well as freshly built.
+MODULES_DEP="$MOD_OV/lib/modules/$KVER/modules.dep"
+MODDEP_VERIFIED=0
+need depmod
+if ! depmod -b "$MOD_OV" "$KVER" 2>/dev/null; then
+    [ "$VERIFY_MODULES_DEP" = 1 ] && die "depmod failed for $KVER under $MODINSTDIR"
+    echo "      warning: depmod reported problems (non-fatal without --verify-modules-dep)" >&2
+fi
+if [ "$VERIFY_MODULES_DEP" = 1 ]; then
+    need modprobe
+    [ -s "$MODULES_DEP" ] || die "modules.dep missing/empty after depmod: $MODULES_DEP"
+    log "      verifying modprobe -n resolves all $(echo $KO_NAMES | wc -w) modules"
+    for m in $KO_NAMES; do
+        grep -q "updates/$m.ko" "$MODULES_DEP" || die "modules.dep has no entry for $m.ko"
+        out="$(modprobe -n --show-depends -d "$MOD_OV" -S "$KVER" "$m" 2>&1)" \
+            || die "modprobe -n failed for $m: $out"
+        echo "$out" | grep -q "/updates/$m.ko" \
+            || die "modprobe -n for $m did not resolve its own object: $out"
+    done
+    # the datapath module must pull the whole acyclic chain, in order
+    chain="$(modprobe -n --show-depends -d "$MOD_OV" -S "$KVER" wlan_gen3 2>&1)"
+    prev=-1
+    for dep in mtk_btif mtk_stp_wmt_soc wlan_gen3; do
+        n="$(printf '%s\n' "$chain" | grep -n "/updates/$dep.ko" | head -1 | cut -d: -f1)"
+        [ -n "$n" ] || die "modprobe -n wlan_gen3 omitted $dep.ko (broken chain): $chain"
+        [ "$n" -gt "$prev" ] || die "modprobe -n wlan_gen3 load order wrong at $dep.ko: $chain"
+        prev="$n"
+    done
+    MODDEP_VERIFIED=1
+    log "      modules.dep verified: mtk_btif -> mtk_stp_wmt_soc -> wlan_gen3 (acyclic)"
+fi
+if [ "$RELEASE_QUALIFIED" = 1 ] && [ "$MODDEP_VERIFIED" != 1 ]; then
+    die "--release-qualified requires --verify-modules-dep to pass (fail closed)"
+fi
 
 # ============================================================================
 # 2. Firmware payload -> $FW_OV/lib/firmware/<names>
@@ -272,6 +335,9 @@ MANIFEST="$OUT/MANIFEST.txt"
     echo "fork_git_commit: $(git_head)"
     echo "kernel_release:  $KVER"
     echo "firmware_mode:   $([ "$FW_PLACEHOLDER" = 1 ] && echo placeholder || echo real)"
+    echo "modules_dep_verified: $([ "$MODDEP_VERIFIED" = 1 ] && echo yes || echo no)"
+    echo "release_qualified:    $([ "$RELEASE_QUALIFIED" = 1 ] && echo yes || echo no)"
+    [ -n "$KERNEL_PROVENANCE" ] && echo "kernel_provenance:    $KERNEL_PROVENANCE"
     echo
     echo "## boot3 image (kernel + appended DTB + device initramfs)"
     if [ -n "$BOOT3" ]; then
@@ -294,6 +360,15 @@ MANIFEST="$OUT/MANIFEST.txt"
     echo "# NOTE: module set is mtk_btif -> mtk_stp_wmt_soc -> wlan_gen3 (acyclic);"
     echo "#       wmt_chrdev_wifi was merged into wlan_gen3 (issue #22). modprobe"
     echo "#       ordering works via the generated modules.dep. See RUNBOOK.md step 4."
+    echo
+    echo "## modules.dep  (depmod on the staged overlay — proves load order)"
+    if [ -s "$MODULES_DEP" ]; then
+        echo "  modules.dep  $(sha "$MODULES_DEP")"
+        sed 's/^/    /' "$MODULES_DEP"
+        echo "# modprobe -n --show-depends resolves all three modules: $([ "$MODDEP_VERIFIED" = 1 ] && echo VERIFIED || echo 'not verified this run')"
+    else
+        echo "  (modules.dep not generated this run)"
+    fi
     echo
     echo "## CONSYS firmware payload  (/lib/firmware)  — authoritative catalog hashes"
     while IFS=$'\t' read -r name size want; do

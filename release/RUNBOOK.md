@@ -200,6 +200,13 @@ that would race and contaminate the first capture; see `userspace/wmt-daemons`).
 > `mtk_btif → mtk_stp_wmt_soc → wlan_gen3`; `depmod` emits a valid `modules.dep`
 > so `modprobe` also works. `wmt_chrdev_wifi.ko` no longer exists as a separate
 > module.
+>
+> The assembled rootfs already carries the `depmod`-generated
+> `/lib/modules/<kver>/modules.dep` (assembly runs `depmod` on the staged
+> overlay), and the release CI **proves** `modprobe -n` resolves all three in
+> this order before the image is qualified (issue #24). So on-device
+> `modprobe wlan_gen3` pulls the whole chain; the explicit `insmod`-by-path
+> sequence below is the belt-and-braces equivalent for the first bring-up.
 
 Load the **WMT core** first — this is enough for C2's pre-firmware/first-query
 capture and does not depend on the Wi-Fi datapath:

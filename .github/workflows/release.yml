@@ -20,8 +20,14 @@ name: release-assemble
 
 on:
   push:
-    branches: [slice10-integration]
+    branches: [main]           # release tracks the current tree (audit F1)
   workflow_dispatch:
+    inputs:
+      mode:
+        description: "release = fail closed, REAL kernel-build bits required; smoke = allow placeholder, marked NON-release"
+        type: choice
+        options: [release, smoke]
+        default: release
 
 permissions:
   contents: read
@@ -33,6 +39,12 @@ jobs:
     timeout-minutes: 150
     env:
       GH_TOKEN: ${{ github.token }}
+      # push (to main) is always a release-qualified run; dispatch honours the
+      # chosen mode (default release). A "smoke" run may use placeholders but is
+      # never marked release-qualified.
+      RELEASE_MODE: ${{ (github.event_name == 'workflow_dispatch' && inputs.mode) || 'release' }}
+    outputs:
+      release_qualified: ${{ steps.qualify.outputs.release_qualified }}
     steps:
       - uses: actions/checkout@v4
 
@@ -64,10 +76,26 @@ jobs:
           find kbits -mindepth 2 -type f -exec cp -n {} kbits/ \; 2>/dev/null || true
           if [ "$got" = 1 ] && [ -f kbits/Image.gz ] && ls kbits/*.ko >/dev/null 2>&1; then
             echo "KMODE=real" >> "$GITHUB_ENV"
-            echo "using REAL kernel-build artifacts:"; ls -l kbits/*.ko kbits/Image.gz kbits/*.dtb
+            ksha=$(gh run view "$id" --json headSha -q '.headSha' 2>/dev/null || echo unknown)
+            echo "KPROV=kernel-build run $id @ ${ksha:0:12}" >> "$GITHUB_ENV"
+            echo "using REAL kernel-build artifacts (run $id @ ${ksha:0:12}):"
+            ls -l kbits/*.ko kbits/Image.gz kbits/*.dtb
           else
             echo "KMODE=placeholder" >> "$GITHUB_ENV"
+            echo "KPROV=SYNTHETIC placeholder (no kernel-build artifact)" >> "$GITHUB_ENV"
             echo "no usable kernel-build artifact — synthesizing placeholders" >&2
+          fi
+
+      # Fail closed for release qualification: a release run MUST use the real
+      # Image.gz + DTB + .ko from kernel-build. Only an explicit `smoke` dispatch
+      # may fall through to the placeholder synth below, and it is never marked
+      # release-qualified (audit finding F3).
+      - name: Gate — release qualification requires real kernel bits
+        run: |
+          echo "RELEASE_MODE=$RELEASE_MODE  KMODE=$KMODE  ($KPROV)"
+          if [ "$RELEASE_MODE" = release ] && [ "$KMODE" != real ]; then
+            echo "::error::release-qualified run requires REAL kernel-build artifacts (Image.gz + 3 .ko); none resolved. Failing closed — no placeholder for a release run."
+            exit 1
           fi
 
       - name: Fetch stock Debian arm64 kernel + static busybox (QEMU boot bits)
@@ -79,7 +107,10 @@ jobs:
           grep -q '^VMLINUZ=..*' "$GITHUB_ENV"
           grep -q '^BUSYBOX=..*' "$GITHUB_ENV"
 
-      - name: Synthesize placeholder kernel bits (fallback only)
+      # NON-release smoke mode ONLY (the gate above already failed a release run
+      # that reached here). Synthesizes non-flashable stand-ins so the plumbing
+      # can be exercised; the manifest for such a run is NEVER release-qualified.
+      - name: Synthesize placeholder kernel bits (NON-release smoke only)
         if: env.KMODE == 'placeholder'
         run: |
           set -euo pipefail
@@ -90,8 +121,9 @@ jobs:
           qemu-system-aarch64 -machine virt,dumpdtb=kbits/mt6797-gemini-pda.dtb \
             -cpu max -nographic 2>/dev/null || true
           test -f kbits/mt6797-gemini-pda.dtb
-          # placeholder .ko named correctly (presence is what the QEMU proof asserts)
-          for m in mtk_btif mtk_stp_wmt_soc wmt_chrdev_wifi wlan_gen3; do
+          # placeholder .ko named correctly (presence is what the QEMU proof
+          # asserts). Post-#22 the set is 3 (chardev merged into wlan_gen3).
+          for m in mtk_btif mtk_stp_wmt_soc wlan_gen3; do
             printf 'GEMINI-KO-PLACEHOLDER %s (real .ko from kernel-build.yml)\n' "$m" \
               > "kbits/$m.ko"
           done
@@ -110,6 +142,13 @@ jobs:
           sudo git config --system --add safe.directory "$PWD"   # git rev-parse under sudo
           KVER_ARG=""
           [ -n "${KVER_OVERRIDE:-}" ] && KVER_ARG="--kver ${KVER_OVERRIDE}"
+          # Release runs verify the depmod-generated modules.dep and stamp the
+          # manifest release-qualified (fails closed inside assemble.sh if the
+          # three modules don't resolve). Smoke runs do neither.
+          QUAL_ARGS=()
+          if [ "$RELEASE_MODE" = release ]; then
+            QUAL_ARGS=(--verify-modules-dep --release-qualified)
+          fi
           sudo -E release/assemble.sh \
             --modules-ko kbits \
             --kernel-dir kbits \
@@ -117,9 +156,36 @@ jobs:
             --busybox "$BUSYBOX" \
             --build-rootfs \
             $KVER_ARG \
+            "${QUAL_ARGS[@]}" \
+            --kernel-provenance "$KPROV" \
             --out release/out
           # readable by the non-root steps that follow
           sudo chmod -R a+rX release/out
+
+      - name: "Assert: manifest commit == release commit; qualification stamped"
+        id: qualify
+        run: |
+          set -euo pipefail
+          mc=$(awk '/^fork_git_commit:/{print $2}' release/out/MANIFEST.txt)
+          echo "manifest fork_git_commit: $mc"
+          echo "release commit (GITHUB_SHA): $GITHUB_SHA"
+          if [ "$mc" != "$GITHUB_SHA" ]; then
+            echo "::error::manifest commit $mc != release commit $GITHUB_SHA (stale manifest cannot ship)"; exit 1
+          fi
+          rq=$(awk '/^release_qualified:/{print $2}' release/out/MANIFEST.txt)
+          mdv=$(awk '/^modules_dep_verified:/{print $2}' release/out/MANIFEST.txt)
+          echo "release_qualified=$rq  modules_dep_verified=$mdv"
+          if [ "$RELEASE_MODE" = release ]; then
+            [ "$rq" = yes ]  || { echo "::error::release run but manifest not release_qualified"; exit 1; }
+            [ "$mdv" = yes ] || { echo "::error::release run but modules.dep not verified"; exit 1; }
+            # no synthetic/placeholder .ko may back a release manifest
+            if grep -qi 'PLACEHOLDER' <(sed -n '/## ported connectivity modules/,/## modules.dep/p' release/out/MANIFEST.txt); then
+              echo "::error::release manifest references placeholder modules"; exit 1
+            fi
+          else
+            [ "$rq" = no ] || { echo "::error::smoke run must NOT be release_qualified"; exit 1; }
+          fi
+          echo "release_qualified=$rq" >> "$GITHUB_OUTPUT"
 
       - name: "Round-trip: assembled boot3 image unpacks to its exact inputs"
         run: |
@@ -181,12 +247,16 @@ jobs:
           cp release/out/initramfs-gemini.cpio.gz stage/
           ( cd stage && sha256sum MANIFEST.txt experimental.img.xz \
               boot3-experimental.img.xz initramfs-gemini.cpio.gz > SHA256SUMS )
-          { echo "## Slice 10 assembly (kernel bits: $KMODE)"; echo '```'; \
+          rq=$(awk '/^release_qualified:/{print $2}' release/out/MANIFEST.txt)
+          { echo "## Slice 10 assembly — mode: $RELEASE_MODE (kernel bits: $KMODE, $KPROV)"; \
+            echo "release_qualified: **$rq**"; echo '```'; \
             cat release/out/MANIFEST.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload deliverable
         uses: actions/upload-artifact@v4
         with:
-          name: gemini-experimental-slot-${{ github.run_number }}-${{ github.sha }}
+          # artifact name carries the qualification so a NON-release smoke build
+          # is never mistaken for a flash-ready one
+          name: gemini-experimental-slot-${{ env.RELEASE_MODE == 'release' && 'release-qualified' || 'NONRELEASE-smoke' }}-${{ github.run_number }}-${{ github.sha }}
           path: stage/
           if-no-files-found: error

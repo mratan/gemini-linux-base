@@ -31,7 +31,7 @@ sudo release/assemble.sh ... --firmware-placeholder --build-rootfs
 
 ## CI — `.github/workflows/release.yml`
 
-On push to `slice10-integration` (+ dispatch): pulls the kernel-build artifact
+On push to `main` (+ `workflow_dispatch`): pulls the kernel-build artifact
 (no kernel rebuild), builds the daemons, runs `assemble.sh --build-rootfs`,
 proves the boot3 image **round-trips byte-exactly**, and boots the assembled
 rootfs in **QEMU** asserting `GEMINI-MODULES-STAGED-OK`,
@@ -40,10 +40,30 @@ rootfs in **QEMU** asserting `GEMINI-MODULES-STAGED-OK`,
 workflow — CI stages named placeholders; the manifest still pins the catalog
 hashes.
 
+### Release qualification — green ≠ flash-ready unless proven (issue #24)
+
+A `push`/default `workflow_dispatch` run is **release-qualified** and **fails
+closed**:
+
+- it uses the **real** `Image.gz` + DTB + three `.ko` from `kernel-build`; if
+  none resolve it **errors out** (no placeholder fallback for a release run);
+- `assemble.sh --verify-modules-dep` runs `depmod` on the staged overlay (the
+  prebuilt path too, not just `--kbuild`) and asserts `modprobe -n
+  --show-depends` resolves all three modules in the acyclic order
+  `mtk_btif → mtk_stp_wmt_soc → wlan_gen3`;
+- the run asserts the manifest's `fork_git_commit` **equals the release commit**
+  (a stale committed manifest cannot ship), and that the manifest is stamped
+  `release_qualified: yes` / `modules_dep_verified: yes`.
+
+`workflow_dispatch` with **`mode: smoke`** keeps the placeholder path for
+plumbing-only smoke tests; such a run stamps `release_qualified: no`, names its
+artifact `…-NONRELEASE-smoke-…`, and can never be mistaken for flash-ready.
+
 ## Module set (issue #22)
 
 Three modules load in the acyclic order `mtk_btif → mtk_stp_wmt_soc →
 wlan_gen3`. The former `wmt_chrdev_wifi`↔`wlan_gen3` `EXPORT_SYMBOL` cycle was
 resolved by merging the chardev into `wlan_gen3` (issue #22), so `depmod` emits
-a valid `modules.dep` and `modprobe` works. `wmt_chrdev_wifi.ko` no longer
-exists separately. See `RUNBOOK.md` §4a.
+a valid `modules.dep` and `modprobe` works — the release job now **proves** this
+on the shipped overlay. `wmt_chrdev_wifi.ko` no longer exists separately. See
+`RUNBOOK.md` §4a.

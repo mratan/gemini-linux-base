@@ -14,10 +14,22 @@
 # the authoritative per-run copy beside the images. Compare the firmware and
 # daemon-source hashes here against any run; expect the binary hashes to track
 # whichever kernel build produced them.
+#
+# The authoritative per-run manifest (issue #24) additionally carries:
+#   modules_dep_verified: yes  -> depmod ran on the staged overlay and
+#                                 `modprobe -n` resolved all three modules
+#   release_qualified:    yes  -> real kernel bits + the modules.dep proof held
+#                                 (a placeholder/smoke run stamps `no`)
+#   kernel_provenance: ...     -> which kernel-build run/commit produced the bits
+#   a `## modules.dep` section -> the depmod-generated load order + its hash
+# The release CI also fails unless `fork_git_commit` == the release commit, so a
+# stale committed manifest like this one can never be shipped as flash-ready.
 generated_utc:   2026-08-12T17:52:45Z
 fork_git_commit: 4b7add4cedede43414e6f03f1c09b8f434be3365
 kernel_release:  6.6.0-dirty
 firmware_mode:   real
+modules_dep_verified: (reference copy — see the per-run manifest)
+release_qualified:    (reference copy — see the per-run manifest)
 
 ## boot3 image (kernel + appended DTB + device initramfs)
 boot3_image      6f4d63e195e1eed2692d6f32403ddadc29a39519881f6e565442dc66a6b2cf74  (14178304 B)
