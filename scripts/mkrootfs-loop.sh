@@ -27,6 +27,7 @@ SUITE=trixie
 MIRROR="${MIRROR:-http://deb.debian.org/debian}"
 OUT=""
 MARGIN_MB=96
+OVERLAYS=()
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -34,6 +35,12 @@ while [ $# -gt 0 ]; do
         --suite) SUITE="$2"; shift 2 ;;
         --mirror) MIRROR="$2"; shift 2 ;;
         --margin-mb) MARGIN_MB="$2"; shift 2 ;;
+        # --overlay DIR (repeatable): copy DIR's contents into the rootfs
+        # staging tree before packing, root-owned (Slice 10 integration
+        # uses this to inject the ported /lib/modules, /lib/firmware and the
+        # WMT daemon overlay). Backward compatible: with no --overlay the
+        # behaviour is identical to before, so packaging.yml is unaffected.
+        --overlay) OVERLAYS+=("$2"); shift 2 ;;
         *) echo "unknown arg: $1" >&2; exit 2 ;;
     esac
 done
@@ -106,6 +113,17 @@ cat >> "$TARGET/root/.profile" <<'EOF'
 echo GEMINI-LOGIN-SHELL-OK
 cat /etc/gemini-experimental-release 2>/dev/null
 EOF
+
+# Overlays (Slice 10): copy each --overlay tree over the staging root,
+# root-owned. -d preserves symlinks (e.g. modules_install's tree); mode and
+# timestamps are preserved but ownership becomes root (this script runs as
+# root), so mkfs.ext4 -d records root:root regardless of the overlay's on-disk
+# ownership. Overlays are applied in the order given; later ones win.
+for ov in ${OVERLAYS[@]+"${OVERLAYS[@]}"}; do
+    [ -d "$ov" ] || { echo "overlay dir not found: $ov" >&2; exit 1; }
+    echo "==> [2b/4] overlay: $ov -> rootfs"
+    cp -dR --preserve=mode,timestamps "$ov/." "$TARGET/"
+done
 
 echo "==> [3/4] Pack ext4 loop image"
 DU_MB=$(du -sm --apparent-size "$TARGET" | cut -f1)

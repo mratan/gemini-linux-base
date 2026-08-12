@@ -1,0 +1,191 @@
+# Slice 10 (tracker issue #11): assemble the flash-ready Experimental-slot
+# deliverable and prove it WITHOUT the device:
+#   * release/assemble.sh builds the boot3 image + the Debian 13 loop-image
+#     rootfs with the ported modules, the (placeholder, in public CI) firmware
+#     payload, and the INERT WMT daemons, and records a manifest;
+#   * the assembled boot3 image round-trips byte-exactly through bootimg.py;
+#   * the assembled rootfs boots in QEMU and self-checks: modules staged,
+#     firmware staged, daemons installed and inert (serial markers).
+#
+# Cheap by design: the gemini KERNEL IS NOT REBUILT — its Image.gz/dtb/.ko are
+# pulled from the latest successful kernel-build run (with a stock-kernel
+# placeholder fallback so this workflow is always green). Everything QEMU boots
+# is a STOCK Debian arm64 kernel, as in packaging.yml. Real firmware blobs
+# never enter this public workflow (same rule as the kernel EXTRA_FIRMWARE
+# embed): CI stages named PLACEHOLDERS; the manifest still pins the
+# authoritative catalog hashes. All artifacts are NOT-YET-FLASHED.
+#
+# Does NOT touch kernel-build.yml / packaging.yml / daemons.yml / capture-kit.yml.
+name: release-assemble
+
+on:
+  push:
+    branches: [slice10-integration]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read   # gh run download of the kernel-build artifact
+
+jobs:
+  assemble-and-prove:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build/test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-arm qemu-user-static binfmt-support mmdebstrap \
+            arch-test debian-archive-keyring gdisk e2fsprogs zstd xz-utils \
+            kmod gcc-aarch64-linux-gnu
+
+      # ---- kernel bits: real from kernel-build if available, else placeholder
+      - name: Resolve gemini kernel bits (Image.gz + dtb + .ko)
+        id: kbits
+        run: |
+          set -euo pipefail
+          mkdir -p kbits
+          got=0
+          for ref in "${{ github.ref_name }}" "main" ""; do
+            args=(--workflow kernel-build.yml --status success -L 1 --json databaseId)
+            [ -n "$ref" ] && args+=(--branch "$ref")
+            id=$(gh run list "${args[@]}" -q '.[0].databaseId' 2>/dev/null || true)
+            if [ -n "${id:-}" ] && [ "$id" != "null" ]; then
+              echo "found kernel-build run $id (branch='${ref:-any}')"
+              if gh run download "$id" --dir kbits 2>/dev/null; then got=1; break; fi
+            fi
+          done
+          # gh puts each artifact in its own subdir; flatten to kbits/
+          find kbits -mindepth 2 -type f -exec cp -n {} kbits/ \; 2>/dev/null || true
+          if [ "$got" = 1 ] && [ -f kbits/Image.gz ] && ls kbits/*.ko >/dev/null 2>&1; then
+            echo "KMODE=real" >> "$GITHUB_ENV"
+            echo "using REAL kernel-build artifacts:"; ls -l kbits/*.ko kbits/Image.gz kbits/*.dtb
+          else
+            echo "KMODE=placeholder" >> "$GITHUB_ENV"
+            echo "no usable kernel-build artifact — synthesizing placeholders" >&2
+          fi
+
+      - name: Fetch stock Debian arm64 kernel + static busybox (QEMU boot bits)
+        run: |
+          set -o pipefail
+          python3 scripts/ci/fetch-qemu-boot-bits.py \
+            --dest "$RUNNER_TEMP/deb-extract" | tee -a "$GITHUB_ENV"
+          grep -q '^MODULES_BASE=..*' "$GITHUB_ENV"
+          grep -q '^VMLINUZ=..*' "$GITHUB_ENV"
+          grep -q '^BUSYBOX=..*' "$GITHUB_ENV"
+
+      - name: Synthesize placeholder kernel bits (fallback only)
+        if: env.KMODE == 'placeholder'
+        run: |
+          set -euo pipefail
+          # kernel-gz stand-in: the stock arm64 vmlinuz (bootimg.py's round-trip
+          # is format-agnostic — it recovers the DTB boundary either way).
+          cp "$VMLINUZ" kbits/Image.gz
+          # a real DTB dumped from QEMU virt, so the appended-DTB round-trip is real.
+          qemu-system-aarch64 -machine virt,dumpdtb=kbits/mt6797-gemini-pda.dtb \
+            -cpu max -nographic 2>/dev/null || true
+          test -f kbits/mt6797-gemini-pda.dtb
+          # placeholder .ko named correctly (presence is what the QEMU proof asserts)
+          for m in mtk_btif mtk_stp_wmt_soc wmt_chrdev_wifi wlan_gen3; do
+            printf 'GEMINI-KO-PLACEHOLDER %s (real .ko from kernel-build.yml)\n' "$m" \
+              > "kbits/$m.ko"
+          done
+          # a kver for the staging path when vermagic can't be read from a placeholder
+          echo "KVER_OVERRIDE=6.6.0-gemini" >> "$GITHUB_ENV"
+
+      - name: Build native WMT daemons (aarch64 glibc) into the overlay
+        run: |
+          make -C userspace/wmt-daemons all install DESTDIR=rootfs-overlay
+          test -x userspace/wmt-daemons/rootfs-overlay/usr/sbin/wmt_loader
+          test -x userspace/wmt-daemons/rootfs-overlay/usr/sbin/wmt_launcher
+
+      - name: Assemble boot3 image + rootfs loop image + manifest
+        run: |
+          set -euo pipefail
+          KVER_ARG=""
+          [ -n "${KVER_OVERRIDE:-}" ] && KVER_ARG="--kver ${KVER_OVERRIDE}"
+          sudo -E release/assemble.sh \
+            --modules-ko kbits \
+            --kernel-dir kbits \
+            --firmware-placeholder \
+            --busybox "$BUSYBOX" \
+            --build-rootfs \
+            $KVER_ARG \
+            --out release/out
+          # readable by the non-root steps that follow
+          sudo chmod -R a+rX release/out
+
+      - name: "Round-trip: assembled boot3 image unpacks to its exact inputs"
+        run: |
+          set -euo pipefail
+          sudo python3 scripts/bootimg.py unpack --img release/out/boot3-experimental.img \
+            --out-dir release/out/rt
+          sudo chmod -R a+rX release/out/rt
+          kf=release/out/rt/kernel.gz; [ -f "$kf" ] || kf=release/out/rt/kernel
+          k=$(sha256sum "$kf" | cut -d' ' -f1)
+          r=$(sha256sum release/out/rt/ramdisk.cpio.gz | cut -d' ' -f1)
+          ki=$(sha256sum kbits/Image.gz | cut -d' ' -f1)
+          ri=$(sha256sum release/out/initramfs-gemini.cpio.gz | cut -d' ' -f1)
+          echo "kernel  $k vs $ki"; echo "ramdisk $r vs $ri"
+          [ "$k" = "$ki" ] && [ "$r" = "$ri" ] || { echo "FAIL: boot3 round-trip mismatch"; exit 1; }
+          echo "PASS: assembled boot3 image round-trips byte-exactly"
+
+      # ---- QEMU proof of the ASSEMBLED rootfs (stock kernel, synthetic disk) ---
+      - name: Collect virtio/ext4/loop modules for the QEMU initramfs
+        run: |
+          python3 scripts/ci/collect-modules.py \
+            --modules-base "$MODULES_BASE" --out out/preload \
+            pci-host-generic virtio_pci virtio_blk loop crc32c_generic ext4
+
+      - name: Build QEMU-test initramfs
+        run: |
+          python3 scripts/mkinitramfs.py --busybox "$BUSYBOX" \
+            --init initramfs/init --modules-dir out/preload \
+            --out out/initramfs-qemu.cpio.gz
+
+      - name: Build synthetic disk carrying the assembled experimental.img
+        run: |
+          scripts/mksynthetic-disk.sh --out out/diskA.img \
+            --image release/out/experimental.img
+
+      - name: "QEMU: assembled rootfs boots; modules/firmware staged; daemons inert"
+        run: |
+          scripts/ci/run-qemu-test.sh \
+            --kernel "$VMLINUZ" --initrd out/initramfs-qemu.cpio.gz \
+            --disk out/diskA.img --timeout 1800 --log out/slice10-serial.log \
+            --append loglevel=7 \
+            --marker GEMINI-INITRAMFS-PIVOT-OK \
+            --marker GEMINI-ROOTFS-SHELL-OK \
+            --marker GEMINI-LOGIN-SHELL-OK \
+            --marker GEMINI-MODULES-STAGED-OK \
+            --marker GEMINI-FIRMWARE-STAGED-OK \
+            --marker GEMINI-DAEMONS-INERT-OK \
+            --marker GEMINI-SLICE10-VERIFY-OK \
+            --forbid GEMINI-INITRAMFS-RESCUE \
+            --forbid GEMINI-DECOY-INIT-VIOLATION \
+            --forbid GEMINI-SLICE10-VERIFY-FAIL
+
+      - name: Stage artifacts (hashed, NOT-YET-FLASHED)
+        run: |
+          mkdir -p stage
+          cp release/out/MANIFEST.txt release/out/NOT-YET-FLASHED.txt stage/
+          cp out/slice10-serial.log stage/
+          xz -T0 -c release/out/experimental.img > stage/experimental.img.xz
+          xz -T0 -c release/out/boot3-experimental.img > stage/boot3-experimental.img.xz
+          cp release/out/initramfs-gemini.cpio.gz stage/
+          ( cd stage && sha256sum MANIFEST.txt experimental.img.xz \
+              boot3-experimental.img.xz initramfs-gemini.cpio.gz > SHA256SUMS )
+          { echo "## Slice 10 assembly (kernel bits: $KMODE)"; echo '```'; \
+            cat release/out/MANIFEST.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload deliverable
+        uses: actions/upload-artifact@v4
+        with:
+          name: gemini-experimental-slot-${{ github.run_number }}-${{ github.sha }}
+          path: stage/
+          if-no-files-found: error

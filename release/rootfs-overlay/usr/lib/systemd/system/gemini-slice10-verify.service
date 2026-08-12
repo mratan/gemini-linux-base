@@ -1,0 +1,17 @@
+# Slice 10 (issue #11) assembled-image self-check. Runs once at multi-user,
+# after the base rootfs boot marker (mkrootfs-loop.sh's gemini-proof), and
+# emits the serial markers release.yml's QEMU proof asserts. Presence checks
+# only — powers nothing, loads no module, starts no daemon.
+[Unit]
+Description=Gemini Experimental-slot assembled-image self-check (Slice 10 QEMU proof)
+After=gemini-proof.service
+Wants=gemini-proof.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/gemini-slice10-verify.sh
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=multi-user.target

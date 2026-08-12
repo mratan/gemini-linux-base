@@ -31,3 +31,9 @@ docs/firmware-consys/
 # capture-kit (issue #9): staging holds the Gemian ramdisk + packed boot
 # image (firmware-adjacent blobs, never committed)
 capture-kit/staging/
+
+# release (issue #11, Slice 10): assemble.sh staging/output — holds the boot3
+# image, the rootfs loop image, the staged (real) firmware overlay and the
+# built .ko. All blobs/images; NEVER committed. Only release/MANIFEST.txt
+# (hashes only) is tracked.
+release/out/
