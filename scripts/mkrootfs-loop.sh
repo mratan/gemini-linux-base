@@ -41,6 +41,13 @@ while [ $# -gt 0 ]; do
         # WMT daemon overlay). Backward compatible: with no --overlay the
         # behaviour is identical to before, so packaging.yml is unaffected.
         --overlay) OVERLAYS+=("$2"); shift 2 ;;
+        # --usb-display (Slice U5, tracker issue #30, ADR-0004): add the
+        # USB-display userspace package set (sway/foot/seatd + modetest +
+        # usbutils) so the deliverable image can drive a udl adapter with no
+        # improvised installs at the first session. Default OFF to keep the
+        # minbase QEMU pivot proof (packaging.yml) small; release/assemble.sh
+        # always passes it for the deliverable image.
+        --usb-display) USB_DISPLAY=1; shift ;;
         *) echo "unknown arg: $1" >&2; exit 2 ;;
     esac
 done
@@ -51,6 +58,14 @@ TARGET="$(mktemp -d)"
 trap 'rm -rf "$TARGET"' EXIT
 
 PKGS=systemd-sysv,udev,kmod,e2fsprogs,busybox-static
+if [ "${USB_DISPLAY:-0}" = 1 ]; then
+    # wlroots compositor (multi-GPU-capable; pixman renderer works on udl),
+    # terminal, seat daemon, modetest (the runbook's pattern test), lsusb,
+    # dbus + a monospace font for foot. See docs/external-display-first-
+    # session-runbook.md Parts 3-5 and release/rootfs-overlay's
+    # gemini-usb-display-start helper.
+    PKGS="$PKGS,sway,foot,seatd,libdrm-tests,usbutils,dbus,fonts-dejavu-core"
+fi
 
 echo "==> [1/4] mmdebstrap --variant=minbase $SUITE (arm64) -> $TARGET"
 mmdebstrap --variant=minbase --architectures=arm64 \

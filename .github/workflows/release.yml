@@ -233,6 +233,7 @@ jobs:
             --marker GEMINI-MODULES-STAGED-OK \
             --marker GEMINI-FIRMWARE-STAGED-OK \
             --marker GEMINI-DAEMONS-INERT-OK \
+            --marker GEMINI-USBDISPLAY-USERSPACE-OK \
             --marker GEMINI-SLICE10-VERIFY-OK \
             --forbid GEMINI-INITRAMFS-RESCUE \
             --forbid GEMINI-DECOY-INIT-VIOLATION \

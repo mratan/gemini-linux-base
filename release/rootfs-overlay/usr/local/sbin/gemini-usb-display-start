@@ -1,0 +1,47 @@
+#!/bin/sh
+# gemini-usb-display-start — single-output Wayland session on the USB display
+# (Slice U5, tracker issue #30; ADR-0004 primary route: udl + DL-165/DL-195).
+#
+# MANUAL START ONLY — nothing launches this at boot. Default-safe: with no
+# adapter plugged in, the system is byte-for-byte the same as before U5 at
+# runtime. Run it from the runbook's Part 5 (docs/external-display-first-
+# session-runbook.md) after the adapter enumerated and udl bound.
+#
+# Scope: drives the USB display ALONE (single-output). The extended desktop
+# across internal panel + USB display is #20/#21 territory — the internal
+# panel currently runs fbdev (atomic-KMS wedge), so sway is pinned to the
+# udl card via WLR_DRM_DEVICES and never touches the mediatek-drm card.
+#
+# NOT-YET-VALIDATED: this helper has never run on hardware. Expected rough
+# edges are noted inline; capture, don't improvise, per the runbook.
+set -u
+
+say() { echo "gemini-usb-display: $*" >&2; }
+
+# find the DRM card whose driver is udl
+UDL_CARD=""
+for c in /sys/class/drm/card[0-9]; do
+    [ -e "$c/device/driver" ] || continue
+    case "$(readlink -f "$c/device/driver")" in
+        */udl) UDL_CARD="/dev/dri/$(basename "$c")" ;;
+    esac
+done
+if [ -z "$UDL_CARD" ]; then
+    say "no udl DRM card found. Is the DisplayLink adapter plugged into the"
+    say "RIGHT port and enumerated (lsusb -t; VID 17e9)? Did udl.ko bind"
+    say "(dmesg | grep -i udl)? See runbook Parts 2-3."
+    exit 1
+fi
+say "using $UDL_CARD"
+
+# pixman renderer: no GPU on this path; wlroots software rendering on udl.
+export WLR_RENDERER=pixman
+# pin wlroots to the udl card only (leave the internal panel/fbcon alone)
+export WLR_DRM_DEVICES="$UDL_CARD"
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/gemini-usb-display}"
+mkdir -p "$XDG_RUNTIME_DIR" && chmod 700 "$XDG_RUNTIME_DIR"
+
+# seatd-launch provides the seat without logind session gymnastics; needs a
+# real VT-capable seat — if launched over SSH and wlroots refuses the seat,
+# retry from the serial/panel console (expected rough edge; capture it).
+exec seatd-launch -- sway -c /etc/gemini/sway-usbdisplay.conf

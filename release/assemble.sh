@@ -345,7 +345,10 @@ if [ "$BUILD_ROOTFS" = 1 ]; then
     ROOTFS="$OUT/experimental.img"
     OV_ARGS=(--overlay "$MOD_OV" --overlay "$FW_OV" --overlay "$DAEMONS_OVERLAY")
     [ -d "$RELEASE_OVERLAY" ] && OV_ARGS+=(--overlay "$RELEASE_OVERLAY")
-    "$REPO/scripts/mkrootfs-loop.sh" --out "$ROOTFS" "${OV_ARGS[@]}"
+    # --usb-display: the deliverable image always carries the USB-display
+    # userspace (Slice U5, issue #30) — packaging.yml's separate minbase
+    # pivot proof stays lean because it calls mkrootfs-loop.sh directly.
+    "$REPO/scripts/mkrootfs-loop.sh" --out "$ROOTFS" --usb-display "${OV_ARGS[@]}"
 else
     log "[5/6] skipping rootfs loop image (pass --build-rootfs, needs root)"
 fi
@@ -364,6 +367,7 @@ MANIFEST="$OUT/MANIFEST.txt"
     echo "kernel_release:  $KVER"
     echo "firmware_mode:   $([ "$FW_PLACEHOLDER" = 1 ] && echo placeholder || echo real)"
     echo "modules_dep_verified: $([ "$MODDEP_VERIFIED" = 1 ] && echo yes || echo no)"
+    echo "usb_display_userspace: $([ "$BUILD_ROOTFS" = 1 ] && echo "staged (sway/foot/seatd/modetest — Slice U5, issue #30)" || echo "n/a (rootfs not built this run)")"
     echo "release_qualified:    $([ "$RELEASE_QUALIFIED" = 1 ] && echo yes || echo no)"
     [ -n "$KERNEL_PROVENANCE" ] && echo "kernel_provenance:    $KERNEL_PROVENANCE"
     echo

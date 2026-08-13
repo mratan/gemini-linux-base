@@ -69,7 +69,19 @@ for b in wmt_loader wmt_launcher; do
 done
 [ "$d_ok" = 1 ] && say "GEMINI-DAEMONS-INERT-OK"
 
-if [ "$mods_ok" = 1 ] && [ "$fw_ok" = 1 ] && [ "$d_ok" = 1 ]; then
+# --- 4. USB-display userspace staged (Slice U5, issue #30) — presence only;
+#        nothing is started (manual-start helper keeps it default-safe)
+ud_ok=1
+for b in sway foot seatd seatd-launch modetest lsusb; do
+    command -v "$b" >/dev/null 2>&1 || { say "GEMINI-SLICE10-USBDISPLAY-MISSING $b"; ud_ok=0; }
+done
+[ -x /usr/local/sbin/gemini-usb-display-start ] \
+    || { say "GEMINI-SLICE10-USBDISPLAY-MISSING gemini-usb-display-start"; ud_ok=0; }
+[ -f /etc/gemini/sway-usbdisplay.conf ] \
+    || { say "GEMINI-SLICE10-USBDISPLAY-MISSING sway-usbdisplay.conf"; ud_ok=0; }
+[ "$ud_ok" = 1 ] && say "GEMINI-USBDISPLAY-USERSPACE-OK"
+
+if [ "$mods_ok" = 1 ] && [ "$fw_ok" = 1 ] && [ "$d_ok" = 1 ] && [ "$ud_ok" = 1 ]; then
     say "GEMINI-SLICE10-VERIFY-OK"
 else
     say "GEMINI-SLICE10-VERIFY-FAIL"
