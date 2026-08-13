@@ -1,5 +1,5 @@
 diff --git a/drivers/usb/musb/mediatek.c b/drivers/usb/musb/mediatek.c
-index 0a35aab3a..e027cdeb2 100644
+index 0a35aab3a..3533f353b 100644
 --- a/drivers/usb/musb/mediatek.c
 +++ b/drivers/usb/musb/mediatek.c
 @@ -11,6 +11,7 @@
@@ -81,16 +81,18 @@ index 0a35aab3a..e027cdeb2 100644
  	pdata->platform_ops = &mtk_musb_ops;
  	pdata->mode = usb_get_dr_mode(dev);
  
-@@ -452,6 +499,26 @@ static int mtk_musb_probe(struct platform_device *pdev)
+@@ -452,6 +499,28 @@ static int mtk_musb_probe(struct platform_device *pdev)
  		return -EINVAL;
  	}
  
 +	/*
-+	 * GEMINI (MT6797 usb11 right port, blockers.md B-19): honor the DT
-+	 * "maximum-speed" property, same as musb_dsps does. High-speed bulk
-+	 * through this port's external SW7226/FUSB301 mux chain fails with
-+	 * "three-strikes" RX errors and babble; capping the port to
-+	 * full-speed keeps the link within what the pad chain can carry.
++	 * GEMINI (MT6797 usb11 right port, blockers.md B-19/B-22): honor the
++	 * DT "maximum-speed" property, same as musb_dsps does. NOTE the
++	 * interim full-speed cap this was written for (builds #249-#251's
++	 * pad-chain theory) was RETIRED 2026-07-20 by dts/0019: the bulk
++	 * failures were the FIFO/num_eps config mismatch (fixed below, build
++	 * #254), and high-speed is stable with well-behaved devices. The
++	 * property remains honored purely as a debug/rollback knob.
 +	 * Only USB_SPEED_FULL is honored — anything else keeps the default.
 +	 */
 +	if (usb_get_maximum_speed(dev) == USB_SPEED_FULL) {
@@ -108,7 +110,7 @@ index 0a35aab3a..e027cdeb2 100644
  	glue->phy = devm_of_phy_get_by_index(dev, np, 0);
  	if (IS_ERR(glue->phy)) {
  		dev_err(dev, "fail to getting phy %ld\n",
-@@ -521,6 +588,7 @@ static void mtk_musb_remove(struct platform_device *pdev)
+@@ -521,6 +590,7 @@ static void mtk_musb_remove(struct platform_device *pdev)
  #ifdef CONFIG_OF
  static const struct of_device_id mtk_musb_match[] = {
  	{.compatible = "mediatek,mtk-musb",},

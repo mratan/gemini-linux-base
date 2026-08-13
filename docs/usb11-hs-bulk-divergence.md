@@ -53,7 +53,12 @@ resets an endpoint's toggle to DATA0, the stale DATA1 bit in TXTOG/RXTOG can nev
 cleared → persistent PID mismatch on that bulk endpoint → RX discards / re-IN storms
 ("three-strikes") and TX stuck-TXPKTRDY, escalating to babble. This shape matches the
 observed RTL8156 wedge (babble after minutes of bulk, unrecoverable without reboot).
-**Candidate patch: `usb/0003`** — masked absolute write, DT-gated
+A second defect in the same function (code-review 2026-08-13): with TXTOGEN/RXTOGEN left
+at GENMASK(15,0) by init, the 16-bit read-modify-write also clobbers *other* endpoints'
+hardware-updated toggle bits with a stale snapshot while they stream.
+**Candidate patch: `usb/0003`** — replicates the vendor mechanism exactly: one 32-bit
+write covering TOG[15:0] + TOGEN[31:16] with TOGEN as the per-EP write-enable (absolute
+and race-free), then a second write clearing the enable. DT-gated
 (`mediatek,quirk-vendor-toggle`).
 
 ### C2 — Babble policy inversion: vendor tolerates, mainline collapses the session
@@ -64,9 +69,10 @@ Mainline (`musb_core.c` `musb_handle_intr_reset` → `musb_recover_from_babble`)
 babble = drop session, `musb_root_disconnect()`, re-init — and the mediatek glue defines
 no `.recover` op. So even a survivable marginal event becomes a visible bus collapse; and
 per the #269 wedge, the collapse is not even recovering cleanly on this IP.
-**Candidate patch: `usb/0004`** — `babble_keep_session` config flag honored in
-`musb_handle_intr_reset` (log-only when a device is attached, vendor semantics), DT-gated
-(`mediatek,babble-keep-session`).
+**Candidate patch: folded into `usb/0003`** (one patch carries both C1 and C2; they gate
+independently at runtime via their DT properties) — `babble_keep_session` config flag
+honored in `musb_handle_intr_reset` (log-only when a device is attached, vendor
+semantics), DT-gated (`mediatek,babble-keep-session`).
 
 ### C3 — HS TX slew calibration reads the wrong FM block on this SoC
 tphy-v1 does slew calibration against a frequency-meter block at `sif + 0x100`
@@ -132,10 +138,14 @@ For the USB-display workload (bulk-OUT dominant), note the asymmetry: TX (OUT) m
 tens of Mbit/s for desktop updates. C1/C2 robustness matters more than raw throughput.
 
 ## 4. The opt-in mechanism (defaults unchanged)
-All four candidates activate **only** via the new opt-in variant DTB
+All five patched/DT candidates (C1, C2, C3, C5, C6) activate **only** via the new opt-in
+variant DTB
 `mt6797-gemini-pda-usbexp.dtb` (`dts/0029`), mirroring the HDMI-variant pattern: the
 default board DTB and the release image behavior are untouched; an experiment session
-packs the variant DTB into a clearly-named boot image. The variant sets:
+packs the variant DTB into a clearly-named boot image (`boot3-usbexp.img` via
+`scripts/bootimg.py`, same recipe as the HDMI variant — the variant DTB ships hashed in
+the kernel-build CI artifact, so the session packs a verified artifact, not a local
+rebuild). The variant sets:
 `mediatek,quirk-vendor-toggle` + `mediatek,babble-keep-session` (+ the SSUSB_REF second
 clock) on `&usb1`, and `mediatek,eye-src = <4>` + `mediatek,force-suspendm-release` on
 `&u2port1`. Individual candidates can be isolated by deleting properties from the variant

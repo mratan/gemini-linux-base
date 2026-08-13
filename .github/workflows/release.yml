@@ -19,12 +19,20 @@
 name: release-assemble
 
 on:
-  push:
-    branches: [main]           # release tracks the current tree (audit F1)
+  # Race-free release tracking (audit F1 + code-review 2026-08-13): fire
+  # AFTER kernel-build completes on main, and consume THAT run's artifacts —
+  # same head SHA guaranteed, so a release manifest can never pair HEAD's
+  # rootfs with an older commit's kernel bits (the previous push trigger
+  # raced the multi-hour kernel-build and silently used the last successful
+  # artifact, whatever commit it came from).
+  workflow_run:
+    workflows: [kernel-build]
+    types: [completed]
+    branches: [main]
   workflow_dispatch:
     inputs:
       mode:
-        description: "release = fail closed, REAL kernel-build bits required; smoke = allow placeholder, marked NON-release"
+        description: "release = fail closed, REAL same-SHA kernel-build bits required; smoke = allow placeholder, marked NON-release"
         type: choice
         options: [release, smoke]
         default: release
@@ -35,18 +43,27 @@ permissions:
 
 jobs:
   assemble-and-prove:
+    # workflow_run fires for failed kernel-builds too — only assemble on
+    # success (a dispatch run has no workflow_run payload and always runs).
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-24.04
     timeout-minutes: 150
     env:
       GH_TOKEN: ${{ github.token }}
-      # push (to main) is always a release-qualified run; dispatch honours the
-      # chosen mode (default release). A "smoke" run may use placeholders but is
-      # never marked release-qualified.
+      # workflow_run (after kernel-build on main) is always a release-qualified
+      # run; dispatch honours the chosen mode (default release). A "smoke" run
+      # may use placeholders but is never marked release-qualified.
       RELEASE_MODE: ${{ (github.event_name == 'workflow_dispatch' && inputs.mode) || 'release' }}
+      # The commit this release is OF: the kernel-build run's head SHA for
+      # workflow_run, the current SHA for dispatch. Checkout and the manifest
+      # assertion both use this.
+      TARGET_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
     outputs:
       release_qualified: ${{ steps.qualify.outputs.release_qualified }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
 
       - name: Install build/test dependencies
         run: |
@@ -62,40 +79,61 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p kbits
-          got=0
-          for ref in "${{ github.ref_name }}" "main" ""; do
-            args=(--workflow kernel-build.yml --status success -L 1 --json databaseId)
-            [ -n "$ref" ] && args+=(--branch "$ref")
-            id=$(gh run list "${args[@]}" -q '.[0].databaseId' 2>/dev/null || true)
-            if [ -n "${id:-}" ] && [ "$id" != "null" ]; then
-              echo "found kernel-build run $id (branch='${ref:-any}')"
-              if gh run download "$id" --dir kbits 2>/dev/null; then got=1; break; fi
-            fi
-          done
+          got=0; ksha=unknown
+          if [ "${{ github.event_name }}" = workflow_run ]; then
+            # consume the artifacts of EXACTLY the run that triggered us —
+            # same head SHA by construction
+            id="${{ github.event.workflow_run.id }}"
+            ksha="${{ github.event.workflow_run.head_sha }}"
+            echo "triggering kernel-build run $id @ $ksha"
+            gh run download "$id" --dir kbits && got=1
+          else
+            for ref in "${{ github.ref_name }}" "main" ""; do
+              args=(--workflow kernel-build.yml --status success -L 1 --json databaseId)
+              [ -n "$ref" ] && args+=(--branch "$ref")
+              id=$(gh run list "${args[@]}" -q '.[0].databaseId' 2>/dev/null || true)
+              if [ -n "${id:-}" ] && [ "$id" != "null" ]; then
+                echo "found kernel-build run $id (branch='${ref:-any}')"
+                if gh run download "$id" --dir kbits 2>/dev/null; then
+                  ksha=$(gh run view "$id" --json headSha -q '.headSha' 2>/dev/null || echo unknown)
+                  got=1; break
+                fi
+              fi
+            done
+          fi
           # gh puts each artifact in its own subdir; flatten to kbits/
           find kbits -mindepth 2 -type f -exec cp -n {} kbits/ \; 2>/dev/null || true
           if [ "$got" = 1 ] && [ -f kbits/Image.gz ] && ls kbits/*.ko >/dev/null 2>&1; then
             echo "KMODE=real" >> "$GITHUB_ENV"
-            ksha=$(gh run view "$id" --json headSha -q '.headSha' 2>/dev/null || echo unknown)
+            echo "KSHA=$ksha" >> "$GITHUB_ENV"
             echo "KPROV=kernel-build run $id @ ${ksha:0:12}" >> "$GITHUB_ENV"
             echo "using REAL kernel-build artifacts (run $id @ ${ksha:0:12}):"
             ls -l kbits/*.ko kbits/Image.gz kbits/*.dtb
           else
             echo "KMODE=placeholder" >> "$GITHUB_ENV"
+            echo "KSHA=unknown" >> "$GITHUB_ENV"
             echo "KPROV=SYNTHETIC placeholder (no kernel-build artifact)" >> "$GITHUB_ENV"
             echo "no usable kernel-build artifact — synthesizing placeholders" >&2
           fi
 
       # Fail closed for release qualification: a release run MUST use the real
-      # Image.gz + DTB + .ko from kernel-build. Only an explicit `smoke` dispatch
-      # may fall through to the placeholder synth below, and it is never marked
-      # release-qualified (audit finding F3).
-      - name: Gate — release qualification requires real kernel bits
+      # Image.gz + DTB + .ko from kernel-build, AND from the SAME commit as
+      # the tree being assembled — a manifest must never pair HEAD's rootfs
+      # with another commit's kernel (code-review 2026-08-13). Only an
+      # explicit `smoke` dispatch may fall through to the placeholder synth
+      # below, and it is never marked release-qualified (audit finding F3).
+      - name: Gate — release qualification requires real, same-SHA kernel bits
         run: |
-          echo "RELEASE_MODE=$RELEASE_MODE  KMODE=$KMODE  ($KPROV)"
-          if [ "$RELEASE_MODE" = release ] && [ "$KMODE" != real ]; then
-            echo "::error::release-qualified run requires REAL kernel-build artifacts (Image.gz + 3 .ko); none resolved. Failing closed — no placeholder for a release run."
-            exit 1
+          echo "RELEASE_MODE=$RELEASE_MODE  KMODE=$KMODE  KSHA=$KSHA  TARGET_SHA=$TARGET_SHA  ($KPROV)"
+          if [ "$RELEASE_MODE" = release ]; then
+            if [ "$KMODE" != real ]; then
+              echo "::error::release-qualified run requires REAL kernel-build artifacts; none resolved. Failing closed — no placeholder for a release run."
+              exit 1
+            fi
+            if [ "$KSHA" != "$TARGET_SHA" ]; then
+              echo "::error::kernel bits are from $KSHA but this release assembles $TARGET_SHA — kernel/rootfs commit skew, failing closed."
+              exit 1
+            fi
           fi
 
       - name: Fetch stock Debian arm64 kernel + static busybox (QEMU boot bits)
@@ -169,9 +207,9 @@ jobs:
           set -euo pipefail
           mc=$(awk '/^fork_git_commit:/{print $2}' release/out/MANIFEST.txt)
           echo "manifest fork_git_commit: $mc"
-          echo "release commit (GITHUB_SHA): $GITHUB_SHA"
-          if [ "$mc" != "$GITHUB_SHA" ]; then
-            echo "::error::manifest commit $mc != release commit $GITHUB_SHA (stale manifest cannot ship)"; exit 1
+          echo "release target commit (TARGET_SHA): $TARGET_SHA"
+          if [ "$mc" != "$TARGET_SHA" ]; then
+            echo "::error::manifest commit $mc != release target commit $TARGET_SHA (stale manifest cannot ship)"; exit 1
           fi
           rq=$(awk '/^release_qualified:/{print $2}' release/out/MANIFEST.txt)
           mdv=$(awk '/^modules_dep_verified:/{print $2}' release/out/MANIFEST.txt)

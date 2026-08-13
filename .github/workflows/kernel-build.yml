@@ -133,9 +133,9 @@ jobs:
       # the merge_config + olddefconfig passes — a silently-dropped symbol
       # (missing dependency) must fail loudly here, not surface as a missing
       # udl.ko on the device. Then assert the in-tree udl module was actually
-      # produced by the build above, and that no drm_shmem_helper.ko exists
-      # (the fragment forces the helper =y precisely so udl.ko and evdi.ko
-      # are the only shipped display modules).
+      # produced, together with drm_shmem_helper.ko — udl's select-driven
+      # hard dep (the helper has no Kconfig prompt and CANNOT be forced =y;
+      # see configs/gemini-usbdisplay.config and commit f42d736).
       - name: "USB display (U1): config fragment survived + udl.ko built"
         run: |
           cd "$GITHUB_WORKSPACE/linux-6.6"
@@ -169,6 +169,14 @@ jobs:
              "$GITHUB_WORKSPACE/out/"
           cp "$GITHUB_WORKSPACE/linux-6.6/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dtb" \
              "$GITHUB_WORKSPACE/out/"
+          # Opt-in variant DTBs must ship staged+hashed too, or the physical
+          # session has nothing verified to pack: the HDMI bring-up variant
+          # (dts/0028, runbook Appendix A) and the U2 usbexp experiment
+          # variant (dts/0029, issue #27 test plan).
+          cp "$GITHUB_WORKSPACE/linux-6.6/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda-hdmi.dtb" \
+             "$GITHUB_WORKSPACE/out/"
+          cp "$GITHUB_WORKSPACE/linux-6.6/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda-usbexp.dtb" \
+             "$GITHUB_WORKSPACE/out/"
           cp "$GITHUB_WORKSPACE/linux-6.6/.config" "$GITHUB_WORKSPACE/out/kernel.config"
           cp "$GITHUB_WORKSPACE"/modules/connectivity/*.ko "$GITHUB_WORKSPACE/out/"
           # Slice U1: USB-display modules ride the same artifact so
@@ -177,7 +185,8 @@ jobs:
           cp "$GITHUB_WORKSPACE/linux-6.6/drivers/gpu/drm/drm_shmem_helper.ko" "$GITHUB_WORKSPACE/out/"
           cp "$GITHUB_WORKSPACE/modules/evdi/evdi.ko" "$GITHUB_WORKSPACE/out/"
           cd "$GITHUB_WORKSPACE/out"
-          sha256sum Image.gz mt6797-gemini-pda.dtb kernel.config *.ko | tee SHA256SUMS
+          sha256sum Image.gz mt6797-gemini-pda.dtb mt6797-gemini-pda-hdmi.dtb \
+            mt6797-gemini-pda-usbexp.dtb kernel.config *.ko | tee SHA256SUMS
           { echo '## Kernel build artifacts (SHA-256)'; echo '```'; cat SHA256SUMS; echo '```'; } \
             >> "$GITHUB_STEP_SUMMARY"
 

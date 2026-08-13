@@ -31,13 +31,42 @@ make -C <kernel-tree> M=$PWD/modules/evdi ARCH=arm64 \
      CROSS_COMPILE=aarch64-linux- modules
 ```
 
-The module's own `Makefile` is kbuild-ready; `conftest.sh` probes the target
-kernel's API at build time and emits `evdi_detect.h` (so no source edits are
-needed across kernel versions). Supported kernel range per upstream README:
-4.15 → 6.15 (our base is 6.6). `evdi.ko` needs only in-tree DRM symbols
-(`CONFIG_DRM=y` — already forced by `configs/gemini-display.config`); it is
-default-safe: a virtual-display platform driver that does nothing until the
-DisplayLinkManager userspace opens it.
+The module's own `Makefile` is kbuild-ready. Kernel-API compatibility in
+**this** version is handled by `LINUX_VERSION_CODE` `#if` ladders in the
+sources (upper-bounded around 6.15) — the `conftest.sh`/`evdi_detect.h`
+build-time probing mechanism only exists from v1.15.0 upstream, NOT here;
+when bumping the vendored version, audit the `#if` ladders (or move to a
+conftest-era release deliberately). Supported kernel range per upstream
+README: 4.15 → 6.15 (our base is 6.6). `evdi.ko` needs only in-tree DRM
+symbols (`CONFIG_DRM=y` — already forced by `configs/gemini-display.config`);
+it is default-safe: a virtual-display platform driver that does nothing until
+the DisplayLinkManager userspace opens it.
+
+## Known issues in the vendored code (kept unmodified by policy)
+
+Found by code review 2026-08-13; fix upstream or at bump time, not by
+patching the vendored copy in place:
+
+- **USB-unplug vs remove_all race** (`evdi_platform_drv.c`, the
+  `evdi_platform_drv_usb()` notifier): the notifier reads `g_ctx.devices[i]`
+  and destroys the device *before* taking `g_ctx.lock` (the mutex covers only
+  the count decrement), racing the sysfs `remove_all` path — potential
+  use-after-free / double-unregister if an adapter is yanked concurrently
+  with `echo 1 > /sys/devices/evdi/remove_all`. Practical guidance: don't
+  drive `remove_all` while unplugging; only relevant to the evdi secondary
+  route.
+- **Build-host probing in the Makefile**: a fatal (non-dash) `include
+  /etc/os-release` plus a Raspbian sniff of the build host's `/proc/cpuinfo`
+  feeding `$(RPIFLAG)` into `ccflags-y`. A host without `/etc/os-release`
+  aborts the build; a Raspberry Pi build host silently bakes `-DRPI` into
+  `evdi.ko` (behaviorally inert on 6.6 — every RPI guard is OR'd with
+  kernel ≥ 5.11 — but it makes the binary differ from the CI artifact).
+  Build on CI or the mercury host, not the relay Pi.
+- **Dead machinery for our use**: `dkms.conf`/`dkms_install.sh` (root-run
+  installer editing modprobe.d — do not use; the packaging pipeline stages
+  the prebuilt .ko) and the `tests/` KUnit scaffolding (not compilable in an
+  out-of-tree `M=` build). Kept only to preserve the unmodified upstream
+  tree shape.
 
 ## Relation to udl (the primary route)
 

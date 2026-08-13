@@ -1,5 +1,5 @@
 diff --git a/drivers/usb/musb/mediatek.c b/drivers/usb/musb/mediatek.c
-index e027cdeb2..604d979fb 100644
+index 3533f353b..7e77c7115 100644
 --- a/drivers/usb/musb/mediatek.c
 +++ b/drivers/usb/musb/mediatek.c
 @@ -51,6 +51,7 @@ struct mtk_glue {
@@ -10,7 +10,7 @@ index e027cdeb2..604d979fb 100644
  };
  
  static int mtk_musb_clks_get(struct mtk_glue *glue)
-@@ -322,6 +323,7 @@ static u16 mtk_musb_get_toggle(struct musb_qh *qh, int is_out)
+@@ -322,11 +323,37 @@ static u16 mtk_musb_get_toggle(struct musb_qh *qh, int is_out)
  static u16 mtk_musb_set_toggle(struct musb_qh *qh, int is_out, struct urb *urb)
  {
  	struct musb *musb = qh->hw_ep->musb;
@@ -18,31 +18,37 @@ index e027cdeb2..604d979fb 100644
  	u8 epnum = qh->hw_ep->epnum;
  	u16 value, toggle;
  
-@@ -329,10 +331,23 @@ static u16 mtk_musb_set_toggle(struct musb_qh *qh, int is_out, struct urb *urb)
+ 	toggle = usb_gettoggle(urb->dev, qh->epnum, is_out);
  
++	if (glue->quirk_vendor_toggle) {
++		/*
++		 * GEMINI (MT6797 usb11, issue #27 candidate C1): write the
++		 * toggle ABSOLUTELY and race-free, vendor musbfsh style
++		 * (musbfsh_host.c): a single 32-bit write covering TOG[15:0]
++		 * plus TOGEN[31:16], with TOGEN acting as the per-EP
++		 * write-enable so only this endpoint's bit is updated. The
++		 * 16-bit RMW below has two defects the vendor mechanism
++		 * avoids: it can never CLEAR a stale DATA1 (usbcore toggle
++		 * resets after dequeue/error are lost -> persistent PID
++		 * mismatch), and — with TOGEN left at GENMASK(15,0) by
++		 * mtk_musb_init — its write-back clobbers other endpoints'
++		 * hardware-updated toggle bits with a stale snapshot while
++		 * they stream. Vendor follows with a second write clearing
++		 * the write-enable half. Opt-in via DT
++		 * "mediatek,quirk-vendor-toggle" (usbexp variant DTB).
++		 */
++		u16 tog_reg = is_out ? MUSB_TXTOG : MUSB_RXTOG;
++
++		musb_writel(musb->mregs, tog_reg,
++			    ((u32)(1 << epnum) << 16) | (toggle << epnum));
++		musb_writel(musb->mregs, tog_reg, toggle << epnum);
++		return 0;
++	}
++
  	if (is_out) {
  		value = musb_readw(musb->mregs, MUSB_TXTOG);
-+		/*
-+		 * GEMINI (MT6797 usb11, issue #27 candidate C1): the |= below
-+		 * can set a toggle bit but never clear one, so once usbcore
-+		 * resets an endpoint's toggle to DATA0 (dequeue/error/
-+		 * re-enumeration) the stale DATA1 here PID-mismatches every
-+		 * later transfer. The vendor musbfsh writes toggles
-+		 * absolutely via the TOGEN write-enable (musbfsh_host.c).
-+		 * Opt-in via DT "mediatek,quirk-vendor-toggle".
-+		 */
-+		if (glue->quirk_vendor_toggle)
-+			value &= ~(1 << epnum);
  		value |= toggle << epnum;
- 		musb_writew(musb->mregs, MUSB_TXTOG, value);
- 	} else {
- 		value = musb_readw(musb->mregs, MUSB_RXTOG);
-+		if (glue->quirk_vendor_toggle)
-+			value &= ~(1 << epnum);
- 		value |= toggle << epnum;
- 		musb_writew(musb->mregs, MUSB_RXTOG, value);
- 	}
-@@ -519,6 +534,28 @@ static int mtk_musb_probe(struct platform_device *pdev)
+@@ -521,6 +548,28 @@ static int mtk_musb_probe(struct platform_device *pdev)
  		dev_info(dev, "capping port to full-speed (DT maximum-speed)\n");
  	}
  

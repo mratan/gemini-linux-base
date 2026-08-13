@@ -72,9 +72,12 @@ boot2 is never touched, so the device is never bricked by this runbook.
 ## Part 0 — device-free prep (safe now)
 
 1. **Image:** the standard release-qualified Experimental-slot image already contains
-   `udl.ko` + `evdi.ko` under `/lib/modules/<kver>/updates` (manifest section
-   "USB-display modules") and, once Slice U5 lands, the userspace display stack. No
-   variant DTB, no DT change, no mux change — the USB display needs none of them.
+   `udl.ko` + `drm_shmem_helper.ko` + `evdi.ko` under `/lib/modules/<kver>/updates`
+   (manifest section "USB-display modules") and the U5-staged userspace display stack:
+   sway/foot/seatd + `modetest`, the launch helper `/usr/local/sbin/gemini-usb-display-start`,
+   and `/etc/gemini/sway-usbdisplay.conf` (presence proven in CI by the
+   `GEMINI-USBDISPLAY-USERSPACE-OK` marker). No variant DTB, no DT change, no mux change —
+   the USB display needs none of them.
 2. **Hardware to buy/bring** (from the U3 shortlist — chipset over brand):
    - Preferred: **Plugable UGA-165** (DL-165, documented 1080p60, DVI-I + passive
      DVI→HDMI adapter) — or the **Plugable UD-160-A dock** (same DL-165 + powered hub +
@@ -147,8 +150,13 @@ boot2 is never touched, so the device is never bricked by this runbook.
       `modetest -M udl -s <connector>:1920x1080@60` → stable test pattern on the monitor.
       Alternatively fbcon: `con2fbmap` the udl fbdev (udl exposes fbdev emulation) and
       check a VT appears.
-- [ ] **Single-output desktop** on udl alone using the U5-staged stack (see the U5 slice;
-      until it lands, a manual X/wayland start on the udl card is acceptable but note it).
+- [ ] **Single-output desktop** on udl alone: run `gemini-usb-display-start` (U5-staged;
+      it finds the udl DRM card, pins wlroots to it via `WLR_DRM_DEVICES` with the pixman
+      renderer, and launches sway + foot from `/etc/gemini/sway-usbdisplay.conf`). Do
+      **not** hand-start a compositor without that pin: an unpinned wlroots will open the
+      mediatek-drm card too and can hit the #20 atomic-KMS wedge on the internal panel.
+      If the helper refuses the seat over SSH (flagged open question), retry from the
+      serial/panel console and capture — don't improvise around it.
 - [ ] **Sustained-use soak (the U2-relevant observation):** 15+ minutes of terminal
       scrolling/editor use on the external screen; watch `dmesg -w` for URB errors,
       resets, babble; note subjective update latency.
