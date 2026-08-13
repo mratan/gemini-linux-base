@@ -1,0 +1,121 @@
+diff --git a/drivers/usb/musb/mediatek.c b/drivers/usb/musb/mediatek.c
+index e027cdeb2..604d979fb 100644
+--- a/drivers/usb/musb/mediatek.c
++++ b/drivers/usb/musb/mediatek.c
+@@ -51,6 +51,7 @@ struct mtk_glue {
+ 	struct clk_bulk_data clks[MTK_MUSB_CLKS_NUM];
+ 	enum usb_role role;
+ 	struct usb_role_switch *role_sw;
++	bool quirk_vendor_toggle;
+ };
+ 
+ static int mtk_musb_clks_get(struct mtk_glue *glue)
+@@ -322,6 +323,7 @@ static u16 mtk_musb_get_toggle(struct musb_qh *qh, int is_out)
+ static u16 mtk_musb_set_toggle(struct musb_qh *qh, int is_out, struct urb *urb)
+ {
+ 	struct musb *musb = qh->hw_ep->musb;
++	struct mtk_glue *glue = dev_get_drvdata(musb->controller->parent);
+ 	u8 epnum = qh->hw_ep->epnum;
+ 	u16 value, toggle;
+ 
+@@ -329,10 +331,23 @@ static u16 mtk_musb_set_toggle(struct musb_qh *qh, int is_out, struct urb *urb)
+ 
+ 	if (is_out) {
+ 		value = musb_readw(musb->mregs, MUSB_TXTOG);
++		/*
++		 * GEMINI (MT6797 usb11, issue #27 candidate C1): the |= below
++		 * can set a toggle bit but never clear one, so once usbcore
++		 * resets an endpoint's toggle to DATA0 (dequeue/error/
++		 * re-enumeration) the stale DATA1 here PID-mismatches every
++		 * later transfer. The vendor musbfsh writes toggles
++		 * absolutely via the TOGEN write-enable (musbfsh_host.c).
++		 * Opt-in via DT "mediatek,quirk-vendor-toggle".
++		 */
++		if (glue->quirk_vendor_toggle)
++			value &= ~(1 << epnum);
+ 		value |= toggle << epnum;
+ 		musb_writew(musb->mregs, MUSB_TXTOG, value);
+ 	} else {
+ 		value = musb_readw(musb->mregs, MUSB_RXTOG);
++		if (glue->quirk_vendor_toggle)
++			value &= ~(1 << epnum);
+ 		value |= toggle << epnum;
+ 		musb_writew(musb->mregs, MUSB_RXTOG, value);
+ 	}
+@@ -519,6 +534,28 @@ static int mtk_musb_probe(struct platform_device *pdev)
+ 		dev_info(dev, "capping port to full-speed (DT maximum-speed)\n");
+ 	}
+ 
++	/*
++	 * GEMINI opt-in experiments (issue #27, docs/usb11-hs-bulk-
++	 * divergence.md). Both default OFF; enabled only by the usbexp
++	 * variant DTB (dts/0029).
++	 */
++	glue->quirk_vendor_toggle =
++		of_property_read_bool(np, "mediatek,quirk-vendor-toggle");
++	if (glue->quirk_vendor_toggle)
++		dev_info(dev, "vendor-toggle quirk enabled (candidate C1)\n");
++
++	if (of_property_read_bool(np, "mediatek,babble-keep-session")) {
++		struct musb_hdrc_config *cfg;
++
++		cfg = devm_kmemdup(dev, pdata->config,
++				   sizeof(*cfg), GFP_KERNEL);
++		if (!cfg)
++			return -ENOMEM;
++		cfg->babble_keep_session = 1;
++		pdata->config = cfg;
++		dev_info(dev, "babble-keep-session enabled (candidate C2)\n");
++	}
++
+ 	glue->phy = devm_of_phy_get_by_index(dev, np, 0);
+ 	if (IS_ERR(glue->phy)) {
+ 		dev_err(dev, "fail to getting phy %ld\n",
+diff --git a/drivers/usb/musb/musb_core.c b/drivers/usb/musb/musb_core.c
+index b24adb5b3..edbac382b 100644
+--- a/drivers/usb/musb/musb_core.c
++++ b/drivers/usb/musb/musb_core.c
+@@ -996,7 +996,24 @@ static void musb_handle_intr_reset(struct musb *musb)
+ 		 * Babble conditions. One such platform is AM335x. In
+ 		 * most cases, however, the only thing we can do is
+ 		 * drop the session.
++		 *
++		 * babble_keep_session (opt-in, MediaTek MT6797 usb11 —
++		 * see drivers/usb/musb/mediatek.c): the vendor musbfsh
++		 * driver logs and IGNORES babble while a device is
++		 * attached (DEVCTL FSDEV covers FS and HS devices),
++		 * keeping the session up; dropping the session on this
++		 * IP has been observed to wedge the host until reboot.
+ 		 */
++		if (musb->config->babble_keep_session) {
++			u8 devctl = musb_readb(musb->mregs, MUSB_DEVCTL);
++
++			if (devctl & (MUSB_DEVCTL_FSDEV | MUSB_DEVCTL_LSDEV)) {
++				dev_err(musb->controller,
++					"Babble (ignored, session kept, devctl %02x)\n",
++					devctl);
++				return;
++			}
++		}
+ 		dev_err(musb->controller, "Babble\n");
+ 		musb_recover_from_babble(musb);
+ 	} else {
+diff --git a/include/linux/usb/musb.h b/include/linux/usb/musb.h
+index 3963e55e8..54bc4df4f 100644
+--- a/include/linux/usb/musb.h
++++ b/include/linux/usb/musb.h
+@@ -71,6 +71,14 @@ struct musb_hdrc_config {
+ 	/* need to explicitly de-assert the port reset after resume? */
+ 	unsigned	host_port_deassert_reset_at_resume:1;
+ 
++	/*
++	 * Host babble: log and keep the session running while a device is
++	 * attached (vendor MediaTek musbfsh semantics) instead of dropping
++	 * the session and re-enumerating. Set by glue code from an opt-in
++	 * DT property; see drivers/usb/musb/mediatek.c.
++	 */
++	unsigned	babble_keep_session:1;
++
+ 	u8		num_eps;	/* number of endpoints _with_ ep0 */
+ 	u8		ram_bits;	/* ram address size */
+ 

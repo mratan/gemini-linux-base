@@ -1,0 +1,59 @@
+diff --git a/arch/arm64/boot/dts/mediatek/Makefile b/arch/arm64/boot/dts/mediatek/Makefile
+index da64c2233..73ad9f304 100644
+--- a/arch/arm64/boot/dts/mediatek/Makefile
++++ b/arch/arm64/boot/dts/mediatek/Makefile
+@@ -7,6 +7,7 @@ dtb-$(CONFIG_ARCH_MEDIATEK) += mt6795-sony-xperia-m5.dtb
+ dtb-$(CONFIG_ARCH_MEDIATEK) += mt6797-evb.dtb
+ dtb-$(CONFIG_ARCH_MEDIATEK) += mt6797-gemini-pda.dtb
+ dtb-$(CONFIG_ARCH_MEDIATEK) += mt6797-gemini-pda-hdmi.dtb
++dtb-$(CONFIG_ARCH_MEDIATEK) += mt6797-gemini-pda-usbexp.dtb
+ dtb-$(CONFIG_ARCH_MEDIATEK) += mt6797-x20-dev.dtb
+ dtb-$(CONFIG_ARCH_MEDIATEK) += mt7622-rfb1.dtb
+ dtb-$(CONFIG_ARCH_MEDIATEK) += mt7622-bananapi-bpi-r64.dtb
+diff --git a/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda-usbexp.dts b/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda-usbexp.dts
+new file mode 100644
+index 000000000..cc4ac08dd
+--- /dev/null
++++ b/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda-usbexp.dts
+@@ -0,0 +1,41 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Gemini PDA — OPT-IN right-port USB experiment variant (Slice U2,
++ * tracker issue #27; docs/usb11-hs-bulk-divergence.md).
++ *
++ * The default mt6797-gemini-pda.dtb is unchanged; pack THIS dtb into a
++ * clearly-named boot image (e.g. boot3-usbexp.img) to activate the
++ * candidate throughput/robustness experiments for the right-port MUSB
++ * host. Isolate candidates by deleting properties here and rebuilding —
++ * single-variable discipline.
++ */
++
++#include "mt6797-gemini-pda.dts"
++
++&usb1 {
++	/*
++	 * Candidate C5: the vendor enables CLK_INFRA_SSUSB_REF (26 MHz ref
++	 * gate) as its second clock before PHY init; the mainline path never
++	 * claims it. The glue takes it as the optional "mcu" clock.
++	 */
++	clocks = <&infrasys CLK_INFRA_ICUSB>, <&infrasys CLK_INFRA_SSUSB_REF>;
++	clock-names = "main", "mcu";
++
++	/* Candidate C1: absolute (clearable) data-toggle writes */
++	mediatek,quirk-vendor-toggle;
++
++	/* Candidate C2: vendor babble semantics — log + keep session */
++	mediatek,babble-keep-session;
++};
++
++&u2port1 {
++	/*
++	 * Candidate C3: skip tphy slew calibration (its FM block is at
++	 * SIF+0xf00 on MT6797 usb11, not the +0x100 tphy-v1 reads) and pin
++	 * the value the vendor always lands: HSTX_SRCTRL = 4.
++	 */
++	mediatek,eye-src = <4>;
++
++	/* Candidate C6: release FORCE_SUSPENDM after host-role forcing */
++	mediatek,force-suspendm-release;
++};

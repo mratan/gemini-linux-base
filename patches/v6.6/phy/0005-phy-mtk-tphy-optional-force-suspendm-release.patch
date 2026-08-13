@@ -1,0 +1,46 @@
+diff --git a/drivers/phy/mediatek/phy-mtk-tphy.c b/drivers/phy/mediatek/phy-mtk-tphy.c
+index 4ab1c2e47..fb0de6ca0 100644
+--- a/drivers/phy/mediatek/phy-mtk-tphy.c
++++ b/drivers/phy/mediatek/phy-mtk-tphy.c
+@@ -340,6 +340,7 @@ struct mtk_phy_instance {
+ 	bool bc12_en;
+ 	bool force_sess_valid;
+ 	bool force_usb_host;
++	bool force_suspendm_release;
+ };
+ 
+ struct mtk_tphy {
+@@ -931,6 +932,24 @@ static void u2_phy_instance_power_on(struct mtk_tphy *tphy,
+ 				 P2C_FORCE_SUSPENDM | P2C_RG_SUSPENDM);
+ 		dev_info(tphy->dev, "u2 phy%d: forcing host role (IDDIG=0, session forced valid, SUSPENDM=1)\n",
+ 			 index);
++
++		/*
++		 * GEMINI opt-in experiment (issue #27 candidate C6): the
++		 * vendor musbfsh PHY recover RELEASES force_suspendm at the
++		 * end of bring-up so the MAC drives suspendm
++		 * (musbfsh_mt65xx.c:1046), while the block above holds it
++		 * forever. Holding it may perturb HS reset/suspend
++		 * sequencing mid-session. Only the FORCE bit is released;
++		 * with it clear the RG value is ignored. Default OFF —
++		 * enabled only by the usbexp variant DTB (dts/0029).
++		 */
++		if (instance->force_suspendm_release) {
++			mtk_phy_clear_bits(com + U3P_U2PHYDTM0,
++					   P2C_FORCE_SUSPENDM);
++			dev_info(tphy->dev,
++				 "u2 phy%d: released FORCE_SUSPENDM (candidate C6)\n",
++				 index);
++		}
+ 	}
+ 
+ 	if (tphy->pdata->avoid_rx_sen_degradation && index) {
+@@ -1202,6 +1221,8 @@ static void phy_parse_property(struct mtk_tphy *tphy,
+ 					"mediatek,force-b-session-valid");
+ 	instance->force_usb_host = device_property_read_bool(dev,
+ 					"mediatek,force-usb-host");
++	instance->force_suspendm_release = device_property_read_bool(dev,
++					"mediatek,force-suspendm-release");
+ 	device_property_read_u32(dev, "mediatek,eye-src",
+ 				 &instance->eye_src);
+ 	device_property_read_u32(dev, "mediatek,eye-vrt",
