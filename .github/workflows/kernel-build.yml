@@ -86,28 +86,34 @@ jobs:
           export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
           command -v dt-validate >/dev/null || { echo "dt-validate not found after pip install"; exit 1; }
           cd "$GITHUB_WORKSPACE/linux-6.6"
-          dtb=arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dtb
           fail=0
-          for sch in \
-              display/bridge/sil,sii9022.yaml \
-              display/mediatek/mediatek,dpi.yaml \
-              connector/hdmi-connector.yaml \
-              misc/planet,gemini-rightport-mux.yaml ; do
-            echo "== dtbs_check schema: $sch =="
-            rm -f "$dtb"
-            out=$(make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
-                       CHECK_DTBS=y DT_SCHEMA_FILES="$sch" \
-                       mediatek/mt6797-gemini-pda.dtb 2>&1)
-            # dtbs_check prints one line per validation failure, tagged with the
-            # offending DTB path + node. Any such line for our DTB is a failure.
-            nodeerr=$(echo "$out" | grep -E "mt6797-gemini-pda\.dtb:.*(dpi@1401e000|hdmi-bridge@39|sii9022|/connector|hdmi_connector|rightport-mux)" || true)
-            if [ -n "$nodeerr" ]; then
-              echo "$nodeerr"
-              echo "FAIL: schema errors for new nodes under $sch"
-              fail=1
-            else
-              echo "  ok"
-            fi
+          # Check both the default board dtb (HDMI nodes disabled) and the
+          # opt-in mt6797-gemini-pda-hdmi variant (Slice VS1b — the same nodes
+          # enabled, forming the real OVL1->RDMA1->DSC0->DPI0->sii9022 pipe that
+          # instantiates the second CRTC). Both must validate clean.
+          for name in mt6797-gemini-pda mt6797-gemini-pda-hdmi ; do
+            dtb="arch/arm64/boot/dts/mediatek/$name.dtb"
+            for sch in \
+                display/bridge/sil,sii9022.yaml \
+                display/mediatek/mediatek,dpi.yaml \
+                connector/hdmi-connector.yaml \
+                misc/planet,gemini-rightport-mux.yaml ; do
+              echo "== dtbs_check $name : $sch =="
+              rm -f "$dtb"
+              out=$(make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+                         CHECK_DTBS=y DT_SCHEMA_FILES="$sch" \
+                         "mediatek/$name.dtb" 2>&1)
+              # dtbs_check prints one line per validation failure, tagged with the
+              # offending DTB path + node. Any such line for our DTB is a failure.
+              nodeerr=$(echo "$out" | grep -E "$name\.dtb:.*(dpi@1401e000|hdmi-bridge@39|sii9022|/connector|hdmi_connector|rightport-mux)" || true)
+              if [ -n "$nodeerr" ]; then
+                echo "$nodeerr"
+                echo "FAIL: schema errors for new nodes under $sch ($name)"
+                fail=1
+              else
+                echo "  ok"
+              fi
+            done
           done
           if [ "$fail" != 0 ]; then exit 1; fi
           echo "dtbs_check passed for the new External-display nodes"

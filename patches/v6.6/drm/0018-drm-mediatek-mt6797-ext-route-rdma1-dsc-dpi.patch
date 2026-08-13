@@ -1,0 +1,63 @@
+diff --git a/drivers/gpu/drm/mediatek/mtk_drm_drv.c b/drivers/gpu/drm/mediatek/mtk_drm_drv.c
+index b1c0fee35..938c9e4da 100644
+--- a/drivers/gpu/drm/mediatek/mtk_drm_drv.c
++++ b/drivers/gpu/drm/mediatek/mtk_drm_drv.c
+@@ -162,24 +162,36 @@ static const unsigned int mt6797_mtk_ddp_main[] = {
+ /*
+  * External display path (HDMI via the SiI9024A on DPI0), an INDEPENDENT second
+  * output that shares nothing with the primary DSI path above. Per the vendor
+- * 3.18 ddp_path.c external scenario (module_list_scenario DDP_SCENARIO_SUB_...):
+- * OVL1 -> RDMA1 -> DPI, i.e. a separate overlay + RDMA feeding DPI0 (vendor
+- * EXTD_RDMA_DPI mode). This mirrors the MT8173 ext path (OVL1 ... RDMA1 ->
+- * DPI0), the direct mainline template.
++ * 3.18 ddp_path.c external scenario (module_list_scenario[] entries SUB_DISP
++ * and SUB_RDMA1_DISP, used by ext_disp/mt6797/external_display.c
++ * _build_path_rdma_dpi() in vendor EXTD_RDMA_DPI mode):
+  *
+- * PORTING NOTE (MT8173 template divergence): on MT8173 RDMA1 drives DPI0 via a
+- * direct mmsys mux; on MT6797 DISP_DPI0_SEL_IN offers {UFOE, RDMA0, DSC} and
+- * RDMA1_SOUT offers {UFOE, DSC} (vendor ddp_path.c sel_in_map/sel_out_map), so
+- * the physical RDMA1->DPI hop needs a UFOE (or DSC) pass-through stage that this
+- * minimal path does not yet program. The mmsys ext routing table + that hop are
+- * deferred to the on-device routing slice; the components below are kept
+- * status="disabled" in the DT until then, so this array never builds a CRTC and
+- * the working DSI path is untouched (mtk_drm_crtc_create() skips a path whose
+- * nodes are disabled).
++ *	OVL1 -> RDMA1 -> DSC -> DPI
++ *
++ * i.e. a separate overlay + RDMA feeding DPI0 through a DSC pass-through hop.
++ *
++ * WHY THE DSC HOP (Slice VS1b, resolving the #13 route gap): MT6797 has NO
++ * direct RDMA1->DPI0 mux. From the vendor ddp_path.c mux tables, RDMA1_SOUT
++ * (sel_out_map[4]) reaches only {UFOE, DSC} and DPI0_SEL_IN (sel_in_map[9])
++ * accepts only {UFOE, RDMA0, DSC} -- so RDMA1 can only reach DPI0 via a UFOE
++ * or a DSC pass-through. It must be DSC, not UFOE: UFOE is committed to the
++ * primary DSI path (PRIMARY_DISP scenario ...RDMA0 -> DISP_PATH0 -> UFOE ->
++ * DSI0), so routing the external path through UFOE would collide with the
++ * internal panel. The vendor therefore selects DSC for the external path,
++ * keeping the two pipes fully independent. Mainline's ddp_dsc funcs already
++ * put the DSC block in bypass mode (DSC_BYPASS), so it carries the RGB stream
++ * uncompressed -- a pure routing element. The four mmsys mux writes that
++ * connect this chain live in mmsys_mt6797_routing_table[] (mtk-mmsys.c).
++ *
++ * The components stay status="disabled" in the default DT (mtk_drm_crtc_create
++ * skips a path whose nodes are unavailable, so the working DSI path is
++ * untouched); the opt-in mt6797-gemini-pda-hdmi.dtb variant enables the whole
++ * chain and instantiates this second CRTC.
+  */
+ static const unsigned int mt6797_mtk_ddp_ext[] = {
+ 	DDP_COMPONENT_OVL1,
+ 	DDP_COMPONENT_RDMA1,
++	DDP_COMPONENT_DSC0,
+ 	DDP_COMPONENT_DPI0,
+ };
+ 
+@@ -759,6 +771,8 @@ static const struct of_device_id mtk_ddp_comp_dt_ids[] = {
+ 	  .data = (void *)MTK_DISP_DITHER },
+ 	{ .compatible = "mediatek,mt8195-disp-dsc",
+ 	  .data = (void *)MTK_DISP_DSC },
++	{ .compatible = "mediatek,mt6797-disp-dsc",
++	  .data = (void *)MTK_DISP_DSC },
+ 	{ .compatible = "mediatek,mt8167-disp-gamma",
+ 	  .data = (void *)MTK_DISP_GAMMA, },
+ 	{ .compatible = "mediatek,mt8173-disp-gamma",

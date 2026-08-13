@@ -1,0 +1,29 @@
+diff --git a/arch/arm64/boot/dts/mediatek/mt6797.dtsi b/arch/arm64/boot/dts/mediatek/mt6797.dtsi
+index 64d05eb67..d525cf26f 100644
+--- a/arch/arm64/boot/dts/mediatek/mt6797.dtsi
++++ b/arch/arm64/boot/dts/mediatek/mt6797.dtsi
+@@ -617,6 +617,24 @@ disp_rdma1: disp-rdma1@14010000 {
+ 			fifo-size = <1536>;
+ 			status = "disabled";
+ 		};
++		/*
++		 * DSC (Display Stream Compression) engine, used here purely as
++		 * the RDMA1 -> DPI0 pass-through hop of the external-display
++		 * pipe (mainline ddp_dsc runs it in bypass mode). MT6797 has no
++		 * direct RDMA1->DPI0 mux; the vendor SUB_DISP/SUB_RDMA1_DISP
++		 * scenarios route through DSC (ddp_path.c). Address from the
++		 * vendor dispsys reg array (mt6797.dts: disp_dsi_dsc @ 0x1401a000).
++		 * No larb: the DSC is an inline processing block, not a DMA
++		 * master. Kept disabled by default; enabled by the opt-in
++		 * mt6797-gemini-pda-hdmi variant.
++		 */
++		disp_dsc0: disp-dsc0@1401a000 {
++			compatible = "mediatek,mt6797-disp-dsc";
++			reg = <0 0x1401a000 0 0x1000>;
++			power-domains = <&scpsys MT6797_POWER_DOMAIN_MM>;
++			clocks = <&mmsys CLK_MM_DISP_DSC>;
++			status = "disabled";
++		};
+ 	mutex: mutex@1401f000 {
+ 		compatible = "mediatek,mt6797-disp-mutex";
+ 		reg = <0 0x1401f000 0 0x1000>;
