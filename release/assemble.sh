@@ -397,8 +397,9 @@ MANIFEST="$OUT/MANIFEST.txt"
         vm="$(modinfo -F vermagic "$f" 2>/dev/null || echo '?')"
         echo "  $m.ko  $(sha "$f")  [vermagic: $vm]"
     done
-    echo "# NOTE: no module-to-module deps (DRM helpers are =y); a USB display is"
-    echo "#       unusable until the right-port high-speed cap lifts (issue #27)."
+    echo "# NOTE: no module-to-module deps (DRM helpers are =y). Right-port MUSB"
+    echo "#       throughput/babble robustness for display-grade bulk is issue #27;"
+    echo "#       nothing here is validated on hardware (NOT-YET-FLASHED)."
     echo
     echo "## modules.dep  (depmod on the staged overlay — proves load order)"
     if [ -s "$MODULES_DEP" ]; then
