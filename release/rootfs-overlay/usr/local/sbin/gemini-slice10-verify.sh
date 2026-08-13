@@ -73,7 +73,7 @@ done
 # --- 4. USB-display userspace staged (Slice U5, issue #30) — presence only;
 #        nothing is started (manual-start helper keeps it default-safe)
 ud_ok=1
-for b in sway foot seatd seatd-launch modetest lsusb; do
+for b in sway foot seatd seatd-launch modetest lsusb wl-mirror; do
     command -v "$b" >/dev/null 2>&1 || { say "GEMINI-SLICE10-USBDISPLAY-MISSING $b"; ud_ok=0; }
 done
 [ -x /usr/local/sbin/gemini-usb-display-start ] \

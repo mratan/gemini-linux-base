@@ -64,7 +64,10 @@ if [ "${USB_DISPLAY:-0}" = 1 ]; then
     # dbus + a monospace font for foot. See docs/external-display-first-
     # session-runbook.md Parts 3-5 and release/rootfs-overlay's
     # gemini-usb-display-start helper.
-    PKGS="$PKGS,sway,foot,seatd,libdrm-tests,usbutils,dbus,fonts-dejavu-core"
+    # wl-mirror: output-mirroring client for the mirrored-display mode
+    # (endpoint priority reordered 2026-08-13: docked single-output ->
+    # mirrored -> extended; issue #21).
+    PKGS="$PKGS,sway,foot,seatd,libdrm-tests,usbutils,dbus,fonts-dejavu-core,wl-mirror"
 fi
 
 echo "==> [1/4] mmdebstrap --variant=minbase $SUITE (arm64) -> $TARGET"

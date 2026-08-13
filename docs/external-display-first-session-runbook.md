@@ -171,13 +171,23 @@ boot2 is never touched, so the device is never bricked by this runbook.
       (`bq25890` still reports Charging).
 - **Capture:** `lsusb -t` of the full tree, coexistence notes, any bandwidth pain.
 
-## Part 7 — extended desktop (endpoint attempt — expected partial)
+## Part 7 — second-screen modes: mirror first, then extended (expected partial)
 
-- [ ] Attempt the two-DRM-device extended desktop (mediatek-drm panel + udl) with the
-      staged compositor. **Expected to be partial**: the internal panel currently runs
-      fbdev (the atomic-KMS wedge, #20), and multi-GPU compositing is the #21 endpoint
-      work. Any result here is bonus data for #20/#21 — capture, don't debug live.
-- **Capture:** compositor logs, which outputs lit, dmesg.
+Endpoint priority (reordered 2026-08-13, issue #21): docked single-output (Part 5, the
+near-term "working") → **mirrored** → extended. Mirror and extend are the same capability
+— the compositor driving BOTH DRM devices — differently configured, and both inherit the
+#20 atomic-KMS dependency for the internal-panel half. This part is the only place an
+*unpinned* compositor start is sanctioned (it IS the experiment; Part 5's warning stands
+everywhere else).
+
+- [ ] Attempt sway with both DRM devices (`WLR_DRM_DEVICES` listing the mediatek card and
+      the udl card). **Expected to be partial**: the internal panel currently runs fbdev
+      (the atomic-KMS wedge, #20).
+- [ ] If both outputs light: run `wl-mirror` (staged in the image) to mirror one output
+      onto the other — that is the priority mode. Extended is the same session without
+      the mirror client (sway's default); note it works but don't polish it this session.
+- [ ] Any result here is bonus data for #20/#21 — capture, don't debug live.
+- **Capture:** compositor logs, which outputs lit, wl-mirror behavior, dmesg.
 
 ## After this session
 
