@@ -75,12 +75,13 @@ WMT_SOC.cfg	80	f4a59b622a4e0c1470e475ce33f3edae43b27f1fbdeba54dc7cf07503d132880"
 
 KO_NAMES="mtk_btif mtk_stp_wmt_soc wlan_gen3"
 # Slice U1 (issue #26, PRD #25, ADR-0004): USB-display modules staged and
-# depmod-verified alongside the connectivity set. udl is built in-tree by the
-# kernel (CONFIG_DRM_UDL=m, configs/gemini-usbdisplay.config); evdi is the
-# vendored out-of-tree modules/evdi. Both have no module-to-module deps by
-# construction (their DRM helpers are forced =y), which the depmod
-# verification below proves rather than assumes.
-DISPLAY_KO_NAMES="udl evdi"
+# depmod-verified alongside the connectivity set. udl + drm_shmem_helper
+# (its select-driven hard dep — the symbol has no Kconfig prompt and cannot
+# be forced =y) are built in-tree by the kernel (CONFIG_DRM_UDL=m,
+# configs/gemini-usbdisplay.config); evdi is the vendored out-of-tree
+# modules/evdi. The depmod verification below proves the udl ->
+# drm_shmem_helper dependency resolves rather than assuming it.
+DISPLAY_KO_NAMES="udl drm_shmem_helper evdi"
 
 # ---- defaults --------------------------------------------------------------
 KERNEL_DIR=""
@@ -171,10 +172,13 @@ elif [ -n "$KBUILD" ]; then
         modules -j"$(nproc)"
     [ -f "$REPO/modules/evdi/evdi.ko" ] || die "module did not build: evdi.ko"
     DISPLAY_KO_FILES+=("$REPO/modules/evdi/evdi.ko")
-    # udl is in-tree: the kernel build itself must have produced it
+    # udl + its shmem helper are in-tree: the kernel build must have produced them
     [ -f "$KBUILD/drivers/gpu/drm/udl/udl.ko" ] \
         || die "udl.ko missing from $KBUILD — is configs/gemini-usbdisplay.config merged (CONFIG_DRM_UDL=m)?"
     DISPLAY_KO_FILES+=("$KBUILD/drivers/gpu/drm/udl/udl.ko")
+    [ -f "$KBUILD/drivers/gpu/drm/drm_shmem_helper.ko" ] \
+        || die "drm_shmem_helper.ko missing from $KBUILD (udl.ko hard dep)"
+    DISPLAY_KO_FILES+=("$KBUILD/drivers/gpu/drm/drm_shmem_helper.ko")
 else
     die "need --modules-ko DIR or --kbuild DIR"
 fi
@@ -401,9 +405,10 @@ MANIFEST="$OUT/MANIFEST.txt"
         vm="$(modinfo -F vermagic "$f" 2>/dev/null || echo '?')"
         echo "  $m.ko  $(sha "$f")  [vermagic: $vm]"
     done
-    echo "# NOTE: no module-to-module deps (DRM helpers are =y). Right-port MUSB"
-    echo "#       throughput/babble robustness for display-grade bulk is issue #27;"
-    echo "#       nothing here is validated on hardware (NOT-YET-FLASHED)."
+    echo "# NOTE: udl.ko depends on drm_shmem_helper.ko (select-driven =m); the"
+    echo "#       depmod verification above proves that chain resolves. Right-port"
+    echo "#       MUSB throughput/babble robustness for display-grade bulk is issue"
+    echo "#       #27; nothing here is validated on hardware (NOT-YET-FLASHED)."
     echo
     echo "## modules.dep  (depmod on the staged overlay — proves load order)"
     if [ -s "$MODULES_DEP" ]; then

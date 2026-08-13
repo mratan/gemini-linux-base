@@ -141,13 +141,16 @@ jobs:
           cd "$GITHUB_WORKSPACE/linux-6.6"
           grep -q '^CONFIG_DRM_UDL=m$' .config \
             || { echo "::error::CONFIG_DRM_UDL=m dropped from merged .config"; exit 1; }
-          grep -q '^CONFIG_DRM_GEM_SHMEM_HELPER=y$' .config \
-            || { echo "::error::CONFIG_DRM_GEM_SHMEM_HELPER=y dropped from merged .config"; exit 1; }
+          # DRM_GEM_SHMEM_HELPER is select-driven (no Kconfig prompt) and
+          # lands =m via udl's select — its .ko is a hard dep of udl.ko and
+          # must ship with it (see configs/gemini-usbdisplay.config).
+          grep -q '^CONFIG_DRM_GEM_SHMEM_HELPER=m$' .config \
+            || { echo "::error::CONFIG_DRM_GEM_SHMEM_HELPER not =m — udl dep shape changed, update staging"; exit 1; }
           test -f drivers/gpu/drm/udl/udl.ko \
             || { echo "::error::udl.ko not produced by kernel build"; exit 1; }
-          test ! -f drivers/gpu/drm/drm_shmem_helper.ko \
-            || { echo "::error::drm_shmem_helper.ko exists — helper regressed to =m, udl.ko grew an unstaged dep"; exit 1; }
-          echo "U1 config + in-tree udl.ko OK"
+          test -f drivers/gpu/drm/drm_shmem_helper.ko \
+            || { echo "::error::drm_shmem_helper.ko not produced (udl.ko dep)"; exit 1; }
+          echo "U1 config + in-tree udl.ko + drm_shmem_helper.ko OK"
 
       # Slice U1: the vendored evdi module (modules/evdi, pinned to the
       # version the aarch64 DisplayLinkManager pairs with — PROVENANCE.md)
@@ -171,6 +174,7 @@ jobs:
           # Slice U1: USB-display modules ride the same artifact so
           # release-assemble can stage + depmod-verify them (issue #26).
           cp "$GITHUB_WORKSPACE/linux-6.6/drivers/gpu/drm/udl/udl.ko" "$GITHUB_WORKSPACE/out/"
+          cp "$GITHUB_WORKSPACE/linux-6.6/drivers/gpu/drm/drm_shmem_helper.ko" "$GITHUB_WORKSPACE/out/"
           cp "$GITHUB_WORKSPACE/modules/evdi/evdi.ko" "$GITHUB_WORKSPACE/out/"
           cd "$GITHUB_WORKSPACE/out"
           sha256sum Image.gz mt6797-gemini-pda.dtb kernel.config *.ko | tee SHA256SUMS
