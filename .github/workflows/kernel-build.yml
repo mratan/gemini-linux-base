@@ -128,6 +128,37 @@ jobs:
           make -C "$GITHUB_WORKSPACE/linux-6.6" \
             M="$GITHUB_WORKSPACE/modules/connectivity" modules
 
+      # Slice U1 (tracker issue #26, PRD #25, ADR-0004): the USB-display
+      # stack. First assert the gemini-usbdisplay.config fragment SURVIVED
+      # the merge_config + olddefconfig passes — a silently-dropped symbol
+      # (missing dependency) must fail loudly here, not surface as a missing
+      # udl.ko on the device. Then assert the in-tree udl module was actually
+      # produced by the build above, and that no drm_shmem_helper.ko exists
+      # (the fragment forces the helper =y precisely so udl.ko and evdi.ko
+      # are the only shipped display modules).
+      - name: "USB display (U1): config fragment survived + udl.ko built"
+        run: |
+          cd "$GITHUB_WORKSPACE/linux-6.6"
+          grep -q '^CONFIG_DRM_UDL=m$' .config \
+            || { echo "::error::CONFIG_DRM_UDL=m dropped from merged .config"; exit 1; }
+          grep -q '^CONFIG_DRM_GEM_SHMEM_HELPER=y$' .config \
+            || { echo "::error::CONFIG_DRM_GEM_SHMEM_HELPER=y dropped from merged .config"; exit 1; }
+          test -f drivers/gpu/drm/udl/udl.ko \
+            || { echo "::error::udl.ko not produced by kernel build"; exit 1; }
+          test ! -f drivers/gpu/drm/drm_shmem_helper.ko \
+            || { echo "::error::drm_shmem_helper.ko exists — helper regressed to =m, udl.ko grew an unstaged dep"; exit 1; }
+          echo "U1 config + in-tree udl.ko OK"
+
+      # Slice U1: the vendored evdi module (modules/evdi, pinned to the
+      # version the aarch64 DisplayLinkManager pairs with — PROVENANCE.md)
+      # must compile and pass modpost against this kernel on every change,
+      # exactly like the connectivity modules.
+      - name: Build evdi module (USB display secondary route)
+        run: |
+          make -C "$GITHUB_WORKSPACE/linux-6.6" \
+            M="$GITHUB_WORKSPACE/modules/evdi" modules
+          test -f "$GITHUB_WORKSPACE/modules/evdi/evdi.ko"
+
       - name: Collect and hash artifacts
         run: |
           mkdir -p "$GITHUB_WORKSPACE/out"
@@ -137,6 +168,10 @@ jobs:
              "$GITHUB_WORKSPACE/out/"
           cp "$GITHUB_WORKSPACE/linux-6.6/.config" "$GITHUB_WORKSPACE/out/kernel.config"
           cp "$GITHUB_WORKSPACE"/modules/connectivity/*.ko "$GITHUB_WORKSPACE/out/"
+          # Slice U1: USB-display modules ride the same artifact so
+          # release-assemble can stage + depmod-verify them (issue #26).
+          cp "$GITHUB_WORKSPACE/linux-6.6/drivers/gpu/drm/udl/udl.ko" "$GITHUB_WORKSPACE/out/"
+          cp "$GITHUB_WORKSPACE/modules/evdi/evdi.ko" "$GITHUB_WORKSPACE/out/"
           cd "$GITHUB_WORKSPACE/out"
           sha256sum Image.gz mt6797-gemini-pda.dtb kernel.config *.ko | tee SHA256SUMS
           { echo '## Kernel build artifacts (SHA-256)'; echo '```'; cat SHA256SUMS; echo '```'; } \

@@ -20,6 +20,8 @@ say() { echo "$@" > "$CON" 2>/dev/null || echo "$@"; }
 
 FW_NAMES="ROMv3_patch_1_0_hdr.bin ROMv3_patch_1_1_hdr.bin WIFI_RAM_CODE_6797 WMT_SOC.cfg"
 KO_NAMES="mtk_btif mtk_stp_wmt_soc wlan_gen3"
+# Slice U1 (issue #26): USB-display modules ride the same staging path.
+KO_NAMES="$KO_NAMES udl evdi"
 DAEMON_UNITS="wmt-loader.service wmt-launcher.service"
 
 say "GEMINI-SLICE10-VERIFY: begin (uname -r=$(uname -r 2>/dev/null))"

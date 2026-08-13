@@ -122,8 +122,9 @@ jobs:
             -cpu max -nographic 2>/dev/null || true
           test -f kbits/mt6797-gemini-pda.dtb
           # placeholder .ko named correctly (presence is what the QEMU proof
-          # asserts). Post-#22 the set is 3 (chardev merged into wlan_gen3).
-          for m in mtk_btif mtk_stp_wmt_soc wlan_gen3; do
+          # asserts). Post-#22 the connectivity set is 3 (chardev merged into
+          # wlan_gen3); Slice U1 (issue #26) adds the USB-display set.
+          for m in mtk_btif mtk_stp_wmt_soc wlan_gen3 udl evdi; do
             printf 'GEMINI-KO-PLACEHOLDER %s (real .ko from kernel-build.yml)\n' "$m" \
               > "kbits/$m.ko"
           done

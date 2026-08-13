@@ -7,8 +7,10 @@
 #                                  + our busybox initramfs (bootimg.py, Slice 4)
 #   <out>/experimental.img         Debian 13 arm64 loop-image rootfs
 #                                  (mkrootfs-loop.sh, Slice 4) with:
-#                                    - the ported connectivity .ko installed
-#                                      under /lib/modules/<kver>/updates
+#                                    - the ported connectivity .ko + the
+#                                      USB-display .ko (udl, evdi — Slice U1,
+#                                      issue #26) installed under
+#                                      /lib/modules/<kver>/updates
 #                                    - the CONSYS firmware payload in /lib/firmware
 #                                    - the native WMT daemons + INERT systemd units
 #                                    - the Slice 10 boot-time self-check
@@ -39,9 +41,10 @@
 # Release qualification (audit F2/F3, issue #24):
 #   --verify-modules-dep   after staging, run depmod on the overlay (works for
 #                          the prebuilt --modules-ko path too) and PROVE that
-#                          `modprobe -n --show-depends` resolves all three
-#                          modules in the acyclic order mtk_btif ->
-#                          mtk_stp_wmt_soc -> wlan_gen3. FAILS CLOSED on any
+#                          `modprobe -n --show-depends` resolves every staged
+#                          module: the connectivity set in the acyclic order
+#                          mtk_btif -> mtk_stp_wmt_soc -> wlan_gen3, plus the
+#                          USB-display set (udl, evdi). FAILS CLOSED on any
 #                          missing/cyclic/unresolvable dependency.
 #   --release-qualified    stamp `release_qualified: yes` in the manifest.
 #                          Requires --verify-modules-dep to pass; a synthetic /
@@ -71,6 +74,13 @@ WIFI_RAM_CODE_6797	451904	c28c50efd411c591372b3a57a46cb99709db56e6cd86d65022af2b
 WMT_SOC.cfg	80	f4a59b622a4e0c1470e475ce33f3edae43b27f1fbdeba54dc7cf07503d132880"
 
 KO_NAMES="mtk_btif mtk_stp_wmt_soc wlan_gen3"
+# Slice U1 (issue #26, PRD #25, ADR-0004): USB-display modules staged and
+# depmod-verified alongside the connectivity set. udl is built in-tree by the
+# kernel (CONFIG_DRM_UDL=m, configs/gemini-usbdisplay.config); evdi is the
+# vendored out-of-tree modules/evdi. Both have no module-to-module deps by
+# construction (their DRM helpers are forced =y), which the depmod
+# verification below proves rather than assumes.
+DISPLAY_KO_NAMES="udl evdi"
 
 # ---- defaults --------------------------------------------------------------
 KERNEL_DIR=""
@@ -136,11 +146,16 @@ git_head() { git -C "$REPO" rev-parse HEAD 2>/dev/null || echo "unknown"; }
 # 1. Connectivity modules -> $MOD_OV/lib/modules/<kver>/updates/*.ko
 # ============================================================================
 declare -a KO_FILES=()
+declare -a DISPLAY_KO_FILES=()
 if [ -n "$MODULES_KO" ]; then
     log "[1/6] using prebuilt modules from $MODULES_KO"
     for m in $KO_NAMES; do
         [ -f "$MODULES_KO/$m.ko" ] || die "prebuilt module missing: $MODULES_KO/$m.ko"
         KO_FILES+=("$MODULES_KO/$m.ko")
+    done
+    for m in $DISPLAY_KO_NAMES; do
+        [ -f "$MODULES_KO/$m.ko" ] || die "prebuilt module missing: $MODULES_KO/$m.ko (USB display, issue #26 — kernel-build must ship it)"
+        DISPLAY_KO_FILES+=("$MODULES_KO/$m.ko")
     done
 elif [ -n "$KBUILD" ]; then
     log "[1/6] building connectivity modules against $KBUILD"
@@ -151,6 +166,15 @@ elif [ -n "$KBUILD" ]; then
         [ -f "$MODULES_SRC/$m.ko" ] || die "module did not build: $m.ko"
         KO_FILES+=("$MODULES_SRC/$m.ko")
     done
+    log "      building evdi (modules/evdi) against $KBUILD"
+    make -C "$KBUILD" M="$REPO/modules/evdi" ARCH=arm64 CROSS_COMPILE="$CROSS_COMPILE" \
+        modules -j"$(nproc)"
+    [ -f "$REPO/modules/evdi/evdi.ko" ] || die "module did not build: evdi.ko"
+    DISPLAY_KO_FILES+=("$REPO/modules/evdi/evdi.ko")
+    # udl is in-tree: the kernel build itself must have produced it
+    [ -f "$KBUILD/drivers/gpu/drm/udl/udl.ko" ] \
+        || die "udl.ko missing from $KBUILD — is configs/gemini-usbdisplay.config merged (CONFIG_DRM_UDL=m)?"
+    DISPLAY_KO_FILES+=("$KBUILD/drivers/gpu/drm/udl/udl.ko")
 else
     die "need --modules-ko DIR or --kbuild DIR"
 fi
@@ -175,10 +199,14 @@ else
     mkdir -p "$MODINSTDIR"
     for k in "${KO_FILES[@]}"; do cp "$k" "$MODINSTDIR/"; done
 fi
-for m in $KO_NAMES; do
+# USB-display modules (Slice U1): plain copy on both paths — udl.ko comes out
+# of the kernel tree (not MODULES_SRC), so modules_install above never sees it.
+mkdir -p "$MODINSTDIR"
+for k in "${DISPLAY_KO_FILES[@]}"; do cp "$k" "$MODINSTDIR/"; done
+for m in $KO_NAMES $DISPLAY_KO_NAMES; do
     [ -f "$MODINSTDIR/$m.ko" ] || die "module not staged: $MODINSTDIR/$m.ko"
 done
-log "      staged $(echo $KO_NAMES | wc -w) modules under /lib/modules/$KVER/updates"
+log "      staged $(echo $KO_NAMES $DISPLAY_KO_NAMES | wc -w) modules under /lib/modules/$KVER/updates"
 
 # ---- depmod on the STAGED overlay (audit finding F2) -----------------------
 # The prebuilt --modules-ko path used by release.yml previously only COPIED the
@@ -197,8 +225,8 @@ fi
 if [ "$VERIFY_MODULES_DEP" = 1 ]; then
     need modprobe
     [ -s "$MODULES_DEP" ] || die "modules.dep missing/empty after depmod: $MODULES_DEP"
-    log "      verifying modprobe -n resolves all $(echo $KO_NAMES | wc -w) modules"
-    for m in $KO_NAMES; do
+    log "      verifying modprobe -n resolves all $(echo $KO_NAMES $DISPLAY_KO_NAMES | wc -w) modules"
+    for m in $KO_NAMES $DISPLAY_KO_NAMES; do
         grep -q "updates/$m.ko" "$MODULES_DEP" || die "modules.dep has no entry for $m.ko"
         out="$(modprobe -n --show-depends -d "$MOD_OV" -S "$KVER" "$m" 2>&1)" \
             || die "modprobe -n failed for $m: $out"
@@ -361,11 +389,22 @@ MANIFEST="$OUT/MANIFEST.txt"
     echo "#       wmt_chrdev_wifi was merged into wlan_gen3 (issue #22). modprobe"
     echo "#       ordering works via the generated modules.dep. See RUNBOOK.md step 4."
     echo
+    echo "## USB-display modules  (/lib/modules/$KVER/updates)  — Slice U1, ADR-0004"
+    echo "# udl: in-tree (CONFIG_DRM_UDL=m, configs/gemini-usbdisplay.config), primary route"
+    echo "# evdi: modules/evdi @ fork commit above (see its PROVENANCE.md), secondary route"
+    for m in $DISPLAY_KO_NAMES; do
+        f="$MODINSTDIR/$m.ko"
+        vm="$(modinfo -F vermagic "$f" 2>/dev/null || echo '?')"
+        echo "  $m.ko  $(sha "$f")  [vermagic: $vm]"
+    done
+    echo "# NOTE: no module-to-module deps (DRM helpers are =y); a USB display is"
+    echo "#       unusable until the right-port high-speed cap lifts (issue #27)."
+    echo
     echo "## modules.dep  (depmod on the staged overlay — proves load order)"
     if [ -s "$MODULES_DEP" ]; then
         echo "  modules.dep  $(sha "$MODULES_DEP")"
         sed 's/^/    /' "$MODULES_DEP"
-        echo "# modprobe -n --show-depends resolves all three modules: $([ "$MODDEP_VERIFIED" = 1 ] && echo VERIFIED || echo 'not verified this run')"
+        echo "# modprobe -n --show-depends resolves all $(echo $KO_NAMES $DISPLAY_KO_NAMES | wc -w) modules: $([ "$MODDEP_VERIFIED" = 1 ] && echo VERIFIED || echo 'not verified this run')"
     else
         echo "  (modules.dep not generated this run)"
     fi
