@@ -1,0 +1,64 @@
+#!/bin/sh
+# gemini-usb-net — bring up a USB gadget on the Experimental slot so the first
+# CONSYS bring-up is reachable over the existing USB cable with NO serial
+# adapter (the experimental image ships no serial rig and no dongle).
+#
+# Primary path: RNDIS network -> SSH. RNDIS + libcomposite + configfs are all
+# built into the experimental kernel (CONFIG_USB_F_RNDIS=y,
+# CONFIG_USB_LIBCOMPOSITE=y, CONFIG_CONFIGFS_FS=y), so this path needs NO
+# modules loaded and cannot fail on a missing .ko.
+# Fallback path: an ACM console (usb_f_acm, a module) so that if the network
+# path ever fails we still get a rescue root shell over the same cable
+# (serial-getty@ttyGS0 autologin) — belt and suspenders, since we have no
+# serial cable to debug a blind first boot.
+#
+# Device IP 10.15.19.82/24 (same subnet the Gemian slot uses, so the existing
+# `ssh -J damkohler root@10.15.19.82` route works). Host (damkohler) side takes
+# 10.15.19.100/24 on the new usb ethernet interface.
+set -e
+
+CFGFS=/sys/kernel/config
+mountpoint -q "$CFGFS" 2>/dev/null || mount -t configfs none "$CFGFS" 2>/dev/null || true
+
+G="$CFGFS/usb_gadget/gemini"
+[ -d "$G" ] && exit 0   # idempotent: already configured
+
+mkdir -p "$G"
+echo 0x1d6b > "$G/idVendor"          # Linux Foundation
+echo 0x0104 > "$G/idProduct"         # Multifunction Composite Gadget
+mkdir -p "$G/strings/0x409"
+echo gemini-exp             > "$G/strings/0x409/serialnumber"
+echo Planet                 > "$G/strings/0x409/manufacturer"
+echo "Gemini Experimental"  > "$G/strings/0x409/product"
+
+mkdir -p "$G/configs/c.1/strings/0x409"
+echo "rndis+acm" > "$G/configs/c.1/strings/0x409/configuration"
+
+# --- RNDIS network function (built-in; primary access path) ----------------
+mkdir -p "$G/functions/rndis.usb0"
+ln -sf "$G/functions/rndis.usb0" "$G/configs/c.1/"
+
+# --- ACM console function (module; best-effort rescue shell) ----------------
+modprobe usb_f_acm 2>/dev/null || true
+if mkdir -p "$G/functions/acm.GS0" 2>/dev/null; then
+    ln -sf "$G/functions/acm.GS0" "$G/configs/c.1/" 2>/dev/null || true
+fi
+
+# --- bind to the (only) USB device controller ------------------------------
+udc="$(ls /sys/class/udc 2>/dev/null | head -1)"
+[ -n "$udc" ] || { echo "gemini-usb-net: no UDC found" >&2; exit 1; }
+echo "$udc" > "$G/UDC"
+
+# --- static IP on the RNDIS interface (read its real name from configfs) ----
+sleep 1
+IF="$(cat "$G/functions/rndis.usb0/ifname" 2>/dev/null)"
+[ -n "$IF" ] || IF=usb0
+for _ in 1 2 3 4 5; do
+    if ip link show "$IF" >/dev/null 2>&1; then
+        ip addr add 10.15.19.82/24 dev "$IF" 2>/dev/null || true
+        ip link set "$IF" up
+        break
+    fi
+    sleep 1
+done
+echo "gemini-usb-net: gadget up on UDC=$udc iface=$IF ip=10.15.19.82/24"

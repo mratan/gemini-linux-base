@@ -48,6 +48,16 @@ while [ $# -gt 0 ]; do
         # minbase QEMU pivot proof (packaging.yml) small; release/assemble.sh
         # always passes it for the deliverable image.
         --usb-display) USB_DISPLAY=1; shift ;;
+        # --headless (issue: first-session SSH access, 2026-08-17): add an SSH
+        # server + iproute2 so the Experimental slot is reachable over the USB
+        # cable with NO serial adapter. Paired with release/headless-overlay,
+        # which brings up a USB RNDIS gadget (+ ACM rescue console) at boot and
+        # installs root's authorized_keys. release/assemble.sh always passes it
+        # for the deliverable; packaging.yml's minbase QEMU proof does not, so
+        # that proof stays lean. openssh-server's maintainer scripts run under
+        # qemu-user-static during the mmdebstrap build, so host keys and the
+        # sshd privsep user are generated correctly at build time.
+        --headless) HEADLESS=1; shift ;;
         *) echo "unknown arg: $1" >&2; exit 2 ;;
     esac
 done
@@ -68,6 +78,11 @@ if [ "${USB_DISPLAY:-0}" = 1 ]; then
     # (endpoint priority reordered 2026-08-13: docked single-output ->
     # mirrored -> extended; issue #21).
     PKGS="$PKGS,sway,foot,seatd,libdrm-tests,usbutils,dbus,fonts-dejavu-core,wl-mirror"
+fi
+if [ "${HEADLESS:-0}" = 1 ]; then
+    # openssh-server: reachable over the USB RNDIS gadget (release/headless-
+    # overlay). iproute2: the gadget script uses `ip` to address the interface.
+    PKGS="$PKGS,openssh-server,iproute2"
 fi
 
 echo "==> [1/4] mmdebstrap --variant=minbase $SUITE (arm64) -> $TARGET"

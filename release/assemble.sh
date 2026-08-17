@@ -349,10 +349,16 @@ if [ "$BUILD_ROOTFS" = 1 ]; then
     ROOTFS="$OUT/experimental.img"
     OV_ARGS=(--overlay "$MOD_OV" --overlay "$FW_OV" --overlay "$DAEMONS_OVERLAY")
     [ -d "$RELEASE_OVERLAY" ] && OV_ARGS+=(--overlay "$RELEASE_OVERLAY")
+    # headless SSH-over-USB access (first-session requirement, 2026-08-17): the
+    # experimental image ships no serial rig, so it must be reachable over the
+    # USB cable. --headless adds openssh-server; HEADLESS_OVERLAY brings up the
+    # RNDIS gadget (+ ACM rescue console) and installs root's authorized_keys.
+    HEADLESS_OVERLAY="$REPO/release/headless-overlay"
+    [ -d "$HEADLESS_OVERLAY" ] && OV_ARGS+=(--overlay "$HEADLESS_OVERLAY")
     # --usb-display: the deliverable image always carries the USB-display
     # userspace (Slice U5, issue #30) — packaging.yml's separate minbase
     # pivot proof stays lean because it calls mkrootfs-loop.sh directly.
-    "$REPO/scripts/mkrootfs-loop.sh" --out "$ROOTFS" --usb-display "${OV_ARGS[@]}"
+    "$REPO/scripts/mkrootfs-loop.sh" --out "$ROOTFS" --usb-display --headless "${OV_ARGS[@]}"
 else
     log "[5/6] skipping rootfs loop image (pass --build-rootfs, needs root)"
 fi

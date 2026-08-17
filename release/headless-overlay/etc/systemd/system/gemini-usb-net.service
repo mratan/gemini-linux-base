@@ -1,0 +1,15 @@
+[Unit]
+Description=Gemini Experimental USB gadget (RNDIS network + ACM rescue console) for headless access
+Documentation=file:///usr/local/sbin/gemini-usb-net
+DefaultDependencies=no
+After=systemd-modules-load.service sys-kernel-config.mount
+Before=ssh.service network.target sysinit.target
+ConditionPathExists=/sys/class/udc
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/gemini-usb-net
+
+[Install]
+WantedBy=sysinit.target
