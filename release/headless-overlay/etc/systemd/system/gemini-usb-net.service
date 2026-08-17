@@ -1,15 +1,22 @@
 [Unit]
 Description=Gemini Experimental USB gadget (RNDIS network + ACM rescue console) for headless access
 Documentation=file:///usr/local/sbin/gemini-usb-net
-DefaultDependencies=no
-After=systemd-modules-load.service sys-kernel-config.mount
-Before=ssh.service network.target sysinit.target
-ConditionPathExists=/sys/class/udc
+# Run late enough that udev has settled and the built-in MUSB UDC + configfs
+# are present (the script also waits for the UDC), but before sshd so the
+# network interface exists when sshd starts. Reliability over earliness: this
+# is the only remote access path on a blind first boot (no serial).
+After=local-fs.target systemd-udevd.service sys-kernel-config.mount
+Before=ssh.service
+StartLimitIntervalSec=120
+StartLimitBurst=5
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/local/sbin/gemini-usb-net
+# Retry if the controller is slow to come up on a cold boot.
+Restart=on-failure
+RestartSec=3
 
 [Install]
-WantedBy=sysinit.target
+WantedBy=multi-user.target

@@ -16,12 +16,26 @@
 # `ssh -J damkohler root@10.15.19.82` route works). Host (damkohler) side takes
 # 10.15.19.100/24 on the new usb ethernet interface.
 set -e
+log() { echo "gemini-usb-net: $*"; }
 
 CFGFS=/sys/kernel/config
 mountpoint -q "$CFGFS" 2>/dev/null || mount -t configfs none "$CFGFS" 2>/dev/null || true
+[ -d "$CFGFS/usb_gadget" ] || { log "configfs usb_gadget missing"; exit 1; }
 
 G="$CFGFS/usb_gadget/gemini"
-[ -d "$G" ] && exit 0   # idempotent: already configured
+if [ -d "$G" ] && [ -s "$G/UDC" ]; then
+    log "already bound"; exit 0     # idempotent
+fi
+
+# Wait for the (built-in MediaTek MUSB) UDC to register — on a cold boot the
+# controller may probe slightly after this service starts.
+udc=""
+for _ in $(seq 1 30); do
+    udc="$(ls /sys/class/udc 2>/dev/null | head -1)"
+    [ -n "$udc" ] && break
+    sleep 1
+done
+[ -n "$udc" ] || { log "no UDC appeared after 30s"; exit 1; }
 
 mkdir -p "$G"
 echo 0x1d6b > "$G/idVendor"          # Linux Foundation
@@ -44,21 +58,19 @@ if mkdir -p "$G/functions/acm.GS0" 2>/dev/null; then
     ln -sf "$G/functions/acm.GS0" "$G/configs/c.1/" 2>/dev/null || true
 fi
 
-# --- bind to the (only) USB device controller ------------------------------
-udc="$(ls /sys/class/udc 2>/dev/null | head -1)"
-[ -n "$udc" ] || { echo "gemini-usb-net: no UDC found" >&2; exit 1; }
+# --- bind to the UDC -------------------------------------------------------
 echo "$udc" > "$G/UDC"
+log "bound to UDC=$udc"
 
 # --- static IP on the RNDIS interface (read its real name from configfs) ----
-sleep 1
-IF="$(cat "$G/functions/rndis.usb0/ifname" 2>/dev/null)"
-[ -n "$IF" ] || IF=usb0
-for _ in 1 2 3 4 5; do
-    if ip link show "$IF" >/dev/null 2>&1; then
-        ip addr add 10.15.19.82/24 dev "$IF" 2>/dev/null || true
-        ip link set "$IF" up
-        break
-    fi
+IF=""
+for _ in $(seq 1 10); do
+    IF="$(cat "$G/functions/rndis.usb0/ifname" 2>/dev/null || true)"
+    [ -n "$IF" ] && ip link show "$IF" >/dev/null 2>&1 && break
+    IF=""
     sleep 1
 done
-echo "gemini-usb-net: gadget up on UDC=$udc iface=$IF ip=10.15.19.82/24"
+[ -n "$IF" ] || IF=usb0
+ip addr add 10.15.19.82/24 dev "$IF" 2>/dev/null || true
+ip link set "$IF" up 2>/dev/null || true
+log "network up on iface=$IF ip=10.15.19.82/24 (host side: 10.15.19.100/24)"
