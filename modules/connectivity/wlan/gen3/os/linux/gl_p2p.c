@@ -755,7 +755,7 @@ BOOLEAN glRegisterP2P(P_GLUE_INFO_T prGlueInfo, const char *prDevName, BOOLEAN f
 	/* 4.2 fill hardware address */
 	COPY_MAC_ADDR(rMacAddr, prAdapter->rMyMacAddr);
 	rMacAddr[0] ^= 0x2;	/* change to local administrated address */
-	ether_addr_copy(prGlueInfo->prP2PInfo->prDevHandler->dev_addr, rMacAddr);
+	eth_hw_addr_set(prGlueInfo->prP2PInfo->prDevHandler, rMacAddr);
 	ether_addr_copy(prGlueInfo->prP2PInfo->prDevHandler->perm_addr, prGlueInfo->prP2PInfo->prDevHandler->dev_addr);
 
 	/* 4.3 register callback functions */
@@ -1090,7 +1090,7 @@ static int p2pStop(IN struct net_device *prDev)
 		DBGLOG(P2P, WARN, "[p2p] scan complete but cfg80211 scan request is NULL\n");
 	GLUE_RELEASE_SPIN_LOCK(prGlueInfo, SPIN_LOCK_NET_DEV);
 	if (prScanRequest)
-		cfg80211_scan_done(prScanRequest, TRUE);
+		{ struct cfg80211_scan_info rInfo = { .aborted = TRUE }; cfg80211_scan_done(prScanRequest, &rInfo); }
 
 	/* 1. stop TX queue */
 	netif_tx_stop_all_queues(prDev);

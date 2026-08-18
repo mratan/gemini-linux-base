@@ -912,7 +912,7 @@ VOID kalP2PIndicateScanDone(IN P_GLUE_INFO_T prGlueInfo, IN UINT_8 ucRoleIndex, 
 			/* report all queued beacon/probe response frames  to upper layer */
 			scanReportBss2Cfg80211(prGlueInfo->prAdapter, BSS_TYPE_P2P_DEVICE, NULL);
 
-			cfg80211_scan_done(prScanRequest, fgIsAbort);
+			{ struct cfg80211_scan_info rInfo = { .aborted = fgIsAbort }; cfg80211_scan_done(prScanRequest, &rInfo); }
 		}
 
 	} while (FALSE);

@@ -617,7 +617,7 @@ VOID kalUpdateMACAddress(IN P_GLUE_INFO_T prGlueInfo, IN PUINT_8 pucMacAddr)
 	ASSERT(pucMacAddr);
 
 	if (UNEQUAL_MAC_ADDR(prGlueInfo->prDevHandler->dev_addr, pucMacAddr))
-		memcpy(prGlueInfo->prDevHandler->dev_addr, pucMacAddr, PARAM_MAC_ADDR_LEN);
+		eth_hw_addr_set(prGlueInfo->prDevHandler, pucMacAddr);
 
 }
 
@@ -1163,7 +1163,7 @@ kalIndicateStatusAndComplete(IN P_GLUE_INFO_T prGlueInfo, IN WLAN_STATUS eStatus
 
 		/* 2. then CFG80211 Indication */
 		if (prScanRequest != NULL)
-			cfg80211_scan_done(prScanRequest, FALSE);
+			{ struct cfg80211_scan_info rInfo = { .aborted = FALSE }; cfg80211_scan_done(prScanRequest, &rInfo); }
 		break;
 
 #if 0

@@ -1209,7 +1209,7 @@ static int wlanStop(struct net_device *prDev)
 	GLUE_RELEASE_SPIN_LOCK(prGlueInfo, SPIN_LOCK_NET_DEV);
 
 	if (prScanRequest)
-		cfg80211_scan_done(prScanRequest, TRUE);
+		{ struct cfg80211_scan_info rInfo = { .aborted = TRUE }; cfg80211_scan_done(prScanRequest, &rInfo); }
 	netif_tx_stop_all_queues(prDev);
 
 	return 0;		/* success */
@@ -2171,7 +2171,7 @@ bailout:
 				DBGLOG(INIT, WARN, "set MAC addr fail 0x%x\n", rStatus);
 				prGlueInfo->u4ReadyFlag = 0;
 			} else {
-				ether_addr_copy(prGlueInfo->prDevHandler->dev_addr, MacAddr.sa_data);
+				eth_hw_addr_set(prGlueInfo->prDevHandler, MacAddr.sa_data);
 				ether_addr_copy(prGlueInfo->prDevHandler->perm_addr,
 				       prGlueInfo->prDevHandler->dev_addr);
 
