@@ -8994,3 +8994,42 @@ capturing #280's actual boot (not yet done) rather than more speculative
 driver changes. **If it gets stuck in a reset loop, reflash `boot2` back
 to #269 immediately**
 (`logs/2026-07-20-269-right-port-high-speed/new_kali_boot.img`).
+
+## 2026-08-18 — CONN power-off ROOT CAUSE: scpsys bus-protect regmap aimed at the wrong infracfg block — dts/0010 phandle reverted to &infrasys
+
+**Symptom (blocker #1 of the Wi-Fi port):** `mtk-scpsys: Failed to power off
+domain conn` on every CONN power-off attempt; the vendor func-on power-cycle
+therefore never truly resets the CONSYS MCU, so func-on only ever works on a
+physically cold chip.
+
+**Root cause, proven by live reads (SSH, CONN powered on and Wi-Fi scanning):**
+
+| Register | AO block (0x10001000) | infracfg2 (0x10201000) |
+|---|---|---|
+| +0x220 PROTECTEN | 0x000104B8 (MD1 mask — real) | 0x00000000 |
+| +0x228 PROTECTSTA1 | 0xE0415CB8 (live acks; 17\|18 clear) | 0x00000000 |
+
+dts/0010 (B-13 era) pointed scpsys's `infracfg` phandle at the second block
+0x10201000. That block reads hard zero at the TOPAXI offsets: it is NOT the
+protect-register home. The vendor runtime (`clk-mt6797-pg.c`) maps
+`INFRA_TOPAXI_PROTECTEN/PROTECTSTA1` off scpsys **reg[0] = the AO block**.
+The asymmetry that hid this for six weeks: power-ON *clears* protect bits and
+polls `(STA1 & mask) == 0` — trivially true against a zero-reading register,
+so power-on always "worked" — while power-OFF *sets* them and polls
+`(STA1 & mask) == mask`, which can never be satisfied there → guaranteed
+timeout. Build #240's "bus-protect fix verified" reads were taken with devmem
+at the AO block (0x10001228) while the driver wrote elsewhere; that result was
+confounded by the consys-spike boot contamination found 2026-08-18.
+
+**Fix:** dts/0010 now only adds the `infracfg2` syscon node (kept, documented
+as NOT the protect home); the scpsys phandle change is dropped, so scpsys
+uses upstream's `&infrasys` (AO block) again.
+
+**Validation (device-free):** full patch series applies clean to a disposable
+v6.6 worktree; `mt6797-gemini-pda.dtb` builds; in the decompiled new DTB the
+scpsys `infracfg` phandle resolves to `infracfg_ao@10001000`. The pre-fix
+build of the same series was structurally diffed against the live on-device
+FDT — only LK-injected nodes differ — so this DTB is flash-equivalent apart
+from the phandle fix. Pending on-device: kexec into the new DTB, then a
+func-off/func-on cycle to confirm CONN really powers off (and a wedged MCU
+becomes software-recoverable, closing the physical-cold-cycle dependency).
