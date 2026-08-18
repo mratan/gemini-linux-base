@@ -169,8 +169,13 @@ static INT32 mtk_wmt_probe(struct platform_device *pdev)
 #if !defined(CONFIG_MTK_GPIO_LEGACY)
 	consys_pinctrl = devm_pinctrl_get(&pdev->dev);
 	if (IS_ERR(consys_pinctrl)) {
-		WMT_PLAT_ERR_FUNC("cannot find consys pinctrl.\n");
-		return PTR_ERR(consys_pinctrl);
+		/* The 6.6 DTB's consys node carries no pinctrl. Failing probe
+		 * here detaches the genpd CONN domain and releases devm state,
+		 * which the power-on path depends on — so tolerate it. The
+		 * only consumer (GPS LNA in wmt_plat_alps) NULL-checks.
+		 */
+		WMT_PLAT_WARN_FUNC("no consys pinctrl (tolerated; GPS LNA ctrl unavailable)\n");
+		consys_pinctrl = NULL;
 	}
 #endif /* !defined(CONFIG_MTK_GPIO_LEGACY) */
 

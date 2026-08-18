@@ -288,7 +288,8 @@ static INT32 consys_clk_get_from_dts(struct platform_device *pdev)
 		WMT_PLAT_WARN_FUNC("[CCF]no conn clock; using CONN power domain via runtime PM\n");
 		clk_scp_conn_main = NULL;
 		consys_pdev = pdev;
-		pm_runtime_enable(&pdev->dev);
+		if (!pm_runtime_enabled(&pdev->dev))
+			pm_runtime_enable(&pdev->dev);
 	}
 	WMT_PLAT_DBG_FUNC("[CCF]clk_scp_conn_main=%p\n", clk_scp_conn_main);
 
