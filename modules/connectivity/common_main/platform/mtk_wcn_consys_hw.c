@@ -458,6 +458,31 @@ int reserve_memory_consys_fn(struct reserved_mem *rmem)
 
 RESERVEDMEM_OF_DECLARE(reserve_memory_test, "mediatek,consys-reserve-memory", reserve_memory_consys_fn);
 
+/* RESERVEDMEM_OF_DECLARE only fires for built-in code during early boot; as an
+ * out-of-tree module the callback never runs and gConEmiPhyBase stays 0 even
+ * though the kernel reserved the region. Look it up at runtime instead.
+ */
+static VOID mtk_wcn_consys_hw_emi_lookup(VOID)
+{
+	struct device_node *np;
+	struct reserved_mem *rmem;
+
+	if (gConEmiPhyBase)
+		return;
+
+	np = of_find_compatible_node(NULL, NULL, "mediatek,consys-reserve-memory");
+	if (!np) {
+		WMT_PLAT_ERR_FUNC("no mediatek,consys-reserve-memory node in DT\n");
+		return;
+	}
+	rmem = of_reserved_mem_lookup(np);
+	of_node_put(np);
+	if (!rmem) {
+		WMT_PLAT_ERR_FUNC("of_reserved_mem_lookup failed for consys-reserve-memory\n");
+		return;
+	}
+	reserve_memory_consys_fn(rmem);
+}
 
 INT32 mtk_wcn_consys_hw_init(void)
 {
@@ -473,6 +498,8 @@ INT32 mtk_wcn_consys_hw_init(void)
 
 	if (iRet)
 		return iRet;
+
+	mtk_wcn_consys_hw_emi_lookup();
 
 	if (gConEmiPhyBase) {
 		if (wmt_consys_ic_ops->consys_ic_emi_mpu_set_region_protection)
