@@ -470,9 +470,16 @@ static VOID mtk_wcn_consys_hw_emi_lookup(VOID)
 	if (gConEmiPhyBase)
 		return;
 
-	np = of_find_compatible_node(NULL, NULL, "mediatek,consys-reserve-memory");
+	/* The experimental DTB's node carries no compatible property (the
+	 * kernel reserved it from reg alone), so find it by path first and
+	 * fall back to the vendor compatible. of_reserved_mem_lookup()
+	 * matches by node basename.
+	 */
+	np = of_find_node_by_path("/reserved-memory/consys-reserve-memory");
+	if (!np)
+		np = of_find_compatible_node(NULL, NULL, "mediatek,consys-reserve-memory");
 	if (!np) {
-		WMT_PLAT_ERR_FUNC("no mediatek,consys-reserve-memory node in DT\n");
+		WMT_PLAT_ERR_FUNC("no consys-reserve-memory node in DT\n");
 		return;
 	}
 	rmem = of_reserved_mem_lookup(np);
