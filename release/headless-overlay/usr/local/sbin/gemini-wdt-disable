@@ -1,0 +1,20 @@
+#!/bin/sh
+# gemini-wdt-disable — disable the MediaTek RGU hardware watchdog early in
+# boot. On this SoC nothing in a minimal Debian pets the RGU watchdog, so it
+# fires ~1-2 min into boot and resets the device — a reboot loop that never
+# lets the system settle (observed on the first experimental boot, 2026-08-17).
+# WDT_MODE is at 0x10007000; writing the key 0x22 with the enable bit clear
+# (0x22000000) disables it. Proven on this hardware (readback -> 0x00000000).
+# Runs at earliest sysinit so it beats the watchdog timeout.
+set -e
+REG=0x10007000
+VAL=0x22000000
+if command -v busybox >/dev/null 2>&1; then
+    busybox devmem "$REG" 32 "$VAL"
+elif command -v devmem2 >/dev/null 2>&1; then
+    devmem2 "$REG" w "$VAL"
+else
+    echo "gemini-wdt-disable: no devmem tool" >&2; exit 1
+fi
+now=$(busybox devmem "$REG" 2>/dev/null || echo "?")
+echo "gemini-wdt-disable: WDT_MODE now $now (watchdog disabled)"

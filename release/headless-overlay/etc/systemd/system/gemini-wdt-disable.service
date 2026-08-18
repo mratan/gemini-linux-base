@@ -1,0 +1,14 @@
+[Unit]
+Description=Disable MediaTek RGU hardware watchdog (prevents ~2min reboot loop on the Experimental slot)
+DefaultDependencies=no
+After=systemd-modules-load.service
+Before=sysinit.target shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/gemini-wdt-disable
+
+[Install]
+WantedBy=sysinit.target

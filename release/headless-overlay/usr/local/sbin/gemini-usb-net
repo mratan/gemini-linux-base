@@ -1,76 +1,37 @@
 #!/bin/sh
-# gemini-usb-net — bring up a USB gadget on the Experimental slot so the first
-# CONSYS bring-up is reachable over the existing USB cable with NO serial
-# adapter (the experimental image ships no serial rig and no dongle).
+# gemini-usb-net — give the built-in USB ethernet gadget an IP so the
+# Experimental slot is reachable over the USB cable with NO serial adapter.
 #
-# Primary path: RNDIS network -> SSH. RNDIS + libcomposite + configfs are all
-# built into the experimental kernel (CONFIG_USB_F_RNDIS=y,
-# CONFIG_USB_LIBCOMPOSITE=y, CONFIG_CONFIGFS_FS=y), so this path needs NO
-# modules loaded and cannot fail on a missing .ko.
-# Fallback path: an ACM console (usb_f_acm, a module) so that if the network
-# path ever fails we still get a rescue root shell over the same cable
-# (serial-getty@ttyGS0 autologin) — belt and suspenders, since we have no
-# serial cable to debug a blind first boot.
-#
-# Device IP 10.15.19.82/24 (same subnet the Gemian slot uses, so the existing
-# `ssh -J damkohler root@10.15.19.82` route works). Host (damkohler) side takes
-# 10.15.19.100/24 on the new usb ethernet interface.
+# The experimental kernel has CONFIG_USB_ETH=y (legacy g_ether, built-in), so
+# an ethernet gadget auto-binds the mtu3 UDC at boot and creates a device-side
+# `usb0` netdev — BEFORE any userspace runs. A configfs gadget therefore can
+# never bind (UDC already busy); the earlier approach fought g_ether and lost.
+# So we simply ride g_ether: wait for its usb0 and address it. Host side
+# (navier/damkohler) takes 10.15.19.100/24 on its matching usb ethernet iface.
+# sshd (enabled separately) binds 0.0.0.0, so it answers on 10.15.19.82.
 set -e
 log() { echo "gemini-usb-net: $*"; }
 
-CFGFS=/sys/kernel/config
-mountpoint -q "$CFGFS" 2>/dev/null || mount -t configfs none "$CFGFS" 2>/dev/null || true
-[ -d "$CFGFS/usb_gadget" ] || { log "configfs usb_gadget missing"; exit 1; }
+# find the gadget's device-side ethernet iface: prefer usb0, else the first
+# iface whose driver is a usb ethernet gadget function.
+find_if() {
+    [ -e /sys/class/net/usb0 ] && { echo usb0; return; }
+    for n in /sys/class/net/*; do
+        d=$(basename "$n")
+        case "$d" in lo|eth*|wlan*) continue;; esac
+        # g_ether/u_ether device side shows up as usbN
+        case "$d" in usb*) echo "$d"; return;; esac
+    done
+}
 
-G="$CFGFS/usb_gadget/gemini"
-if [ -d "$G" ] && [ -s "$G/UDC" ]; then
-    log "already bound"; exit 0     # idempotent
-fi
-
-# Wait for the (built-in MediaTek MUSB) UDC to register — on a cold boot the
-# controller may probe slightly after this service starts.
-udc=""
-for _ in $(seq 1 30); do
-    udc="$(ls /sys/class/udc 2>/dev/null | head -1)"
-    [ -n "$udc" ] && break
-    sleep 1
-done
-[ -n "$udc" ] || { log "no UDC appeared after 30s"; exit 1; }
-
-mkdir -p "$G"
-echo 0x1d6b > "$G/idVendor"          # Linux Foundation
-echo 0x0104 > "$G/idProduct"         # Multifunction Composite Gadget
-mkdir -p "$G/strings/0x409"
-echo gemini-exp             > "$G/strings/0x409/serialnumber"
-echo Planet                 > "$G/strings/0x409/manufacturer"
-echo "Gemini Experimental"  > "$G/strings/0x409/product"
-
-mkdir -p "$G/configs/c.1/strings/0x409"
-echo "rndis+acm" > "$G/configs/c.1/strings/0x409/configuration"
-
-# --- RNDIS network function (built-in; primary access path) ----------------
-mkdir -p "$G/functions/rndis.usb0"
-ln -sf "$G/functions/rndis.usb0" "$G/configs/c.1/"
-
-# --- ACM console function (module; best-effort rescue shell) ----------------
-modprobe usb_f_acm 2>/dev/null || true
-if mkdir -p "$G/functions/acm.GS0" 2>/dev/null; then
-    ln -sf "$G/functions/acm.GS0" "$G/configs/c.1/" 2>/dev/null || true
-fi
-
-# --- bind to the UDC -------------------------------------------------------
-echo "$udc" > "$G/UDC"
-log "bound to UDC=$udc"
-
-# --- static IP on the RNDIS interface (read its real name from configfs) ----
 IF=""
-for _ in $(seq 1 10); do
-    IF="$(cat "$G/functions/rndis.usb0/ifname" 2>/dev/null || true)"
-    [ -n "$IF" ] && ip link show "$IF" >/dev/null 2>&1 && break
-    IF=""
+for _ in $(seq 1 30); do
+    IF=$(find_if)
+    [ -n "$IF" ] && break
     sleep 1
 done
-[ -n "$IF" ] || IF=usb0
+[ -n "$IF" ] || { log "no usb gadget iface appeared after 30s"; exit 1; }
+
 ip addr add 10.15.19.82/24 dev "$IF" 2>/dev/null || true
-ip link set "$IF" up 2>/dev/null || true
-log "network up on iface=$IF ip=10.15.19.82/24 (host side: 10.15.19.100/24)"
+ip link set "$IF" up
+log "configured $IF = 10.15.19.82/24 (host side: 10.15.19.100/24)"

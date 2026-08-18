@@ -151,14 +151,17 @@ EOF
 # root-owned. tar (not cp) so that overlaying e.g. lib/modules or lib/firmware
 # extracts THROUGH the merged-usr symlinks (`/lib` -> `usr/lib`) instead of
 # trying to replace the symlink with a directory (--keep-directory-symlink);
-# symlinks and modes inside the overlay are preserved, and extracting as root
-# yields root:root regardless of the overlay's on-disk ownership, so
-# mkfs.ext4 -d records root:root. Overlays are applied in order; later wins.
+# symlinks and modes inside the overlay are preserved. --no-same-owner is
+# REQUIRED: without it, root's tar restores the archive's stored ownership
+# (the overlay files come from a checkout owned by the build user, uid 1000),
+# which broke sshd StrictModes on /root/.ssh/authorized_keys (owner must be
+# root). With it, extracted files take root:root, so mkfs.ext4 -d records
+# root:root. Overlays are applied in order; later wins.
 for ov in ${OVERLAYS[@]+"${OVERLAYS[@]}"}; do
     [ -d "$ov" ] || { echo "overlay dir not found: $ov" >&2; exit 1; }
     echo "==> [2b/4] overlay: $ov -> rootfs"
     ( cd "$ov" && tar -cf - . ) \
-        | tar -C "$TARGET" --keep-directory-symlink -xf -
+        | tar -C "$TARGET" --keep-directory-symlink --no-same-owner -xf -
 done
 
 echo "==> [3/4] Pack ext4 loop image"
