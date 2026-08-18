@@ -1,0 +1,68 @@
+arm64: dts: mediatek: gemini: consys 4-window + interrupts, rename, add btif/wifi
+
+Reconcile connectivity DTB into source (issue #32); matches the on-device
+verified DTB. consys@18070000 renamed to gemini,mt6797-consys-wmt (blocks
+the spike driver's boot-time MCU wedge = B-21) + AP_RGU/TOPCKGEN/SPM reg
+windows + BGF/WDT interrupts; add btif@1100c000(+tx/rx) and wifi@180f0000
+(the gen3 AHB HIF needs mediatek,wifi to register its probe with WMT).
+
+diff --git a/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts b/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
+--- a/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
++++ b/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
+@@ -1360,8 +1360,16 @@
+ 	};
+ 
+ 	consys: consys@18070000 {
+-		compatible = "mediatek,mt6797-consys";
+-		reg = <0 0x18070000 0 0x200>;
++		/* Renamed vendor compatible so bsg100 consys-spike cannot bind
++		 * (it wedges the MCU at boot -> B-21). reg gains AP_RGU/TOPCKGEN/SPM
++		 * windows and BGF/WDT interrupts the vendor WMT stack reads. */
++		compatible = "gemini,mt6797-consys-wmt";
++		reg = <0 0x18070000 0 0x200>,
++		      <0 0x10007000 0 0x100>,
++		      <0 0x10000000 0 0x2000>,
++		      <0 0x10006000 0 0x1000>;
++		interrupts = <GIC_SPI 284 IRQ_TYPE_LEVEL_LOW>,
++			     <GIC_SPI 285 IRQ_TYPE_LEVEL_LOW>;
+ 		power-domains = <&scpsys MT6797_POWER_DOMAIN_CONN>;
+ 		/* AP<->CONSYS BTIF FIFO clock, for the Stage W2 (Gate
+ 		 * G2b) WMT handshake; the BTIF block itself
+@@ -1374,6 +1382,37 @@
+ 		vcn33_wifi-supply = <&mt6351_vcn33_wifi_reg>;
+ 		memory-region = <&consys_mem>;
+ 	};
++
++	btif: btif@1100c000 {
++		compatible = "mediatek,btif";
++		reg = <0 0x1100c000 0 0x1000>;
++		interrupts = <GIC_SPI 130 IRQ_TYPE_LEVEL_LOW>;
++		clocks = <&infrasys CLK_INFRA_BTIF>, <&infrasys CLK_INFRA_AP_DMA>;
++		clock-names = "btifc", "apdmac";
++	};
++
++	btif_tx: btif_tx@11000a00 {
++		compatible = "mediatek,btif_tx";
++		reg = <0 0x11000a00 0 0x80>;
++		interrupts = <GIC_SPI 116 IRQ_TYPE_LEVEL_LOW>;
++	};
++
++	btif_rx: btif_rx@11000a80 {
++		compatible = "mediatek,btif_rx";
++		reg = <0 0x11000a80 0 0x80>;
++		interrupts = <GIC_SPI 117 IRQ_TYPE_LEVEL_LOW>;
++	};
++
++	wifi: wifi@180f0000 {
++		compatible = "mediatek,wifi";
++		reg = <0 0x180f0000 0 0x1100>,
++		      <0 0x11000080 0 0x80>;
++		interrupts = <GIC_SPI 283 IRQ_TYPE_LEVEL_LOW>,
++			     <GIC_SPI 97 IRQ_TYPE_LEVEL_LOW>;
++		clocks = <&infrasys CLK_INFRA_AP_DMA>;
++		clock-names = "wifi-dma";
++		hardware-values = <0x00000279>, <0x000a2800>, <0x000a2800>;
++	};
+ };
+ 
+ /*
