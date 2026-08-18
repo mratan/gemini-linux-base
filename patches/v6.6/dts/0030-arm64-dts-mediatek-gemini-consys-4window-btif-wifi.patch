@@ -1,10 +1,14 @@
 arm64: dts: mediatek: gemini: consys 4-window + interrupts, rename, add btif/wifi
 
-Reconcile connectivity DTB into source (issue #32); matches the on-device
-verified DTB. consys@18070000 renamed to gemini,mt6797-consys-wmt (blocks
-the spike driver's boot-time MCU wedge = B-21) + AP_RGU/TOPCKGEN/SPM reg
-windows + BGF/WDT interrupts; add btif@1100c000(+tx/rx) and wifi@180f0000
-(the gen3 AHB HIF needs mediatek,wifi to register its probe with WMT).
+Reconcile the connectivity DTB into source (issue #32); matches the DTB
+verified on-device 2026-08-18 (Wi-Fi scan of 16 APs). consys@18070000
+renamed to gemini,mt6797-consys-wmt so bsg100's built-in consys-spike
+(matches vendor mediatek,mt6797-consys) can never bind and wedge the MCU
+at boot (B-21 root cause); add AP_RGU/TOPCKGEN/SPM reg windows + BGF/WDT
+interrupts the vendor WMT stack reads. Add btif@1100c000(+tx/rx) (the
+AP<->CONSYS on-chip channel) and wifi@180f0000 (the gen3 AHB HIF needs
+mediatek,wifi to register its probe with WMT). Numbered 0030 so it applies
+after the consys vcn33-supplies patch (0021).
 
 diff --git a/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts b/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
 --- a/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
