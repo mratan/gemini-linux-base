@@ -76,6 +76,12 @@ const struct of_device_id apwmt_of_ids[] = {
 	{.compatible = "mediatek,mt6735-consys",},
 	{.compatible = "mediatek,mt6755-consys",},
 	{.compatible = "mediatek,mt6757-consys",},
+	/* Renamed compatible on the experimental DTB so bsg100's built-in
+	 * consys-spike driver (same vendor compatible, probes at boot and
+	 * wedges the MCU — issue #32) can never bind the node. Vendor
+	 * string kept for stock DTBs.
+	 */
+	{.compatible = "gemini,mt6797-consys-wmt",},
 	{.compatible = "mediatek,mt6797-consys",},
 	{.compatible = "mediatek,mt8127-consys",},
 	{.compatible = "mediatek,mt8163-consys",},
