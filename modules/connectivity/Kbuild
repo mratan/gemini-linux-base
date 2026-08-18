@@ -158,6 +158,20 @@ $(foreach o,$(wlan_gen3-y),$(eval CFLAGS_$(o) := $(WLAN_GEN3_CFLAGS)))
 # and is NOT compiled with the gen3 -DMT6797/HIF include flags.
 wlan_gen3-y += wlan/wmt_chrdev_wifi.o
 
+# /dev/wmtdetect chardev — opened by the vendor wmt_loader (which runs
+# before wmt_launcher) to query the SoC chip id and seed it into WMT;
+# replaces the interim gemini_chipid_seed shim. SoC-only build: the
+# external-combo-chip probe paths (sdio_detect.c, wmt_detect_pwr.c) need
+# 3.18-only headers (<mt_boot.h>, <mtk_rtc.h>) and probe hardware the
+# Gemini doesn't have, so wmt_detect_soc_stubs.c answers those entry
+# points with "no external chip". Symbol deps (mtk_wcn_wmt_chipid_query/
+# set_chipid, wmt_plat_get_soc_chipid) come from mtk_stp_wmt_soc — insmod
+# that first.
+obj-m += mtk_wmt_detect.o
+mtk_wmt_detect-y := \
+	common_detect/wmt_detect.o \
+	common_detect/wmt_detect_soc_stubs.o
+
 # WMT core + STP + SoC platform glue, as one module (keeps the vendor's
 # intra-stack symbol web internal; exports stay available for wlan gen3)
 obj-m += mtk_stp_wmt_soc.o

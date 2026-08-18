@@ -23,9 +23,13 @@ Object selection (`Kbuild`) mirrors the vendor `CONFIG_MTK_COMBO=y` +
 external transports (`hif_sdio`, `stp_sdio`, `stp_uart`), `stp_dbg_combo`,
 and the LTE-coex `wmt_idc` path are excluded; from `common_detect`, only
 `mtk_wcn_stub_alps.c` (cmb-stub callback registry, chip-id query) and
-`wmt_gpio.c` (gpio_ctrl_info table) are built — the rest (wmt_detect char
-device, drv_init tree) waits until the daemons/gen3 slices need
-`/dev/wmtdetect`.
+`wmt_gpio.c` (gpio_ctrl_info table) are built — plus, since 2026-08-18,
+`wmt_detect.c` as its own `mtk_wmt_detect.ko` (the `/dev/wmtdetect` char
+device the vendor `wmt_loader` drives), with the external-combo probe
+paths (`sdio_detect.c`, `wmt_detect_pwr.c` — both need 3.18-only headers)
+replaced by the SoC-only stubs in `wmt_detect_soc_stubs.c`. The `drv_init`
+tree stays excluded (`MTK_WCN_REMOVE_KO=0`: our drivers are separate
+modules loaded by insmod, not by the DO_MODULE_INIT ioctl).
 
 ### Gen3 WLAN (Slice 9, tracker issue #10)
 

@@ -429,6 +429,14 @@ INT32 wmt_dev_patch_get(PUINT8 pPatchName, osal_firmware **ppPatch)
 		return -1;
 	}
 	*ppPatch = NULL;
+	/* churn: the launcher hands over absolute paths ("-p /lib/firmware"
+	 * prefix); the vendor original opened them via VFS, but
+	 * request_firmware() resolves names relative to the firmware search
+	 * path, so keep only the basename or the prefix doubles up
+	 * (/lib/firmware/lib/firmware/...).
+	 */
+	if (strrchr((PINT8)pPatchName, '/'))
+		pPatchName = (PUINT8)strrchr((PINT8)pPatchName, '/') + 1;
 	do {
 		iRet = request_firmware((const struct firmware **)&fw, pPatchName, NULL);
 		if (iRet == -EAGAIN) {
@@ -475,6 +483,13 @@ MTK_WCN_BOOL wmt_dev_is_file_exist(PUINT8 pFileName)
 		WMT_ERR_FUNC("invalid file name(%s)\n", pFileName);
 		return MTK_WCN_BOOL_FALSE;
 	}
+
+	/* churn: same basename strip as wmt_dev_patch_get() — callers pass
+	 * launcher-prefixed absolute paths, request_firmware() wants a name
+	 * relative to the firmware search path.
+	 */
+	if (strrchr((PINT8)pFileName, '/'))
+		pFileName = (PUINT8)strrchr((PINT8)pFileName, '/') + 1;
 
 	iRet = request_firmware((const struct firmware **)&fw, pFileName, NULL);
 	if (iRet != 0) {

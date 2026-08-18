@@ -239,6 +239,22 @@ enables the cfg80211 features the driver requires (`NL80211_TESTMODE`,
 - **N9 [novel] CPU-boost hint no-op** — `kalBoostCpu()` used the MTK PPM driver
   (`mach/mt_ppm_api.h`), absent mainline; now a no-op (throughput hint only,
   not correctness). `plat/mt6797/plat_priv.c`.
+- **N10 [novel] firmware paths: basename-strip before request_firmware()** —
+  the vendor `wmt_launcher`/`wmt_loader` pass launcher-prefixed absolute
+  paths (`-p /lib/firmware` → `/lib/firmware/ROMv3_...`); the vendor
+  original opened them via VFS, but the port's `request_firmware()`
+  resolves names relative to the firmware search path, doubling the prefix
+  (`/lib/firmware/lib/firmware/...` — previously worked around with a
+  self-symlink on the image). `wmt_dev_patch_get()` and
+  `wmt_dev_is_file_exist()` now strip to the basename. `linux/wmt_dev.c`.
+- **N11 [novel] /dev/wmtdetect chardev as mtk_wmt_detect.ko (SoC-only)** —
+  `common_detect/wmt_detect.c` built as its own module so the real vendor
+  `wmt_loader` replaces the `gemini_chipid_seed` interim shim. External
+  combo-chip probe paths (`sdio_detect.c`, `wmt_detect_pwr.c`: 3.18-only
+  `<mt_boot.h>`/`<mtk_rtc.h>`, no such hardware on this device) are stubbed
+  by `wmt_detect_soc_stubs.c` ("no external chip" answers); `drv_init` tree
+  stays out (`MTK_WCN_REMOVE_KO=0` — modules are insmodded, not
+  ioctl-inited).
 
 ## Tracked warnings (gen3, not silenced — all pre-existing vendor quality)
 
