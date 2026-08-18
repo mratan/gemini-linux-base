@@ -38,6 +38,12 @@ phase0() {
 # EXPECT: /dev/wmtdetect + /dev/stpwmt appear; powers NOTHING by itself.
 # ---------------------------------------------------------------------------
 phase1() {
+  # bsg100's built-in consys-spike driver binds 18070000.consys at boot and
+  # holds the platform device — our WMT driver (same compatible) can never
+  # probe while it is bound, and probe is where the conn clock/power-domain
+  # and regulators get wired. Unbind it first (idempotent).
+  echo 18070000.consys > /sys/bus/platform/drivers/mtk-consys-spike/unbind 2>/dev/null \
+    && echo "consys-spike unbound" || echo "consys-spike not bound (ok)"
   insmod "$K/mtk_btif.ko"
   insmod "$K/mtk_stp_wmt_soc.ko"
   ls -l /dev/wmtdetect /dev/stpwmt

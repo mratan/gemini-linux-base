@@ -46,6 +46,7 @@
 #include "mt6797.h"
 #include "mtk_wcn_consys_hw.h"
 #include <linux/platform_device.h>
+#include <linux/pm_runtime.h>
 
 #if CONSYS_EMI_MPU_SETTING
 #include <emi_mpu.h>
@@ -119,6 +120,12 @@ struct clk *clk_scp_conn_main;	/*ctrl conn_power_on/off */
 #if CONSYS_AHB_CLK_MAGEMENT
 struct clk *clk_infra_conn_main;	/*ctrl infra_connmcu_bus clk */
 #endif
+/* On the 6.6 base there is no scpsys "conn" clock: the CONN subsystem is a
+ * genpd power domain (the consys DT node's power-domains). When the clock is
+ * absent we hold the domain through runtime PM on the consys platform device
+ * instead (proven on this kernel by bsg100's consys-spike driver).
+ */
+static struct platform_device *consys_pdev;
 #endif /* !defined(CONFIG_MTK_CLKMGR) */
 
 
@@ -278,8 +285,10 @@ static INT32 consys_clk_get_from_dts(struct platform_device *pdev)
 #if !defined(CONFIG_MTK_CLKMGR)
 	clk_scp_conn_main = devm_clk_get(&pdev->dev, "conn");
 	if (IS_ERR(clk_scp_conn_main)) {
-		WMT_PLAT_ERR_FUNC("[CCF]cannot get clk_scp_conn_main clock.\n");
-		return PTR_ERR(clk_scp_conn_main);
+		WMT_PLAT_WARN_FUNC("[CCF]no conn clock; using CONN power domain via runtime PM\n");
+		clk_scp_conn_main = NULL;
+		consys_pdev = pdev;
+		pm_runtime_enable(&pdev->dev);
 	}
 	WMT_PLAT_DBG_FUNC("[CCF]clk_scp_conn_main=%p\n", clk_scp_conn_main);
 
@@ -385,10 +394,19 @@ static INT32 consys_hw_power_ctrl(MTK_WCN_BOOL enable)
 			WMT_PLAT_ERR_FUNC("conn_power_on fail(%d)\n", iRet);
 		WMT_PLAT_DBG_FUNC("conn_power_on ok\n");
 #else
-		iRet = clk_prepare_enable(clk_scp_conn_main);
-		if (iRet)
-			WMT_PLAT_ERR_FUNC("clk_prepare_enable(clk_scp_conn_main) fail(%d)\n", iRet);
-		WMT_PLAT_DBG_FUNC("clk_prepare_enable(clk_scp_conn_main) ok\n");
+		if (clk_scp_conn_main) {
+			iRet = clk_prepare_enable(clk_scp_conn_main);
+			if (iRet)
+				WMT_PLAT_ERR_FUNC("clk_prepare_enable(clk_scp_conn_main) fail(%d)\n", iRet);
+			WMT_PLAT_DBG_FUNC("clk_prepare_enable(clk_scp_conn_main) ok\n");
+		} else if (consys_pdev) {
+			iRet = pm_runtime_get_sync(&consys_pdev->dev);
+			if (iRet < 0)
+				WMT_PLAT_ERR_FUNC("pm_runtime_get_sync(consys) fail(%d)\n", iRet);
+			else
+				iRet = 0;
+			WMT_PLAT_INFO_FUNC("pm_runtime_get_sync(consys) done(%d)\n", iRet);
+		}
 #endif /* defined(CONFIG_MTK_CLKMGR) */
 
 #else
@@ -470,8 +488,13 @@ static INT32 consys_hw_power_ctrl(MTK_WCN_BOOL enable)
 			WMT_PLAT_ERR_FUNC("conn_power_off fail(%d)\n", iRet);
 		WMT_PLAT_DBG_FUNC("conn_power_off ok\n");
 #else
-		clk_disable_unprepare(clk_scp_conn_main);
-		WMT_PLAT_DBG_FUNC("clk_disable_unprepare(clk_scp_conn_main) calling\n");
+		if (clk_scp_conn_main) {
+			clk_disable_unprepare(clk_scp_conn_main);
+			WMT_PLAT_DBG_FUNC("clk_disable_unprepare(clk_scp_conn_main) calling\n");
+		} else if (consys_pdev) {
+			pm_runtime_put_sync(&consys_pdev->dev);
+			WMT_PLAT_INFO_FUNC("pm_runtime_put_sync(consys) called\n");
+		}
 #endif /* defined(CONFIG_MTK_CLKMGR) */
 
 #else
@@ -984,6 +1007,13 @@ static INT32 consys_read_reg_from_dts(VOID)
 		WMT_PLAT_DBG_FUNC("Get topckgen register base(0x%zx)\n", conn_reg.topckgen_base);
 		conn_reg.spm_base = (SIZE_T) of_iomap(node, 3);
 		WMT_PLAT_DBG_FUNC("Get spm register base(0x%zx)\n", conn_reg.spm_base);
+		if (!conn_reg.mcu_base || !conn_reg.ap_rgu_base ||
+		    !conn_reg.topckgen_base || !conn_reg.spm_base) {
+			WMT_PLAT_ERR_FUNC("consys reg window(s) missing in DT: mcu(0x%zx) rgu(0x%zx) topck(0x%zx) spm(0x%zx)\n",
+					  conn_reg.mcu_base, conn_reg.ap_rgu_base,
+					  conn_reg.topckgen_base, conn_reg.spm_base);
+			return iRet;
+		}
 	} else {
 		WMT_PLAT_ERR_FUNC("[%s] can't find CONSYS compatible node\n", __func__);
 		return iRet;
