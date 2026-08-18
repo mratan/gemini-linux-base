@@ -1339,8 +1339,13 @@ static INT32 wmt_plat_soc_gps_lna_ctrl(ENUM_PIN_STATE state)
 	WMT_PLAT_DBG_FUNC("ENTER++\n");
 	consys_pinctrl = mtk_wcn_consys_get_pinctrl();
 	if (consys_pinctrl == NULL) {
-		WMT_PLAT_ERR_FUNC("get consys pinctrl fail\n");
-		return -1;
+		/* No pinctrl on the 6.6 DTB (probe tolerates its absence).
+		 * GPS LNA is irrelevant to the Wi-Fi bring-up; returning an
+		 * error here propagates up consys_hw_gpio_ctrl and aborts
+		 * the whole WMT func-on (seen live 2026-08-17). No-op.
+		 */
+		WMT_PLAT_WARN_FUNC("no consys pinctrl; skip gps lna ctrl\n");
+		return 0;
 	}
 
 	gps_lna_init = pinctrl_lookup_state(consys_pinctrl, "gps_lna_state_init");
