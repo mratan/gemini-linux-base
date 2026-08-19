@@ -1,0 +1,76 @@
+pmdomain: mediatek: mt6797: release MFG SRAM via MFG_SRAM_CON (ext_sram_ctl_offs)
+
+mt6797 keeps the MFG domain's SRAM PDN/ACK in a separate SPM register
+(MFG_SRAM_CON 0x33C: PDN 1:0, ACK 17:16 — vendor clk-mt6797-pg.c
+spm_mtcmos_ctrl_mfg), which the generic sequence cannot express; the
+deferral in pmdomain/0003 left MFG SRAM powered down and the first
+panfrost probe hard-stalled the AXI on its first GPU register access.
+Add an optional ext_sram_ctl_offs redirecting the existing
+sram_enable/disable steps to that register, and use it for MFG.
+MFG_COREx (split PDN-in-PWR_CON / ACK-in-SRAM_CON) left for a
+follow-up — nothing consumes those genpds yet.
+
+diff --git a/drivers/pmdomain/mediatek/mtk-scpsys.c b/drivers/pmdomain/mediatek/mtk-scpsys.c
+index c972619f5..58a746a25 100644
+--- a/drivers/pmdomain/mediatek/mtk-scpsys.c
++++ b/drivers/pmdomain/mediatek/mtk-scpsys.c
+@@ -115,6 +115,10 @@ static const char * const clk_names[] = {
+  * @sta_mask: The mask for power on/off status bit.
+  * @ctl_offs: The offset for main power control register.
+  * @sram_pdn_bits: The mask for sram power control bits.
++ * @ext_sram_ctl_offs: Optional separate SPM register holding the domain's
++ *		SRAM PDN/ACK bits (e.g. mt6797 MFG_SRAM_CON 0x33C); when set,
++ *		sram_pdn_bits/sram_pdn_ack_bits apply to this register instead
++ *		of the domain's own control register.
+  * @sram_pdn_ack_bits: The mask for sram power control acked bits.
+  * @bus_prot_mask: The mask for single step bus protection.
+  * @clk_id: The basic clocks required by this power domain.
+@@ -126,6 +130,7 @@ struct scp_domain_data {
+ 	int ctl_offs;
+ 	u32 sram_pdn_bits;
+ 	u32 sram_pdn_ack_bits;
++	u32 ext_sram_ctl_offs;
+ 	u32 bus_prot_mask;
+ 	enum clk_id clk_id[MAX_CLKS];
+ 	u8 caps;
+@@ -339,7 +344,9 @@ static int scpsys_power_on(struct generic_pm_domain *genpd)
+ 	val |= PWR_RST_B_BIT;
+ 	writel(val, ctl_addr);
+ 
+-	ret = scpsys_sram_enable(scpd, ctl_addr);
++	ret = scpsys_sram_enable(scpd, scpd->data->ext_sram_ctl_offs ?
++				 scp->base + scpd->data->ext_sram_ctl_offs :
++				 ctl_addr);
+ 	if (ret < 0)
+ 		goto err_pwr_ack;
+ 
+@@ -371,7 +378,9 @@ static int scpsys_power_off(struct generic_pm_domain *genpd)
+ 	if (ret < 0)
+ 		goto out;
+ 
+-	ret = scpsys_sram_disable(scpd, ctl_addr);
++	ret = scpsys_sram_disable(scpd, scpd->data->ext_sram_ctl_offs ?
++				  scp->base + scpd->data->ext_sram_ctl_offs :
++				  ctl_addr);
+ 	if (ret < 0)
+ 		goto out;
+ 
+@@ -875,8 +884,16 @@ static const struct scp_domain_data scp_domain_data_mt6797[] = {
+ 		.name = "mfg",
+ 		.sta_mask = BIT(12),
+ 		.ctl_offs = 0x338,
+-		.sram_pdn_bits = 0,
+-		.sram_pdn_ack_bits = 0,
++		/*
++		 * mt6797 keeps the MFG SRAM power controls in the separate
++		 * MFG_SRAM_CON register (SPM 0x33C): PDN bits 1:0, ACK bits
++		 * 17:16 (vendor clk-mt6797-pg.c spm_mtcmos_ctrl_mfg). The
++		 * first panfrost probe without this release hard-stalled the
++		 * AXI on the first GPU register access (2026-08-18).
++		 */
++		.sram_pdn_bits = GENMASK(1, 0),
++		.sram_pdn_ack_bits = GENMASK(17, 16),
++		.ext_sram_ctl_offs = 0x33C,
+ 		.clk_id = {CLK_NONE},
+ 		.caps = MTK_SCPD_KEEP_DEFAULT_OFF,
+ 	},
