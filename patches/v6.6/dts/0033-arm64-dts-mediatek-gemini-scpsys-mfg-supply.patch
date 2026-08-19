@@ -1,0 +1,23 @@
+arm64: dts: mediatek: gemini: feed the MFG domain from the vgpu buck (mfg-supply)
+
+diff --git a/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts b/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
+index b739c6d93..a02bfa018 100644
+--- a/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
++++ b/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
+@@ -2000,3 +2000,16 @@ pins-mux {
+ 		};
+ 	};
+ };
++
++/*
++ * The MFG MTCMOS is fed by the external RT5735 vgpu buck; without the rail
++ * up the domain's PWR_ACK never sets ("Failed to power on domain mfg",
++ * 2026-08-19 probe attempt 5). mtk-scpsys resolves an optional
++ * "<domain-name>-supply" on its node and enables it first in power-on —
++ * the vendor gpufreq likewise enables VGPU before any MTCMOS touch.
++ * panfrost's own mali-supply reference coexists (refcounted) and is what
++ * DVFS uses for voltage scaling.
++ */
++&scpsys {
++	mfg-supply = <&vgpu>;
++};
