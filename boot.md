@@ -9033,3 +9033,26 @@ FDT — only LK-injected nodes differ — so this DTB is flash-equivalent apart
 from the phandle fix. Pending on-device: kexec into the new DTB, then a
 func-off/func-on cycle to confirm CONN really powers off (and a wedged MCU
 becomes software-recoverable, closing the physical-cold-cycle dependency).
+
+## 2026-08-18 — Track 2: VGPU buck die CONFIRMED (RT5735 @ 0x1c) — audit F5 closed; DTS address fixed
+
+Live SSH session (no GPU power-on). The Slice-6 `regulator@60` node never
+probed (`fan53555-regulator 2-0060: Failed to get chip ID!`). Read-only i2c
+sweep of adapter 2 (= controller 0x11010000 = vendor i2c id 7, the
+`mediatek,gpupm_used` bus): exactly one device ACKs, at **0x1c**, and its
+PID register (0x03) reads **0x10 = RT5735_PRODUCT_ID**. The vendor DTB's
+i2c7 in fact declares BOTH `rt5735@1c` (`rt,rt5735-regulator`, the real
+buck) and `vgpu_buck@60` (`mediatek,vgpu_buck` — the fan53555 runtime-probe
+node with no chip behind it on this board; `is_fan53555_exist()` fails and
+the vendor gpufreq falls back to RT5735). The regulator/0001 RT5735 variant
+support (PROGVSEL0 0x11, 600 mV + n·6.25 mV, 128 steps) matches the vendor
+`rt5735.c` exactly — only the DT address was wrong.
+
+Also read: rail is **disabled** at boot (PROGVSEL0 = 0x26, EN clear —
+837.5 mV staged by LK), consistent with keeping `regulator-boot-on` off and
+letting panfrost enable it on demand.
+
+**Change:** dts/0024 `regulator@60` → `regulator@1c` (reg 0x1c), comment
+rewritten with the confirmed-die provenance; dts/0025 context resynced.
+Series re-validated: applies clean, DTB builds (`64bc5bb9…`), node present
+as `regulator@1c`.

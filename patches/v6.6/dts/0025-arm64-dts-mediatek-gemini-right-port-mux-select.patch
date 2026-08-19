@@ -7,8 +7,8 @@ diff --git a/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts b/arch/arm64/boo
 index bcdd6e340..e79e56527 100644
 --- a/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
 +++ b/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
-@@ -1856,3 +1856,87 @@ vgpu: regulator@60 {
- 		/* NOT regulator-boot-on: chip @0x60 unconfirmed (richtek,rt5735 vs a fan53555-family part have different VSEL encodings), so do not enable/apply this rail at boot until the die is confirmed on hardware (audit finding F5). */
+@@ -1856,3 +1856,87 @@ vgpu: regulator@1c {
+ 		/* Die CONFIRMED on hardware 2026-08-18 (closes audit F5): Richtek RT5735 at 0x1c — PID reg 0x03 reads 0x10 (RT5735_PRODUCT_ID); the vendor DTB's i2c7 carries rt5735@1c "rt,rt5735-regulator" plus a chipless vgpu_buck@60 fan53555-probe node, and a live bus scan ACKs only 0x1c. Rail found disabled, VSEL0 staged at 0x26 (837.5 mV). Still no regulator-boot-on: panfrost enables it on demand. */
  	};
  };
 +

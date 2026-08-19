@@ -130,13 +130,13 @@ index 0eccc52de..46be5851b 100644
 +	clock-frequency = <100000>;
 +	status = "okay";
 +
-+	vgpu: regulator@60 {
++	vgpu: regulator@1c {
 +		compatible = "richtek,rt5735";
-+		reg = <0x60>;
++		reg = <0x1c>;
 +		regulator-name = "vgpu";
 +		regulator-min-microvolt = <600000>;
 +		regulator-max-microvolt = <1393750>;
 +		regulator-ramp-delay = <6250>;
-+		/* NOT regulator-boot-on: chip @0x60 unconfirmed (richtek,rt5735 vs a fan53555-family part have different VSEL encodings), so do not enable/apply this rail at boot until the die is confirmed on hardware (audit finding F5). */
++		/* Die CONFIRMED on hardware 2026-08-18 (closes audit F5): Richtek RT5735 at 0x1c — PID reg 0x03 reads 0x10 (RT5735_PRODUCT_ID); the vendor DTB's i2c7 carries rt5735@1c "rt,rt5735-regulator" plus a chipless vgpu_buck@60 fan53555-probe node, and a live bus scan ACKs only 0x1c. Rail found disabled, VSEL0 staged at 0x26 (837.5 mV). Still no regulator-boot-on: panfrost enables it on demand. */
 +	};
 +};
