@@ -1,0 +1,50 @@
+arm64: dts: mediatek: gemini: snap GPU OPP voltages to the RT5735 VSEL grid
+
+The vendor gpufreq voltages are not multiples of the RT5735's 6.25 mV
+step, so the regulator core rejects every OPP (probe attempt 7:
+'OPP not supported by regulators', devfreq -34). Round each up to the
+next 600000+n*6250 uV code (safe direction).
+
+diff --git a/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts b/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
+index a02bfa018..ae66f6f94 100644
+--- a/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
++++ b/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
+@@ -1799,31 +1799,31 @@ gpu_opp_table: opp-table-gpu {
+ 
+ 		opp-238000000 {
+ 			opp-hz = /bits/ 64 <238000000>;
+-			opp-microvolt = <859500>;
++			opp-microvolt = <862500>; /* vendor 859500, RT5735 grid */
+ 		};
+ 		opp-365000000 {
+ 			opp-hz = /bits/ 64 <365000000>;
+-			opp-microvolt = <910800>;
++			opp-microvolt = <912500>; /* vendor 910800, RT5735 grid */
+ 		};
+ 		opp-442500000 {
+ 			opp-hz = /bits/ 64 <442500000>;
+-			opp-microvolt = <949300>;
++			opp-microvolt = <950000>; /* vendor 949300, RT5735 grid */
+ 		};
+ 		opp-520000000 {
+ 			opp-hz = /bits/ 64 <520000000>;
+-			opp-microvolt = <1000600>;
++			opp-microvolt = <1006250>; /* vendor 1000600, RT5735 grid */
+ 		};
+ 		opp-610000000 {
+ 			opp-hz = /bits/ 64 <610000000>;
+-			opp-microvolt = <1039100>;
++			opp-microvolt = <1043750>; /* vendor 1039100, RT5735 grid */
+ 		};
+ 		opp-700000000 {
+ 			opp-hz = /bits/ 64 <700000000>;
+-			opp-microvolt = <1090400>;
++			opp-microvolt = <1093750>; /* vendor 1090400, RT5735 grid */
+ 		};
+ 		opp-780000000 {
+ 			opp-hz = /bits/ 64 <780000000>;
+-			opp-microvolt = <1128900>;
++			opp-microvolt = <1131250>; /* vendor 1128900, RT5735 grid */
+ 		};
+ 	};
+ 
