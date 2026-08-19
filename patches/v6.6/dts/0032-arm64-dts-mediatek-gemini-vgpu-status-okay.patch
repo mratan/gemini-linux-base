@@ -1,0 +1,29 @@
+arm64: dts: mediatek: gemini: enable the vgpu rt5735 node over the vproc placeholder merge
+
+The board dts carries a disabled 'vproc' regulator@1c placeholder from
+the bsg100 era; dtc merges same-unit-address nodes property-wise and
+its status=disabled survived, so the rt5735 never instantiated. The
+buck is the VGPU rail (gpupm bus, vendor gpufreq EXTIC path, found
+disabled while CPUs run). Override status explicitly.
+
+diff --git a/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts b/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
+index 01d8495d2..b739c6d93 100644
+--- a/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
++++ b/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
+@@ -1899,6 +1899,16 @@ &i2c7 {
+ 	vgpu: regulator@1c {
+ 		compatible = "richtek,rt5735";
+ 		reg = <0x1c>;
++		/*
++		 * dtc merges this node with the disabled vproc placeholder at
++		 * the same unit address earlier in this file (a bsg100-era
++		 * misidentification: this buck sits on the gpupm i2c bus, the
++		 * vendor DTB drives it from gpufreq, and it is found DISABLED
++		 * while the CPUs run — a live vproc supply cannot be off).
++		 * The placeholder's status=disabled survives the property
++		 * merge, so re-enable explicitly.
++		 */
++		status = "okay";
+ 		regulator-name = "vgpu";
+ 		regulator-min-microvolt = <600000>;
+ 		regulator-max-microvolt = <1393750>;
