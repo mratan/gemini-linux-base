@@ -22,6 +22,54 @@ session runs it and its captures land in `04-docs/captures/<date>/`.
 
 ---
 
+## Session-state preamble (2026-08-19) — read before the original text
+
+Operational facts have moved since this runbook was written; where they
+conflict with the text below, this preamble wins:
+
+- **The remote-only period is over.** Physical sessions have run since
+  2026-08-17. The Internal Wi-Fi Prototype (Track 1) is DONE — scan,
+  WPA2 association, DHCP, internet, and software CONSYS power-cycling all
+  verified; bring-up is `/root/auto-bringup.sh` + `/root/wifi-connect.sh`
+  on a settled (≥90 s) boot.
+- **Boot-slot reality:** boot2 AND boot3 both carry the experimental GPU
+  stack (`boot-gpustack2.img`, sha `9cf5558b…` = c972573 kernel +
+  `dd9bb75e…` DTB). The original "never flash boot2" rule is historical:
+  stock Gemian boot2 was backed up (`1fa78de9…`, 01-backups/) before the
+  2026-08-17 flash and its ADR-0002 restore is still owed. Today's
+  fallback slot is **boot1 Android**, not Gemian-on-boot2.
+- **The deliverable image already ships the USB-display userspace**
+  (Slice U5: sway/foot/seatd/libdrm-tests/usbutils +
+  `/usr/local/sbin/gemini-usb-display-start` +
+  `/etc/gemini/sway-usbdisplay.conf`), and `udl.ko`/`evdi.ko`/
+  `drm_shmem_helper.ko` sit in `/lib/modules/6.6.0-dirty/updates/`.
+- **First light does NOT need the usbexp variant DTB.** The flashed main
+  DTB suffices for plain `udl`. The `mt6797-gemini-pda-usbexp.dtb`
+  variant (now `0c5f1b00…`, includes every GPU/consys fix through
+  `ecf610b`) is only for the U2 single-variable USB experiments
+  (C1–C6), via `/root/kexec-usbexp.sh`.
+- **Turnkey wrapper:** `usb-display-preflight.sh` (staged with the kit)
+  runs Parts 3–4 — adapter enumeration → udl load → connector/EDID
+  capture → 10 s modetest SMPTE scanout — and leaves Part 5 as the
+  manual `gemini-usb-display-start` step.
+- **Hard-won session protocol (2026-08-18/19):**
+  - Power on with the **USB cable unplugged**; plug ~60 s after the
+    splash. A cable at power-on parks the preloader (0e8d:2008) or, on
+    chord-less resets, boots Android.
+  - **kexec boots lose the USB gadget ~75 % of the time** (mtu3). For
+    anything that must survive unattended, flash + cold boot; treat
+    kexec chains as operator-present-only.
+  - If navier's `enp0s20f0u3` is DOWN/no-IP after an enumeration:
+    `sudo ip addr add 10.15.19.100/24 dev enp0s20f0u3 && sudo ip link
+    set enp0s20f0u3 up`.
+  - The RGU watchdog is armed+kernel-petted only on **flashed** (LK)
+    boots; on kexec boots it comes up disabled, and re-arming it by
+    devmem creates an unpetted 31 s time bomb — don't.
+  - Parked download mode (`0e8d:2008`): unplug, hold power ~10 s (Esc +
+    silver + power ~15–20 s if it resists), then chord-boot.
+
+---
+
 ## ⛔ GATE — do not execute any physical step yet
 
 **Nothing here runs until the remote-only period is declared over and the device is in
