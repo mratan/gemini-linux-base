@@ -1,0 +1,37 @@
+arm64: dts: mediatek: gemini: clock the GPU from the mfgcfg BG3D gate
+
+Add the g3d_config@13000000 mfgcfg clock-controller node and make it
+the panfrost core clock (its CCF parent chain enables mfg_sel and the
+PLL). The bare topckgen mux left the BG3D gate closed — the exact
+unclocked-register-access class of hang B-13 taught us to fear.
+
+diff --git a/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts b/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
+index 2dcfcafc8..01d8495d2 100644
+--- a/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
++++ b/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
+@@ -1846,6 +1846,16 @@ opp-780000000 {
+ 	 * Compatible model (T880 vs vendor's T860) is flagged for owner
+ 	 * review in patches/v6.6/gpu/0001; panfrost auto-detects at runtime.
+ 	 */
++	/*
++	 * g3d_config block: holds the BG3D gate ("mfg-main" in the vendor
++	 * mali node) between mfg_sel and the GPU. See clk-mt6797-mfg.c.
++	 */
++	mfgcfg: clock-controller@13000000 {
++		compatible = "mediatek,mt6797-mfgcfg";
++		reg = <0 0x13000000 0 0x1000>;
++		#clock-cells = <1>;
++	};
++
+ 	gpu: gpu@13040000 {
+ 		compatible = "mediatek,mt6797-mali", "arm,mali-t880";
+ 		reg = <0 0x13040000 0 0x4000>;
+@@ -1853,7 +1863,7 @@ gpu: gpu@13040000 {
+ 			     <GIC_SPI 263 IRQ_TYPE_LEVEL_LOW>,
+ 			     <GIC_SPI 262 IRQ_TYPE_LEVEL_LOW>;
+ 		interrupt-names = "job", "mmu", "gpu";
+-		clocks = <&topckgen CLK_TOP_MUX_MFG>;
++		clocks = <&mfgcfg CLK_MFGCFG_BG3D>;
+ 		clock-names = "core";
+ 		mali-supply = <&vgpu>;
+ 		power-domains = <&scpsys MT6797_POWER_DOMAIN_MFG>;

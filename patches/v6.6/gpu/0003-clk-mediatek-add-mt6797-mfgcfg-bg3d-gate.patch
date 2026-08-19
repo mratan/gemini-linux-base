@@ -1,0 +1,117 @@
+clk: mediatek: add MT6797 mfgcfg (g3d_config) BG3D gate driver
+
+The vendor mali node needs "mfg-main" — the BG3D gate at g3d_config
+0x13000000 (vendor clk-mt6797.c mfg_cg_regs sta 0x0/set 0x4/clr 0x8,
+bit 0, parent mfg_sel). Without it the first GPU register access
+stalls the AXI. Modeled on clk-mt6779-mfg.c; tristate so it can ship
+as a module and panfrost defers until it probes.
+
+diff --git a/drivers/clk/mediatek/Kconfig b/drivers/clk/mediatek/Kconfig
+index 48b42d111..3dd12e6da 100644
+--- a/drivers/clk/mediatek/Kconfig
++++ b/drivers/clk/mediatek/Kconfig
+@@ -312,6 +312,13 @@ config COMMON_CLK_MT6797
+ 	help
+ 	  This driver supports MediaTek MT6797 basic clocks.
+ 
++config COMMON_CLK_MT6797_MFGCFG
++	tristate "Clock driver for MediaTek MT6797 mfgcfg"
++	depends on COMMON_CLK_MT6797
++	help
++	  This driver supports the MediaTek MT6797 mfgcfg (g3d_config)
++	  clock gate for the Mali GPU.
++
+ config COMMON_CLK_MT6797_MMSYS
+ 	tristate "Clock driver for MediaTek MT6797 mmsys"
+ 	depends on COMMON_CLK_MT6797
+diff --git a/drivers/clk/mediatek/Makefile b/drivers/clk/mediatek/Makefile
+index dbeaa5b41..57307e692 100644
+--- a/drivers/clk/mediatek/Makefile
++++ b/drivers/clk/mediatek/Makefile
+@@ -26,6 +26,7 @@ obj-$(CONFIG_COMMON_CLK_MT6795_VDECSYS) += clk-mt6795-vdecsys.o
+ obj-$(CONFIG_COMMON_CLK_MT6795_VENCSYS) += clk-mt6795-vencsys.o
+ obj-$(CONFIG_COMMON_CLK_MT6797) += clk-mt6797.o
+ obj-$(CONFIG_COMMON_CLK_MT6797_IMGSYS) += clk-mt6797-img.o
++obj-$(CONFIG_COMMON_CLK_MT6797_MFGCFG) += clk-mt6797-mfg.o
+ obj-$(CONFIG_COMMON_CLK_MT6797_MMSYS) += clk-mt6797-mm.o
+ obj-$(CONFIG_COMMON_CLK_MT6797_VDECSYS) += clk-mt6797-vdec.o
+ obj-$(CONFIG_COMMON_CLK_MT6797_VENCSYS) += clk-mt6797-venc.o
+diff --git a/drivers/clk/mediatek/clk-mt6797-mfg.c b/drivers/clk/mediatek/clk-mt6797-mfg.c
+new file mode 100644
+index 000000000..026431abe
+--- /dev/null
++++ b/drivers/clk/mediatek/clk-mt6797-mfg.c
+@@ -0,0 +1,60 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * MT6797 mfgcfg (g3d_config) clock controller — the single BG3D gate
++ * between the topckgen mfg_sel mux and the Mali-T880 register/datapath
++ * clock. Register layout from the vendor 3.18 clk-mt6797.c
++ * (mfg_cg_regs: sta 0x0, set 0x4, clr 0x8; GATE(MFG_BG3D, "mfg_bg3d",
++ * "mfg_sel", ..., shift 0)) and the vendor DTB's g3d_config@13000000
++ * node. Without this gate enabled, the first GPU register access stalls
++ * the AXI (the vendor "mfg-main" clock).
++ */
++
++#include <linux/module.h>
++#include <linux/clk-provider.h>
++#include <linux/platform_device.h>
++
++#include "clk-mtk.h"
++#include "clk-gate.h"
++
++#include <dt-bindings/clock/mt6797-clk.h>
++
++static const struct mtk_gate_regs mfg_cg_regs = {
++	.set_ofs = 0x4,
++	.clr_ofs = 0x8,
++	.sta_ofs = 0x0,
++};
++
++#define GATE_MFG(_id, _name, _parent, _shift)			\
++	GATE_MTK(_id, _name, _parent, &mfg_cg_regs, _shift,	\
++		&mtk_clk_gate_ops_setclr)
++
++static const struct mtk_gate mfg_clks[] = {
++	GATE_MFG(CLK_MFGCFG_BG3D, "mfg_bg3d", "mfg_sel", 0),
++};
++
++static const struct mtk_clk_desc mfg_desc = {
++	.clks = mfg_clks,
++	.num_clks = ARRAY_SIZE(mfg_clks),
++};
++
++static const struct of_device_id of_match_clk_mt6797_mfg[] = {
++	{
++		.compatible = "mediatek,mt6797-mfgcfg",
++		.data = &mfg_desc,
++	}, {
++		/* sentinel */
++	}
++};
++MODULE_DEVICE_TABLE(of, of_match_clk_mt6797_mfg);
++
++static struct platform_driver clk_mt6797_mfg_drv = {
++	.probe = mtk_clk_simple_probe,
++	.remove_new = mtk_clk_simple_remove,
++	.driver = {
++		.name = "clk-mt6797-mfg",
++		.of_match_table = of_match_clk_mt6797_mfg,
++	},
++};
++
++module_platform_driver(clk_mt6797_mfg_drv);
++MODULE_LICENSE("GPL");
+diff --git a/include/dt-bindings/clock/mt6797-clk.h b/include/dt-bindings/clock/mt6797-clk.h
+index dc23ddb75..88a77a91e 100644
+--- a/include/dt-bindings/clock/mt6797-clk.h
++++ b/include/dt-bindings/clock/mt6797-clk.h
+@@ -270,4 +270,8 @@
+ #define	CLK_VENC_3				4
+ #define	CLK_VENC_NR				5
+ 
++/* MFGCFG (g3d_config@13000000) */
++#define CLK_MFGCFG_BG3D				0
++#define CLK_MFGCFG_NR				1
++
+ #endif /* _DT_BINDINGS_CLK_MT6797_H */
