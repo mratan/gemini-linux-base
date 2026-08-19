@@ -256,6 +256,13 @@ enables the cfg80211 features the driver requires (`NL80211_TESTMODE`,
   stays out (`MTK_WCN_REMOVE_KO=0` — modules are insmodded, not
   ioctl-inited).
 
+- **N12 [novel] hci_stp (drv_bt) 6.6 churn** — `set_fs()/f_op->read/write`
+  → `kernel_read()/kernel_write()` (v5.10 removal); `hdev->driver_data` →
+  `hci_{get,set}_drvdata()`; `HCI_BREDR` → `HCI_PRIMARY` (v4.8); rx
+  callbacks re-typed to the exact `MTK_WCN_STP_IF_RX` signature
+  (`const PUINT8`); `module_exit` fn made void; `reset` param made bool.
+  `drv_bt/linux/hci_stp.c`.
+
 ## Tracked warnings (gen3, not silenced — all pre-existing vendor quality)
 
 Clean-build inventory 2026-08-12: 42 total, dominated by enum-conversion (7),

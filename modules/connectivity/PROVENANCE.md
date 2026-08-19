@@ -31,6 +31,18 @@ replaced by the SoC-only stubs in `wmt_detect_soc_stubs.c`. The `drv_init`
 tree stays excluded (`MTK_WCN_REMOVE_KO=0`: our drivers are separate
 modules loaded by insmod, not by the DO_MODULE_INIT ioctl).
 
+### Bluetooth hci_stp (2026-08-19)
+
+`drv_bt/` (hci_stp.c + headers) is vendored from **gemian-3.18** (branch
+`native` — the Reference slot's kernel, where Bluetooth demonstrably worked
+on this device), NOT from ubports-3.18: ubports carries only the
+Android-style `stp_chrdev_bt` chardev, while gemian forked MTK's native
+BlueZ `hci_stp` driver, which registers a real `hci0` and uses the STP
+core's bluez mode (rx delivered via `mtk_wcn_sys_if_rx`). File header
+carries MTK's old proprietary boilerplate but declares
+`MODULE_LICENSE("GPL")` and ships in gemian's public GPL-2.0 kernel tree —
+the same distribution basis as the rest of the vendored stack.
+
 ### Gen3 WLAN (Slice 9, tracker issue #10)
 
 `wlan/gen3/` object selection mirrors the vendor gen3 Makefile for

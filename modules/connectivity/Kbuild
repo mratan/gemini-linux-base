@@ -14,7 +14,8 @@ ccflags-y := \
 	-I$(src)/common_main/platform/include \
 	-I$(src)/common_detect \
 	-I$(src)/btif/inc \
-	-I$(src)/btif/plat_inc
+	-I$(src)/btif/plat_inc \
+	-I$(src)/drv_bt/include
 
 # Vendor build flags for the CONSYS/SoC path (from the 3.18 Makefiles),
 # minus -Werror: warnings in ported code are tracked, not silenced.
@@ -171,6 +172,15 @@ obj-m += mtk_wmt_detect.o
 mtk_wmt_detect-y := \
 	common_detect/wmt_detect.o \
 	common_detect/wmt_detect_soc_stubs.o
+
+# Native BlueZ HCI driver over STP (gemian-3.18 drv_bt — the driver the
+# Reference slot's working Bluetooth used). Registers a real hci0 with the
+# kernel BT core; STP's bluez mode then delivers BT_TASK_INDX rx straight
+# to it (stp_core "If bluez, direct send packet to hci_core"). No chardev,
+# no vhci bridge. Depends on mtk_stp_wmt_soc exports AND the kernel BT
+# core (bluetooth.ko, CONFIG_BT=m) — insmod bluetooth before this.
+obj-m += mtk_hci_stp.o
+mtk_hci_stp-y := drv_bt/linux/hci_stp.o
 
 # WMT core + STP + SoC platform glue, as one module (keeps the vendor's
 # intra-stack symbol web internal; exports stay available for wlan gen3)
