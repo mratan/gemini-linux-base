@@ -1,0 +1,71 @@
+pmdomain+dts: mt6797 MFG domains use the mfg_52m_sel/VCG pre-clock
+
+Vendor clk-mt6797-pg.c PGATEs every MFG mtcmos transition behind
+mfg_52m_sel, delivered through the INFRA_MFG_VCG infra gate (bit 14,
+'Virtual CG'). Nothing referenced that gate, so clk_disable_unused
+shut it at late init and the 52M feed into MFG was dead during the
+panfrost probe (stall #2 with SRAM released). Add CLK_MFG52M wired to
+a new scpsys "mfg52m" clock = <&infrasys CLK_INFRA_MFG_VCG>; use it
+on MFG_ASYNC (was CLK_MFG, a bsg100-era guess) and MFG.
+
+diff --git a/arch/arm64/boot/dts/mediatek/mt6797.dtsi b/arch/arm64/boot/dts/mediatek/mt6797.dtsi
+index ae9fec128..c3694c883 100644
+--- a/arch/arm64/boot/dts/mediatek/mt6797.dtsi
++++ b/arch/arm64/boot/dts/mediatek/mt6797.dtsi
+@@ -239,8 +239,9 @@ scpsys: power-controller@10006000 {
+ 		reg = <0 0x10006000 0 0x1000>;
+ 		clocks = <&topckgen CLK_TOP_MUX_MFG>,
+ 			 <&topckgen CLK_TOP_MUX_MM>,
+-			 <&topckgen CLK_TOP_MUX_VDEC>;
+-		clock-names = "mfg", "mm", "vdec";
++			 <&topckgen CLK_TOP_MUX_VDEC>,
++			 <&infrasys CLK_INFRA_MFG_VCG>;
++		clock-names = "mfg", "mm", "vdec", "mfg52m";
+ 		infracfg = <&infrasys>;
+ 	};
+ 
+diff --git a/drivers/pmdomain/mediatek/mtk-scpsys.c b/drivers/pmdomain/mediatek/mtk-scpsys.c
+index 58a746a25..1b56ca6bf 100644
+--- a/drivers/pmdomain/mediatek/mtk-scpsys.c
++++ b/drivers/pmdomain/mediatek/mtk-scpsys.c
+@@ -90,6 +90,7 @@ enum clk_id {
+ 	CLK_HIFSEL,
+ 	CLK_JPGDEC,
+ 	CLK_AUDIO,
++	CLK_MFG52M,
+ 	CLK_MAX,
+ };
+ 
+@@ -104,6 +105,7 @@ static const char * const clk_names[] = {
+ 	"hif_sel",
+ 	"jpgdec",
+ 	"audio",
++	"mfg52m",
+ 	NULL,
+ };
+ 
+@@ -849,7 +851,14 @@ static const struct scp_domain_data scp_domain_data_mt6797[] = {
+ 		.ctl_offs = 0x334,
+ 		.sram_pdn_bits = 0,
+ 		.sram_pdn_ack_bits = 0,
+-		.clk_id = {CLK_MFG},
++		/*
++		 * Vendor PGATE pre_clk for every MFG mtcmos transition is
++		 * mfg_52m_sel (not the main mfg mux), delivered through the
++		 * INFRA_MFG_VCG gate — the scpsys "mfg52m" clock. Referencing
++		 * it here also keeps clk_disable_unused from shutting the
++		 * otherwise-unused 52M feed.
++		 */
++		.clk_id = {CLK_MFG52M},
+ 	},
+ 	/*
+ 	 * MFG (Mali GPU top) and its four shader-core domains. Register
+@@ -894,7 +903,7 @@ static const struct scp_domain_data scp_domain_data_mt6797[] = {
+ 		.sram_pdn_bits = GENMASK(1, 0),
+ 		.sram_pdn_ack_bits = GENMASK(17, 16),
+ 		.ext_sram_ctl_offs = 0x33C,
+-		.clk_id = {CLK_NONE},
++		.clk_id = {CLK_MFG52M},
+ 		.caps = MTK_SCPD_KEEP_DEFAULT_OFF,
+ 	},
+ 	[MT6797_POWER_DOMAIN_MFG_CORE0] = {
