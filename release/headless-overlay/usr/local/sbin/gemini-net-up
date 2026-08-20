@@ -1,0 +1,86 @@
+#!/bin/sh
+# gemini-net-up — bring internal Wi-Fi up after boot and join the stored
+# network, so SSH does not depend on the USB cable.
+#
+# Why this is a boot service and not a manual step: every iteration of the
+# panel and GPU work costs a flash and a boot, and when the USB gadget dies —
+# which it does on most kexec boots — the session stops until someone is
+# physically at the device. A second way in makes that survivable.
+#
+# TIMING IS LOAD-BEARING. A CONSYS func-on fired at ~14 s uptime WEDGES the
+# cold subsystem: regulators, clocks and pwrap are not ready that early, and no
+# software retry recovers it (confirmed over two cold boots, 2026-08-18). The
+# one reliable success was a manual run at 1-2 minutes. So this waits for a
+# settle floor before touching CONSYS at all. Do not lower it casually.
+#
+# It deliberately does NOT touch the watchdog — see gemini-watchdog.
+set -u
+
+SETTLE=${GEMINI_SETTLE:-120}
+LOG=/var/log/gemini-net-up.log
+WPA=/root/wpa.conf
+K=/lib/modules/$(uname -r)/updates
+
+exec >>"$LOG" 2>&1
+echo "=== gemini-net-up $(date -Is) uptime=$(cut -d. -f1 /proc/uptime)s ==="
+
+# Wait for the settle floor measured from boot, not from service start, so a
+# slow boot does not add to it.
+while :; do
+    up=$(cut -d. -f1 /proc/uptime)
+    [ "$up" -ge "$SETTLE" ] && break
+    sleep 5
+done
+echo "settled at uptime ${up}s"
+
+if [ ! -r "$WPA" ]; then
+    echo "no $WPA — nothing to join; leaving Wi-Fi down"; exit 0
+fi
+
+if ! ip link show wlan0 >/dev/null 2>&1; then
+    echo "-- bringing up the CONSYS stack"
+    for m in mtk_btif mtk_stp_wmt_soc mtk_wmt_detect; do
+        insmod "$K/$m.ko" 2>&1 | sed "s/^/   $m: /"
+    done
+    /usr/sbin/wmt_loader; echo "   wmt_loader rc=$?"
+    for m in rfkill cfg80211 wlan_gen3; do
+        insmod "$K/$m.ko" 2>&1 | sed "s/^/   $m: /"
+    done
+    systemd-run -q --unit=gemini-wmt-launcher /usr/sbin/wmt_launcher -p /lib/firmware
+    sleep 4
+    echo 1 > /dev/wmtWifi; echo "   func-on rc=$?"
+    # wlan0 does not appear instantly after func-on.
+    for _ in $(seq 1 30); do
+        ip link show wlan0 >/dev/null 2>&1 && break
+        sleep 1
+    done
+fi
+
+ip link show wlan0 >/dev/null 2>&1 || { echo "wlan0 never appeared — giving up"; exit 1; }
+ip link set wlan0 up
+echo "-- wlan0 up, associating"
+
+# Association can fail transiently (a scan that lands badly, a slow AP). A
+# wedged CONSYS will not recover no matter how often we ask, so the retry
+# budget is small and deliberate rather than a loop that hides the difference.
+state=
+for attempt in 1 2 3; do
+    pkill -f "wpa_supplicant.*wlan0" 2>/dev/null && sleep 1
+    wpa_supplicant -B -i wlan0 -c "$WPA" -f /root/wpa.log || { echo "supplicant failed to start"; sleep 5; continue; }
+    for _ in $(seq 1 30); do
+        state=$(wpa_cli -i wlan0 status 2>/dev/null | sed -n 's/^wpa_state=//p')
+        [ "$state" = COMPLETED ] && break
+        sleep 1
+    done
+    echo "attempt $attempt: wpa_state=$state"
+    [ "$state" = COMPLETED ] && break
+    sleep 5
+done
+[ "$state" = COMPLETED ] || { tail -20 /root/wpa.log; exit 2; }
+
+busybox udhcpc -i wlan0 -q -n -t 10 -s /usr/share/udhcpc/default.script
+addr=$(ip -4 -br addr show wlan0)
+echo "wlan0: $addr"
+# Publish the address where the host can find it without guessing.
+ip -4 -o addr show wlan0 | awk '{print $4}' | cut -d/ -f1 > /run/gemini-wifi-ip
+echo "GEMINI-NET-UP-OK $(cat /run/gemini-wifi-ip 2>/dev/null)"

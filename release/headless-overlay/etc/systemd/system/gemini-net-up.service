@@ -1,0 +1,15 @@
+[Unit]
+Description=Bring up internal Wi-Fi and join the stored network (a way in that is not the USB cable)
+Documentation=file:///usr/local/sbin/gemini-net-up
+After=multi-user.target network.target
+Wants=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# The script waits for a settle floor internally; the timeout must exceed it.
+TimeoutStartSec=600
+ExecStart=/usr/local/sbin/gemini-net-up
+
+[Install]
+WantedBy=multi-user.target

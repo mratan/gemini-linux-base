@@ -1,0 +1,15 @@
+[Unit]
+Description=Decide who owns the RGU hardware watchdog (arm+pet, or disable if unclaimed)
+Documentation=file:///usr/local/sbin/gemini-watchdog
+DefaultDependencies=no
+After=systemd-modules-load.service
+Before=sysinit.target shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/gemini-watchdog
+
+[Install]
+WantedBy=sysinit.target

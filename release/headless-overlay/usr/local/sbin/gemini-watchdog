@@ -1,0 +1,36 @@
+#!/bin/sh
+# gemini-watchdog — decide, at boot, who is responsible for the RGU watchdog.
+#
+# Background. Nothing in a minimal Debian pets the MediaTek RGU watchdog, so
+# early experimental boots hit a ~1-2 minute reset loop and the fix at the time
+# was to disable the watchdog outright (gemini-wdt-disable, 2026-08-17). That
+# was right then and is wrong now: for a hands-free lab the watchdog is the
+# recovery mechanism. A kernel that hangs with the watchdog armed resets and
+# comes back; a kernel that hangs with it disabled is a dead device needing a
+# human and a power button. Disabling it once turned a recoverable hang into
+# exactly that.
+#
+# The kernel has the driver (mtk_wdt, compatible mediatek,mt6589-wdt) and the
+# DTB has watchdog@10007000, so /dev/watchdog should exist and systemd's
+# RuntimeWatchdogSec pets it. But if for any reason the driver did not bind, an
+# armed unpetted watchdog is a reset loop — so fall back to the old behaviour
+# and say loudly that hands-free recovery is off.
+set -e
+REG=0x10007000
+
+if [ -c /dev/watchdog0 ] || [ -c /dev/watchdog ]; then
+    echo "gemini-watchdog: kernel watchdog device present — leaving the RGU ARMED."
+    echo "gemini-watchdog: systemd pets it (RuntimeWatchdogSec); a hang now self-recovers."
+    exit 0
+fi
+
+echo "gemini-watchdog: WARNING no /dev/watchdog — the mtk_wdt driver did not bind."
+echo "gemini-watchdog: disabling the RGU to avoid an unpetted reset loop."
+echo "gemini-watchdog: HANDS-FREE RECOVERY IS OFF: a hang will need a physical power cycle."
+if command -v busybox >/dev/null 2>&1; then
+    busybox devmem "$REG" 32 0x22000000
+elif command -v devmem2 >/dev/null 2>&1; then
+    devmem2 "$REG" w 0x22000000
+else
+    echo "gemini-watchdog: no devmem tool; watchdog left as-is" >&2
+fi
