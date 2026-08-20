@@ -1381,6 +1381,41 @@ before relying on the device being back to a good state.
 
 ---
 
+
+## 🔴 B-24 — NT36672 panel retarget hangs the boot at DRM bind (watchdog loop)
+
+**Opened 2026-08-20.** The NT36672 panel retarget (`panel/0007` + `panel/0008`,
+fork `33d641c`) **does light the physical panel** — the operator confirmed
+kernel text on the glass, a first for this port, which closes the identity half
+of B-17. But the kernel then **hangs during display bring-up** and the RGU
+watchdog resets the device in a loop.
+
+**Evidence:** on-screen output stops at the `mediatek-drm ... bound 1401xxxxx`
+cluster (~0.86 s) with nothing after. Host-side USB shows the SoC re-enumerating
+on a fixed cadence — `MT65xx Preloader` at 09:52:24 and again at **09:52:54,
+exactly 30 s apart**, matching the RGU watchdog's 31 s timeout. The RNDIS gadget
+appears briefly (09:46:00) when a boot gets far enough, then dies with the next
+reset. This also explains a long run of `-110`/`-62` enumeration failures that
+were misread as cable/mtu3 flakiness.
+
+**Suspect:** the 183-command init table pushed in `mtk_dsi_host_transfer()`.
+Most likely a transfer that never completes (or a long series of timeouts)
+inside `drm_panel_prepare()`, which runs under the CRTC enable path. Note the
+init runs in command mode (via `drm/0013`) before the switch back to burst.
+
+**Next steps:** (1) bisect the table — send only the page-select + sleep-out +
+display-on subset first; (2) instrument `ssd2092_init_sequence()` with a
+per-command `dev_info` and read the last one printed; (3) check whether any
+command's payload exceeds the DSI FIFO / needs the CMDQ path; (4) consider a
+bounded timeout so a stalled transfer cannot wedge bind.
+
+**PROCESS FAILURE (mine) — do not repeat:** the new kernel was flashed to
+**both** boot2 and boot3, leaving no known-good experimental slot; recovery
+required booting boot1 Android and restoring `boot-gpustack4.img`
+(`4a912fae…`) to p30/p31 over adb. **Flash one slot at a time and keep the
+other known-good.** Android on boot1 remains the deep fallback and was
+untouched throughout.
+
 ## 🟡 B-17 — DRM atomic commit never completes (`flip_done`/vblank timeout loop), panel stays dark
 
 **Opened 2026-07-08**, split out of B-13 once B-13's original scope (cpu0
