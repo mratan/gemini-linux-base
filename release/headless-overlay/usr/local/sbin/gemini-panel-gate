@@ -149,6 +149,19 @@ else
 fi
 say
 
+# --- 3b. backlight and CRTC state (evidence, not a verdict) -----------------
+say "[3b] backlight / pipeline state (reported, not judged)"
+for b in /sys/class/backlight/*/; do
+    [ -d "$b" ] || continue
+    say "      $(basename "$b"): brightness=$(cat "$b/brightness" 2>/dev/null)/$(cat "$b/max_brightness" 2>/dev/null) bl_power=$(cat "$b/bl_power" 2>/dev/null)"
+done
+say "      fbcon: $(cat /sys/class/vtconsole/vtcon1/name 2>/dev/null), active VT $(cat /sys/class/tty/tty0/active 2>/dev/null)"
+# Recorded because "backlight on, image wrong" and "backlight off" look
+# identical in a photograph of a dark panel, and the distinction decides
+# whether to suspect the bias rails or the DSI timing. Not a pass/fail: a lit
+# backlight proves nothing about whether the right pixels reach the glass.
+say
+
 # --- 4. the driver's own complaint about blanking ---------------------------
 say "[4] D-PHY blanking warning"
 if dmesg 2>/dev/null | grep -q "HFP + HBP less than d-phy"; then
