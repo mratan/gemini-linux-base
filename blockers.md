@@ -1382,6 +1382,80 @@ before relying on the device being back to a good state.
 ---
 
 
+## 🔴 B-26 — a booted kernel with no userspace never resets: the watchdog pets itself
+
+**Opened 2026-08-20.** The hardware watchdog cannot rescue an unattended hang
+in the one case that matters most, and it took losing the device to see it.
+
+**Evidence.** A `kexec` into the known-good kernel produced a system that
+booted far enough for the built-in g_ether gadget to enumerate (host log:
+`Product: RNDIS/Ethernet Gadget`, `Manufacturer: Linux 6.6.0-dirty with mtu3`,
+one second after the old kernel's gadget disconnected) but never reached
+userspace: the link carrier stayed down (`ip link set usb0 up` is
+gemini-usb-net's job), Wi-Fi never associated, and the panel went from lit to
+dark. It then sat in that state for **8 minutes with no reset**, with the RGU
+watchdog armed the whole time.
+
+**Cause.** `CONFIG_WATCHDOG_HANDLE_BOOT_ENABLED=y` makes the watchdog core
+adopt the running RGU that LK left armed and pet it from a kernel worker until
+userspace opens `/dev/watchdog`. With `CONFIG_WATCHDOG_OPEN_TIMEOUT=0` that
+wait has **no deadline** — so a kernel that boots but never starts userspace
+keeps its own watchdog fed indefinitely. The safety net feeds the thing it is
+supposed to catch.
+
+`gemini-watchdog.service` and systemd's `RuntimeWatchdogSec` only cover the
+window *after* PID 1 is running. This is the window before it.
+
+**Fix (staged, untested on hardware):** `watchdog.open_timeout=120` in
+`configs/gemini-cmdline.config`. Userspace then has 120 s to claim the device —
+systemd claims it within about two seconds of PID 1 starting — and if it never
+does, the core stops petting and the RGU resets. Turns "dead device" into
+"another boot attempt".
+
+**Related trap, same root:** `CONFIG_CMDLINE_FORCE=y`, so the compiled-in
+command line is the only one that takes effect. What LK passes is discarded —
+and so is `kexec --command-line`. A parameter not in
+`configs/gemini-cmdline.config` is not set, however it was supplied.
+
+## 🔴 B-25 — kexec is not a safe autonomous reboot on this hardware
+
+**Opened 2026-08-20.** Superseding the more optimistic earlier note that kexec
+gives "a FULLY AUTONOMOUS reboot".
+
+A kexec into the **known-good, currently-running** kernel (same Image and DTB
+extracted from the flashed `boot-gpustack4.img`; the local rebuild of that DTB
+is byte-identical, so the inputs were right) failed to reach userspace. This
+was a deliberate null test — the same kernel that was running a moment earlier
+— so the failure is kexec itself, not the payload.
+
+Then it got worse: the wedged gadget could not be recovered from the host. The
+hub port shows `power connect` but never `enable`; the device answers
+`-110 device descriptor read` and `-62 device not accepting address`. A 4 s
+link-down did not clear it and neither did 45 s. The device-side mtu3
+controller is wedged and, because this hub does not switch VBUS (B-27), the
+host cannot present a true unplug. **Recovery required a physical power cycle.**
+
+**Consequence for the hands-free lab:** kexec cannot be the mechanism for
+entering a kernel unattended. Prefer flash + cold boot, which is also what the
+project's own operating notes said and what this test ignored. kexec remains
+useful only when a human can power-cycle.
+
+## 🟡 B-27 — the lab hub advertises per-port power switching but does not switch VBUS
+
+**Opened 2026-08-20.** The Anker hub's two Realtek RTS5411 chips report `ppps`
+and the port status word clears its POWER bit, and the device does leave the
+bus — but the 5 V rail is hardwired. Measured with Android logging its own
+charger across a 12 s "power off": ChargerVoltage 5043 → 5024 mV, current 442 →
+446 mA, status `Charging` throughout, while the device simultaneously vanished
+from the bus.
+
+So `gemini-port.py` is a **data replug, not a power cycle**. It re-enumerates a
+healthy device fine (0.9 s), but it cannot clear a wedged device-side UDC
+(B-25) because the device never sees VBUS drop. A hub with genuine VBUS
+switching would fix that specific case; nothing in software will.
+
+Side effect worth keeping: the device charges while "unplugged".
+
 ## 🔴 B-24 — NT36672 panel retarget hangs the boot at DRM bind (watchdog loop)
 
 **Opened 2026-08-20.** The NT36672 panel retarget (`panel/0007` + `panel/0008`,

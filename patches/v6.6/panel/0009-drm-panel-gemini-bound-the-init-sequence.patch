@@ -1,0 +1,165 @@
+drm/panel: bound the Gemini panel init sequence in wall-clock time (B-24)
+
+The 183-command NT36672 init table runs inside drm_panel_prepare(), under the
+CRTC enable path, during boot. Every individual DSI call is already bounded --
+mtk_dsi_host_send_cmd() waits at most 2 s for its IRQ -- but two of those
+bounds abort nothing: mtk_dsi_wait_for_idle() polls for up to 2 s and then
+merely warns and resets the engine, and the video->command mode switch adds
+another 500 ms. A panel that answers slowly can therefore spend minutes in
+prepare() without any single call ever "hanging".
+
+That is fatal rather than slow. The RGU hardware watchdog fires at ~31 s and
+nothing pets it this early in boot, so the result is a reset loop -- which on
+the host looks exactly like a flaky USB cable, and was read as one for most of
+an evening on 2026-08-20 (B-24).
+
+So the sequence now carries a wall-clock budget, checked between commands.
+When it is exhausted the sequence aborts naming the command it stopped at,
+prepare() fails, and the kernel carries on booting with no image. A dark panel
+is a bad outcome; a watchdog loop is a dead device. This guarantees the first
+can never become the second, whatever the panel does.
+
+It also names the culprit: every command's elapsed time is measured, slow ones
+(>= 200 ms) are warned about, and init_verbose=1 logs all 183 with their index.
+Finding which command stalls becomes a bisect rather than a guess -- which is
+what the follow-up fix needs.
+
+Both knobs are module parameters, but note CONFIG_CMDLINE_FORCE=y on this
+build: the kernel command line is compiled in, and what LK passes -- and what
+`kexec --command-line` passes -- is discarded. Setting these at boot means
+editing configs/gemini-cmdline.config, not the bootloader.
+
+--- a/drivers/gpu/drm/panel/panel-solomon-ssd2092.c
++++ b/drivers/gpu/drm/panel/panel-solomon-ssd2092.c
+@@ -79,19 +79,100 @@
+  * root-caused 2026-07-11 after every other host-side difference had
+  * been eliminated.
+  */
++/*
++ * BOUNDED INITIALISATION (B-24).
++ *
++ * The init table is 183 commands and runs inside drm_panel_prepare(), which
++ * runs under the CRTC enable path during boot. Each command is individually
++ * bounded already -- mtk_dsi_host_send_cmd() waits at most 2 s for its IRQ --
++ * but two of those bounds do not abort anything: mtk_dsi_wait_for_idle()
++ * spends up to 2 s polling and then merely warns and resets the engine, and
++ * the mode switch adds another 500 ms. So a panel that answers slowly, or not
++ * at all, can spend minutes here without any single call "hanging".
++ *
++ * That is fatal rather than merely slow, because the RGU hardware watchdog
++ * fires at ~31 s and nothing pets it this early in boot. The result is a
++ * reset loop that looks, on the host, exactly like a flaky USB cable -- which
++ * is how it was misdiagnosed for most of an evening on 2026-08-20.
++ *
++ * So the sequence carries a wall-clock budget checked between commands. When
++ * it is exhausted the sequence aborts and names the command it stopped at,
++ * prepare() fails, and the kernel carries on booting with no image. A dark
++ * panel is a bad outcome; a watchdog loop is a dead device, and the whole
++ * point is that the first can never become the second.
++ *
++ * The budget is a module parameter so a diagnostic boot can widen it from the
++ * kernel command line without a rebuild:
++ *     panel_solomon_ssd2092.init_budget_ms=30000
++ */
++static unsigned int init_budget_ms = 8000;
++module_param(init_budget_ms, uint, 0644);
++MODULE_PARM_DESC(init_budget_ms,
++		 "wall-clock budget for the panel init sequence, ms (0 = unbounded; must stay well under the ~31 s watchdog)");
++
++static bool init_verbose;
++module_param(init_verbose, bool, 0644);
++MODULE_PARM_DESC(init_verbose,
++		 "log every init command with its index and elapsed time (names the stalling command)");
++
++struct ssd2092_init_ctx {
++	struct mipi_dsi_device *dsi;
++	unsigned long start;
++	unsigned long deadline;
++	unsigned int index;
++};
++
++static int ssd2092_init_cmd(struct ssd2092_init_ctx *c, const u8 *d, size_t len)
++{
++	unsigned long t0 = jiffies;
++	ssize_t ret;
++	unsigned int ms;
++
++	if (init_budget_ms && time_after(jiffies, c->deadline)) {
++		dev_err(&c->dsi->dev,
++			"init sequence exceeded its %u ms budget at command %u (0x%02x); aborting so the boot survives\n",
++			init_budget_ms, c->index, d[0]);
++		return -ETIMEDOUT;
++	}
++
++	/*
++	 * Packet-type dispatch, unchanged: commands >= 0xB0 are Novatek
++	 * manufacturer registers and must go as GENERIC packets.
++	 */
++	if (d[0] >= 0xb0)
++		ret = mipi_dsi_generic_write(c->dsi, d, len);
++	else
++		ret = mipi_dsi_dcs_write_buffer(c->dsi, d, len);
++
++	ms = jiffies_to_msecs(jiffies - t0);
++	if (ret < 0) {
++		dev_err(&c->dsi->dev,
++			"init command %u (0x%02x) failed after %u ms: %zd\n",
++			c->index, d[0], ms, ret);
++		return ret;
++	}
++	/*
++	 * Report slow commands even on success. A command that takes a second
++	 * is the one eating the budget, and knowing which one it is turns
++	 * fixing this from a guess into a bisect.
++	 */
++	if (init_verbose)
++		dev_info(&c->dsi->dev, "init command %u (0x%02x) ok in %u ms\n",
++			 c->index, d[0], ms);
++	else if (ms >= 200)
++		dev_warn(&c->dsi->dev, "init command %u (0x%02x) took %u ms\n",
++			 c->index, d[0], ms);
++
++	c->index++;
++	return 0;
++}
++
+ #define ssd2092_dcs(dsi, seq...)					\
+ ({									\
+ 	static const u8 d[] = { seq };					\
+-	ssize_t ret;							\
+-	if (d[0] >= 0xb0)						\
+-		ret = mipi_dsi_generic_write(dsi, d, ARRAY_SIZE(d));	\
+-	else								\
+-		ret = mipi_dsi_dcs_write_buffer(dsi, d, ARRAY_SIZE(d));	\
+-	if (ret < 0) {							\
+-		dev_err(&(dsi)->dev,					\
+-			"DSI write (cmd 0x%02x) failed: %zd\n", d[0], ret); \
++	int ret = ssd2092_init_cmd(&ctx, d, ARRAY_SIZE(d));		\
++	if (ret < 0)							\
+ 		return ret;						\
+-	}								\
+ })
+ 
+ /*
+@@ -102,6 +183,12 @@
+ static int ssd2092_init_sequence(struct ssd2092 *priv)
+ {
+ 	struct mipi_dsi_device *dsi = priv->dsi;
++	struct ssd2092_init_ctx ctx = {
++		.dsi = dsi,
++		.start = jiffies,
++		.deadline = jiffies + msecs_to_jiffies(init_budget_ms),
++		.index = 0,
++	};
+ 
+ 	/*
+ 	 * Novatek NT36672 vendor init table, generated mechanically from
+@@ -303,6 +390,8 @@
+ 	msleep(120);
+ 	ssd2092_dcs(dsi, 0x29, 0x00);
+ 	msleep(10);
++	dev_info(&dsi->dev, "init sequence complete: %u commands in %u ms\n",
++		 ctx.index, jiffies_to_msecs(jiffies - ctx.start));
+ 	return 0;
+ }
+ 

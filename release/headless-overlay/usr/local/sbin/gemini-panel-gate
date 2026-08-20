@@ -1,0 +1,172 @@
+#!/bin/sh
+# gemini-panel-gate — one machine-checkable answer to "is the panel correct?"
+#
+# Built BEFORE the fix it judges, deliberately. Until now "does the panel work"
+# meant asking a person to look at the glass and describe it, which is slow,
+# ambiguous, and was responsible for several hours of misdiagnosis. Worse, the
+# obvious mechanical substitute — a compositor screenshot — proves only that
+# software drew something into a buffer. It says nothing about whether light
+# left the panel. This project has already been fooled by exactly that.
+#
+# So this gate asserts on hardware state: what the DSI block was actually
+# programmed with, what the panel controller says about itself, and whether the
+# system got far enough to be asked. Photographic evidence of the glass is the
+# host's job (scripts/gemini-eyes.py); the two together are the standard of
+# evidence, and neither alone is.
+#
+# Exit status: 0 = PASS, 1 = FAIL, 2 = could not run.
+
+set -u
+
+DSI=0x1401c000
+FAIL=0
+SKIP=0
+CHECKS=0
+
+say()  { printf '%s\n' "$*"; }
+ok()   { CHECKS=$((CHECKS+1)); say "  PASS  $*"; }
+bad()  { CHECKS=$((CHECKS+1)); FAIL=$((FAIL+1)); say "  FAIL  $*"; }
+skip() { SKIP=$((SKIP+1)); say "  SKIP  $*"; }
+
+reg() {  # reg <offset-hex> -> value as 0x%08X, or empty
+    busybox devmem $(printf '0x%X' $((DSI + 0x$1))) 2>/dev/null
+}
+
+# ---------------------------------------------------------------------------
+# Golden values.
+#
+# PROVENANCE — these are not invented and not derived from mainline's formula.
+# They are what the stock LK bootloader programs into the DSI block on THIS
+# unit, read live off the hardware and recorded in boot.md capture 244
+# (2026-07-10), cross-checked against the vendor LCM
+# aeon_nt36672_fhd_dsi_vdo_x600_xinli.c (HSA/HBP/HFP = 10/42/42, VSA/VBP/VFP =
+# 3/15/10, PLL_CLOCK 440).
+#
+# LK provably lights this panel — it draws the boot splash on it. So its
+# register state is the definition of correct for this hardware, and any
+# disagreement is the kernel being wrong, not LK.
+#
+# The expensive lesson behind this file: those LK values sat in the logs for
+# six weeks and were dismissed in a code comment as "splash leftovers". They
+# were the NT36672's real parameters the whole time. Comparing against them
+# automatically is the point of the gate.
+# ---------------------------------------------------------------------------
+G_TXRX=0x0001003C   # 4 lanes, EOT enabled, HSTX_CKLP_EN
+G_PSCTRL=0x00030CA8 # packed 24-bit RGB888, 3240 bytes/line
+G_VSA=0x00000003
+G_VBP=0x0000000F    # 15
+G_VFP=0x0000000A    # 10
+G_VACT=0x00000870   # 2160
+G_HSA_WC=0x0000001C
+G_HBP_WC=0x00000094
+G_HFP_WC=0x00000074
+
+cmp_reg() {  # cmp_reg <name> <offset> <golden>
+    _n=$1; _o=$2; _g=$3
+    _v=$(reg "$_o")
+    if [ -z "$_v" ]; then
+        skip "$_n (DSI+0x$_o): could not read (devmem/CONFIG_DEVMEM?)"
+        return
+    fi
+    if [ "$_v" = "$_g" ]; then
+        ok "$_n (DSI+0x$_o) = $_v"
+    else
+        bad "$_n (DSI+0x$_o) = $_v, expected $_g"
+    fi
+}
+
+say "=== gemini-panel-gate $(date -Is 2>/dev/null) ==="
+say "kernel: $(uname -sr)"
+say
+
+# --- 1. did the boot actually complete -------------------------------------
+say "[1] boot completed"
+UP=$(cut -d. -f1 /proc/uptime)
+STATE=$(systemctl is-system-running 2>/dev/null || true)
+say "      uptime ${UP}s, systemd: ${STATE:-unknown}"
+# A watchdog boot loop never gets here at all — the gate runs from userspace,
+# so reaching this line is itself most of the evidence. What it cannot see is
+# whether *previous* boots were cut short; that is the host classifier's job
+# (gemini-state.py reports BOOTLOOP from re-enumeration cadence). Report the
+# boot record when the journal is persistent so the two can be correlated.
+if [ -d /var/log/journal ]; then
+    BOOTS=$(journalctl --list-boots 2>/dev/null | wc -l)
+    say "      persistent journal: $BOOTS boots recorded"
+else
+    say "      journal is volatile — previous boots are not visible from here;"
+    say "      use the host classifier for boot-loop detection"
+fi
+if [ "$UP" -lt 60 ]; then
+    bad "boot completed but only ${UP}s ago — too early to distinguish a"
+    say "        healthy boot from one about to be cut short by the watchdog."
+    say "        Re-run past 60s uptime."
+elif [ "$STATE" = "running" ] || [ "$STATE" = "degraded" ]; then
+    ok "reached userspace (systemd: $STATE) and stayed up ${UP}s"
+else
+    bad "systemd is '$STATE' — userspace did not come up cleanly"
+fi
+say
+
+# --- 2. DSI registers against LK's golden values ----------------------------
+say "[2] DSI block vs LK golden values"
+MODE=$(reg 14)
+case "$MODE" in
+    "")          skip "MODE_CTRL: could not read" ;;
+    0x00000003)  ok "MODE_CTRL (DSI+0x14) = $MODE (BURST video, as the NT36672 LCM declares)" ;;
+    0x00000001)  bad "MODE_CTRL (DSI+0x14) = $MODE (SYNC_PULSE) — this is the SSD2092-variant setting" ;;
+    *)           bad "MODE_CTRL (DSI+0x14) = $MODE, expected 0x00000003 (BURST)" ;;
+esac
+cmp_reg TXRX_CTRL 18 "$G_TXRX"
+cmp_reg PSCTRL    1c "$G_PSCTRL"
+cmp_reg VSA_NL    20 "$G_VSA"
+cmp_reg VBP_NL    24 "$G_VBP"
+cmp_reg VFP_NL    28 "$G_VFP"
+cmp_reg VACT_NL   2c "$G_VACT"
+cmp_reg HSA_WC    50 "$G_HSA_WC"
+cmp_reg HBP_WC    54 "$G_HBP_WC"
+cmp_reg HFP_WC    58 "$G_HFP_WC"
+say
+
+# --- 3. the panel controller's own account of itself ------------------------
+say "[3] panel status over DCS (RDDPM 0x0A)"
+RDDPM_PATH=/sys/kernel/debug/dri/0/panel_rddpm
+if [ -r "$RDDPM_PATH" ]; then
+    RD=$(cat "$RDDPM_PATH" 2>/dev/null)
+    # Vendor ESD table checks RDDPM == 0x9C: booster on, sleep out, display on.
+    if [ "$RD" = "0x9c" ] || [ "$RD" = "0x9C" ]; then
+        ok "RDDPM = $RD (booster on, sleep out, display on — vendor ESD value)"
+    else
+        bad "RDDPM = $RD, expected 0x9C per the vendor ESD table"
+    fi
+else
+    skip "no DCS read path yet ($RDDPM_PATH absent)."
+    say "        This is the one check that asks the panel rather than the SoC,"
+    say "        so it is worth having: it distinguishes 'we programmed the DSI"
+    say "        correctly' from 'the panel accepted its initialisation'. It"
+    say "        needs a debugfs hook in the panel driver; until that lands the"
+    say "        gate cannot make that distinction and says so rather than"
+    say "        quietly passing."
+fi
+say
+
+# --- 4. the driver's own complaint about blanking ---------------------------
+say "[4] D-PHY blanking warning"
+if dmesg 2>/dev/null | grep -q "HFP + HBP less than d-phy"; then
+    bad "mtk_dsi warned 'HFP + HBP less than d-phy, FPS will under 60Hz'"
+    say "        Horizontal blanking is too narrow to cover the PHY's LP-HS"
+    say "        transitions. This warning is present whenever the timings are"
+    say "        wrong and absent when they are right."
+else
+    ok "absent — blanking covers the D-PHY transitions"
+fi
+say
+
+# --- verdict ---------------------------------------------------------------
+if [ "$FAIL" -eq 0 ]; then
+    say "PANEL-GATE: PASS  [$CHECKS checks, $SKIP skipped]"
+    [ "$SKIP" -gt 0 ] && say "  NOTE: $SKIP check(s) could not run — see SKIP lines above."
+    exit 0
+else
+    say "PANEL-GATE: FAIL  [$FAIL of $CHECKS checks failed, $SKIP skipped]"
+    exit 1
+fi
