@@ -1382,6 +1382,51 @@ before relying on the device being back to a good state.
 ---
 
 
+## 🟢 B-28 — download mode is a CONTROLLABLE state, not a trap (2026-08-20)
+
+**This supersedes the long-standing note that a parked download mode "can only
+be cleared by physically holding Esc + silver + power for ~15-20 s"** (a belief
+that cost 11 h on 2026-08-06 and has shaped every operating rule since).
+Demonstrated today, twice each way, with no physical contact:
+
+**Entering it deliberately.** Reboot the device with the hub port POWERED. The
+preloader sees a host and parks: `0e8d:2000` then `0e8d:2008`. Reliable — it
+happened on both `systemctl reboot` and `adb reboot bootloader`.
+
+**Leaving it, by command.**
+```
+mtk reset                       # ask the preloader to reset
+uhubctl -e -l <hub> -p <n> -a off   # hold the port dark across the reboot
+sleep 80                        # let it get past the preloader
+uhubctl -e -l <hub> -p <n> -a on
+```
+Result: `STATE: ANDROID`, adb available. Recovered from download mode to a
+booted system with zero physical intervention.
+
+Attribution caveat, stated because it matters for building on this: `mtk reset`
+printed its "connect the phone" hint rather than clearly completing, so it is
+not proven which half did the work — the reset command, or the port-dark cycle
+letting the preloader's USB window expire so it continued booting. The
+*sequence* is reproducible; the mechanism is not yet pinned down.
+
+**Consequences.** The two remaining acceptance criteria on tracker #49 are met:
+a port held dark across a boot avoids the download-mode park, and a powered
+port during a boot enters it on purpose. More importantly, the rescue-slot
+write (#51) no longer depends on a human: download mode is now a place the lab
+can drive to and back on demand, which is where mtkclient can write p22.
+
+**Also corrected today:** a device that has parked in download mode presents
+NOTHING on the bus until the port is cycled — no connect bit, dark panel, no
+network. That looks exactly like a powered-off device and was misread as one
+here. Before concluding the device is off, cycle the port and re-check.
+
+**Not confirmed:** `adb reboot bootloader` did not reach LK's fastboot. LK
+plainly contains fastboot (`fastboot_init`, `app/mt_boot/fastboot.c`,
+lock/unlock handling), but the preloader parked in download mode first, so the
+test was masked rather than answered. Reaching fastboot would need the port
+dark through the preloader window and powered by the time LK runs — a timing
+experiment, not yet done.
+
 ## 🔴 B-26 — a booted kernel with no userspace never resets: the watchdog pets itself
 
 **Opened 2026-08-20.** The hardware watchdog cannot rescue an unattended hang
