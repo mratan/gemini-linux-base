@@ -1,0 +1,21 @@
+arm64: dts: mediatek: gemini: constrain the CMA pool below 4GB (32-bit DMA)
+
+diff --git a/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts b/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
+index e244d9cfc..c7a680dff 100644
+--- a/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
++++ b/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
+@@ -99,6 +99,14 @@ linux,cma {
+ 			reusable;
+ 			size = <0 0x8000000>;
+ 			alignment = <0 0x400000>;
++			/*
++			 * Keep the pool below 4 GB: without alloc-ranges it
++			 * lands at the top of the 4 GB DRAM (above the 32-bit
++			 * DMA limit) and every mediatek-drm dumb-buffer alloc
++			 * fails with ENOMEM while CmaFree shows 128 MB free
++			 * (2026-08-20 session — sway lost its output entirely).
++			 */
++			alloc-ranges = <0 0x40000000 0 0xC0000000>;
+ 			linux,cma-default;
+ 		};
+ 
