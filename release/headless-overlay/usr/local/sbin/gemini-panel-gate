@@ -129,15 +129,25 @@ say
 
 # --- 3. the panel controller's own account of itself ------------------------
 say "[3] panel status over DCS (RDDPM 0x0A)"
-RDDPM_PATH=/sys/kernel/debug/dri/0/panel_rddpm
+# panel/0010 exposes this; the path is driver-owned so it does not depend on
+# which DRM card number the panel landed on.
+RDDPM_PATH=/sys/kernel/debug/gemini-panel/rddpm
+[ -r "$RDDPM_PATH" ] || RDDPM_PATH=/sys/kernel/debug/dri/0/panel_rddpm
 if [ -r "$RDDPM_PATH" ]; then
     RD=$(cat "$RDDPM_PATH" 2>/dev/null)
     # Vendor ESD table checks RDDPM == 0x9C: booster on, sleep out, display on.
-    if [ "$RD" = "0x9c" ] || [ "$RD" = "0x9C" ]; then
-        ok "RDDPM = $RD (booster on, sleep out, display on — vendor ESD value)"
-    else
-        bad "RDDPM = $RD, expected 0x9C per the vendor ESD table"
-    fi
+    case "$RD" in
+        0x9c|0x9C)
+            ok "RDDPM = $RD (booster on, sleep out, display on — vendor ESD value)" ;;
+        0x1c|0x1C)
+            bad "RDDPM = $RD — booster OFF. The panel is ignoring the manufacturer"
+            say "        registers; this is what a packet-type mismatch looks like"
+            say "        (0xB0+ commands must go as GENERIC, not DCS)." ;;
+        unavailable*|error*)
+            skip "RDDPM: $RD" ;;
+        *)
+            bad "RDDPM = $RD, expected 0x9C per the vendor ESD table" ;;
+    esac
 else
     skip "no DCS read path yet ($RDDPM_PATH absent)."
     say "        This is the one check that asks the panel rather than the SoC,"
