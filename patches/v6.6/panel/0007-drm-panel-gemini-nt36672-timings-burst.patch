@@ -1,0 +1,59 @@
+drm/panel: retarget Gemini panel timings to the NT36672 variant (burst video)
+
+Single-variable test of the wrong-panel-variant root cause (PRD #34):
+mode + DSI flags only, init table unchanged, so the register readback
+cleanly distinguishes 'wrong variant' from everything else.
+
+diff --git a/drivers/gpu/drm/panel/panel-solomon-ssd2092.c b/drivers/gpu/drm/panel/panel-solomon-ssd2092.c
+index 229da17b3..19ebe1e08 100644
+--- a/drivers/gpu/drm/panel/panel-solomon-ssd2092.c
++++ b/drivers/gpu/drm/panel/panel-solomon-ssd2092.c
+@@ -422,16 +422,31 @@ static int ssd2092_unprepare(struct drm_panel *panel)
+  * boot.md).  The vendor kernel values gave the first stable fbcon on
+  * glass (build #138, banner #122, 2026-07-12).
+  */
++/*
++ * 2026-08-20: retargeted to the NT36672 variant.  LK's atag,videolfb names
++ * this unit's panel "aeon_nt36672_fhd_dsi_vdo_x600_xinli" (Novatek NT36672),
++ * NOT the Solomon SSD2092 this file was written for -- the Gemini shipped in
++ * two panel variants and the vendor tree carries an LCM for each.  Values
++ * below are the vendor LCM's (aeon_nt36672_fhd_dsi_vdo_x600_xinli.c:689-703):
++ * HSA/HBP/HFP = 10/42/42, VSA/VBP/VFP = 3/15/10, BURST video, PLL_CLOCK 440.
++ * clock = 880000 kbps * 4 lanes / 24 bpp = 146667 kHz reproduces that PLL via
++ * mtk_dsi's data_rate = clock * bpp / lanes.
++ *
++ * Cross-check: run through the vendor word-count formula these give
++ * HSA_WC/HBP_WC/HFP_WC = 0x1c/0x94/0x74, byte-exact with LK's own golden DSI
++ * dump (boot.md) -- the previous SSD2092 numbers produced 0x02/0x32/0x4e and
++ * tripped mtk_dsi's "HFP + HBP less than d-phy" warning.
++ */
+ static const struct drm_display_mode ssd2092_mode = {
+-	.clock		= 167333,
++	.clock		= 146667,
+ 	.hdisplay	= 1080,
+-	.hsync_start	= 1080 + 26,
+-	.hsync_end	= 1080 + 26 + 4,
+-	.htotal		= 1080 + 26 + 4 + 20,
++	.hsync_start	= 1080 + 42,
++	.hsync_end	= 1080 + 42 + 10,
++	.htotal		= 1080 + 42 + 10 + 42,
+ 	.vdisplay	= 2160,
+-	.vsync_start	= 2160 + 76,
+-	.vsync_end	= 2160 + 76 + 1,
+-	.vtotal		= 2160 + 76 + 1 + 43,
++	.vsync_start	= 2160 + 10,
++	.vsync_end	= 2160 + 10 + 3,
++	.vtotal		= 2160 + 10 + 3 + 15,
+ 	.width_mm	= 68,
+ 	.height_mm	= 136,
+ };
+@@ -508,7 +523,8 @@ static int ssd2092_probe(struct mipi_dsi_device *dsi)
+ 	 * EOT on the wire, and CLOCK_NON_CONTINUOUS sets HSTX_CKLP_EN,
+ 	 * making the register bit-identical to LK's.
+ 	 */
+-	dsi->mode_flags = MIPI_DSI_MODE_VIDEO | MIPI_DSI_MODE_VIDEO_SYNC_PULSE |
++	/* NT36672 variant: vendor LCM uses BURST_VDO_MODE (see mode comment). */
++	dsi->mode_flags = MIPI_DSI_MODE_VIDEO | MIPI_DSI_MODE_VIDEO_BURST |
+ 			  MIPI_DSI_MODE_LPM | MIPI_DSI_MODE_NO_EOT_PACKET |
+ 			  MIPI_DSI_CLOCK_NON_CONTINUOUS;
+ 
