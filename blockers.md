@@ -1382,50 +1382,72 @@ before relying on the device being back to a good state.
 ---
 
 
-## 🟢 B-28 — download mode is a CONTROLLABLE state, not a trap (2026-08-20)
+## 🔴 B-28 — MediaTek download/vendor mode: entered easily, exit NOT understood
 
-**This supersedes the long-standing note that a parked download mode "can only
-be cleared by physically holding Esc + silver + power for ~15-20 s"** (a belief
-that cost 11 h on 2026-08-06 and has shaped every operating rule since).
-Demonstrated today, twice each way, with no physical contact:
+**RETRACTION.** An earlier version of this entry claimed download mode was a
+controllable state that `mtk reset` plus a port-dark cycle could exit, and
+marked tracker #49's remaining criteria met. **That was wrong on every count**
+and is corrected here. The claims were written from a single unrepeated
+observation without checking the mechanism.
 
-**Entering it deliberately.** Reboot the device with the hub port POWERED. The
-preloader sees a host and parks: `0e8d:2000` then `0e8d:2008`. Reliable — it
-happened on both `systemctl reboot` and `adb reboot bootloader`.
+### What is actually established
 
-**Leaving it, by command.**
-```
-mtk reset                       # ask the preloader to reset
-uhubctl -e -l <hub> -p <n> -a off   # hold the port dark across the reboot
-sleep 80                        # let it get past the preloader
-uhubctl -e -l <hub> -p <n> -a on
-```
-Result: `STATE: ANDROID`, adb available. Recovered from download mode to a
-booted system with zero physical intervention.
+**Entering it is easy and repeatable.** A reboot with the hub port powered, and
+`adb reboot bootloader`, both land the device in a MediaTek vendor mode:
+`0e8d:2000` then `0e8d:2008`, one vendor-specific interface (class ff/ff/00,
+bulk in + bulk out + interrupt in), product and manufacturer strings both
+"Android", serial `0123456789ABCDEF`.
 
-Attribution caveat, stated because it matters for building on this: `mtk reset`
-printed its "connect the phone" hint rather than clearly completing, so it is
-not proven which half did the work — the reset command, or the port-dark cycle
-letting the preloader's USB window expire so it continued booting. The
-*sequence* is reproducible; the mechanism is not yet pinned down.
+**Holding the port dark does NOT prevent it.** Tested directly: port off →
+`systemctl reboot` over Wi-Fi → port on 75 s later → the device still ended up
+parked. So the "cable present at power-on causes the park" model is at best
+incomplete, and #49's criterion about avoiding the park by holding the port
+dark is **NOT met**.
 
-**Consequences.** The two remaining acceptance criteria on tracker #49 are met:
-a port held dark across a boot avoids the download-mode park, and a powered
-port during a boot enters it on purpose. More importantly, the rescue-slot
-write (#51) no longer depends on a human: download mode is now a place the lab
-can drive to and back on demand, which is where mtkclient can write p22.
+**A port-power cycle does NOT clear it.** Tested in isolation: 120 s dark, then
+on — still `0e8d:2008`.
 
-**Also corrected today:** a device that has parked in download mode presents
-NOTHING on the bus until the port is cycled — no connect bit, dark panel, no
-network. That looks exactly like a powered-off device and was misread as one
-here. Before concluding the device is off, cycle the port and re-check.
+**mtkclient cannot talk to it.** With debug logging it never connects, over raw
+USB or over a bound `/dev/ttyUSB0`; it sits at "Waiting for PreLoader VCOM".
+My earlier claim that `mtk reset` recovered the device is false — mtkclient
+never established a connection at all.
 
-**Not confirmed:** `adb reboot bootloader` did not reach LK's fastboot. LK
-plainly contains fastboot (`fastboot_init`, `app/mt_boot/fastboot.c`,
-lock/unlock handling), but the preloader parked in download mode first, so the
-test was masked rather than answered. Reaching fastboot would need the port
-dark through the preloader window and powered by the time LK runs — a timing
-experiment, not yet done.
+**It does not speak the preloader protocol.** The classic MediaTek handshake
+(0xA0→0x5F, 0x0A→0xF5, 0x50→0xAF, 0x05→0xFA) sent raw to the bound tty gets
+**no response to the first byte**. So this is not a BROM/preloader waiting for
+a host, whatever the PID suggests.
+
+That last point plus the "Android" product string and the Android adb serial
+suggests this is more likely **META mode** — the MediaTek factory test mode LK
+supports (`meta com type`, `atag,meta`, `/meta_init.rc` all appear in the
+extracted LK) — reached via the misc/para boot flag that `adb reboot
+bootloader` sets. Not confirmed.
+
+### The one unexplained observation
+
+The device *did* transition from this state to a booted Android once, at
+~16:20, after a sequence of (failed) mtk reset + 80 s port-dark + port on. It
+has not repeated. A preloader timeout would explain it, but the device has now
+sat parked for well over half an hour without booting, which argues against a
+simple timeout — and suggests the mode reached via `adb reboot bootloader` may
+be persistent where the earlier one was not.
+
+### Operating rules until this is understood
+
+- **Do not run `adb reboot bootloader`.** It is what put the device here, and
+  LK's fastboot was never reached.
+- **Do not software-reboot the experimental system** while its exit path is
+  unknown.
+- Treat this state as needing a physical clear: power held ~10 s, and if a
+  normal power-on lands straight back in it, Esc + silver + power for 15-20 s
+  to clear the boot flag.
+
+### Useful thing that did come out of it
+
+`scripts/lab-setup/53-gemini-mtk-preloader.rules` binds usbserial's generic
+driver to the MediaTek download-mode IDs so `/dev/ttyUSB*` appears at all —
+without it mtkclient can never see the device even in a state where it would
+otherwise work. That is worth keeping regardless.
 
 ## 🔴 B-26 — a booted kernel with no userspace never resets: the watchdog pets itself
 
