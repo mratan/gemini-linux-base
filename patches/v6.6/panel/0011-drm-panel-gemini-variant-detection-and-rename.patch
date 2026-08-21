@@ -1,0 +1,1907 @@
+drm/panel: pick the Gemini's panel at runtime, and stop naming the driver
+ after the wrong one
+
+The Gemini shipped with two panels on identical wiring — a Novatek NT36672
+and a Solomon SSD2092 — so the device tree cannot say which is fitted, and
+a build that assumes one gives a dark screen on the other. Until now this
+driver assumed, twice: first that it was an SSD2092, and then, when that
+turned out to be wrong, by being retargeted in place to the NT36672 and
+throwing the SSD2092's transcription away.
+
+Ask instead. LK probes the fitted panel at every boot and hands the kernel
+the LCM's name in the videolfb ATAG, which arrives as
+/chosen/atag,videolfb — 8 bytes of framebuffer base, an "lcm found" flag,
+fps, vram, then a NUL-terminated string. On this unit it reads
+"aeon_nt36672_fhd_dsi_vdo_x600_xinli". That is the same identity the
+vendor kernel selects its LCM driver by.
+
+So: a variant table keyed on that string, carrying each panel's mode, DSI
+mode flags (the NT36672 is BURST, the SSD2092 SYNC_PULSE) and init
+sequence. The SSD2092's 188-command sequence is restored verbatim from
+this driver's first version and marked as never having run on hardware,
+because it has not — there is no SSD2092 unit in this lab. It is here so a
+build serves both panels and so the transcription is not lost a second
+time.
+
+When LK says nothing recognisable, fall back to the NT36672 and say so at
+warn level rather than refusing to probe. A machine that boots with a
+display that might be wrong is recoverable over the network; one that
+boots with no display, on a device whose only other way in is a USB cable,
+is much less so. The message is what makes the difference diagnosable.
+
+And the rename, which is the other half of the same bug. This file was
+called panel-solomon-ssd2092.c and asserted the Solomon identity in its
+header comment for six weeks while driving a Novatek part. That is a large
+part of why B-31 survived as long as it did: the touchscreen fault was a
+display fault, and every reader who came to the display looking for a
+Novatek TDDI part found a file about a Solomon controller and moved on. It
+is now panel-gemini-fhd.c / DRM_PANEL_GEMINI_FHD, named after the machine
+rather than after either panel, with a new "planet,gemini-panel"
+compatible. "solomon,ssd2092" is kept in the match table on purpose: every
+DTB flashed before today carries it, and some of those live in boot slots
+that exist to be fallen back to.
+
+Provenance of the golden values and both generated init tables is carried
+through the move unchanged.
+
+Verified on hardware: "bootloader reports Novatek NT36672 (TDDI)
+(aeon_nt36672_fhd_dsi_vdo_x600_xinli)", init sequence 183 commands in
+156 ms — byte-identical to before — panel gate PASS 13/13, desktop
+photographed on the glass.
+
+Signed-off-by: mratan <mattdratan@gmail.com>
+
+--- a/drivers/gpu/drm/panel/panel-solomon-ssd2092.c
++++ /dev/null
+@@ -1,716 +0,0 @@
+-// SPDX-License-Identifier: GPL-2.0
+-/*
+- * Solomon SSD2092 FHD DSI panel driver
+- *
+- * Panel: 5.99" 1080x2160 MIPI DSI video-mode (sync-pulse) panel,
+- * Solomon SSD2092 controller, panel ID 0x01572098.
+- * Used on: Planet Computers Gemini PDA (MT6797X / Helio X27).
+- *
+- * This is the panel actually fitted to the Gemini PDA: the stock LK
+- * bootloader probes it at every boot ("we will use lcm:
+- * aeon_ssd2092_fhd_dsi_solomon", ID read 0x01572098). Earlier project
+- * documentation assumed the R63419 WQHD panel from the vendor DTB's
+- * videolfb template string, but that atag is a build-time default LK
+- * overwrites after probing.
+- *
+- * All hardware values (timings, lane count, init sequence, reset
+- * sequence) come from the vendor 3.18 kernel LCM driver:
+- *   drivers/misc/mediatek/lcm/aeon_ssd2092_fhd_dsi_solomon/
+- *     aeon_ssd2092_fhd_dsi_solomon.c
+- *   (gemini-android-kernel-3.18-android8 tree)
+- * Vendor params: SYNC_PULSE_VDO_MODE, LCM_FOUR_LANE, RGB888,
+- * VSA/VBP/VFP = 1/43/76, HSA/HBP/HFP = 4/20/26, PLL_CLOCK = 502 MHz.
+- *
+- * LCD bias: dual-output +/-5V charge pump (vendor calls it lp3101,
+- * same part family/address as TPS65132), I2C, addr 0x3E. Exposed here
+- * as avdd/avee regulator supplies.
+- */
+-
+-#include <linux/backlight.h>
+-#include <linux/debugfs.h>
+-#include <linux/delay.h>
+-#include <linux/gpio/consumer.h>
+-#include <linux/module.h>
+-#include <linux/of.h>
+-#include <linux/regulator/consumer.h>
+-
+-#include <video/mipi_display.h>
+-
+-#include <drm/drm_crtc.h>
+-#include <drm/drm_mipi_dsi.h>
+-#include <drm/drm_modes.h>
+-#include <drm/drm_panel.h>
+-
+-struct ssd2092 {
+-	struct drm_panel panel;
+-	struct mipi_dsi_device *dsi;
+-
+-	struct regulator *avdd;
+-	struct regulator *avee;
+-	struct gpio_desc *reset_gpio;
+-	struct backlight_device *backlight;
+-
+-	bool prepared;
+-	bool enabled;
+-
+-	struct dentry *debugfs;
+-};
+-
+-static inline struct ssd2092 *panel_to_ssd2092(struct drm_panel *panel)
+-{
+-	return container_of(panel, struct ssd2092, panel);
+-}
+-
+-/*
+- * PANEL IDENTITY (corrected 2026-08-20): this driver now targets the
+- * Novatek NT36672 variant, which is what LK reports for this unit in
+- * chosen/atag,videolfb ("aeon_nt36672_fhd_dsi_vdo_x600_xinli").  The
+- * Gemini shipped with at least two panel variants and the vendor tree
+- * compiles an LCM for each (CONFIG_CUSTOM_KERNEL_LCM lists both);
+- * LK picks one by string at boot.  The file/symbol names still say
+- * ssd2092 -- renaming is a follow-up, deliberately not mixed into the
+- * change that makes the panel light up.
+- *
+- * Packet-type dispatch matches the vendor DSI layer exactly
+- * (ddp_dsi.c DSI_set_cmdq_V2): commands >= 0xB0 (manufacturer
+- * registers -- all the analog/booster/gamma configuration) are sent
+- * as GENERIC packets (data ID 0x23/0x29); commands < 0xB0 (standard
+- * MIPI DCS) as DCS packets (0x05/0x15/0x39).  Sending the 0xB0+
+- * registers as DCS makes the panel silently ignore them: init
+- * "succeeds", status reads look sane, but the booster never starts
+- * (RDDPM 0x0a reads 0x1c instead of 0x9c) and the glass stays dark --
+- * root-caused 2026-07-11 after every other host-side difference had
+- * been eliminated.
+- */
+-/*
+- * BOUNDED INITIALISATION (B-24).
+- *
+- * The init table is 183 commands and runs inside drm_panel_prepare(), which
+- * runs under the CRTC enable path during boot. Each command is individually
+- * bounded already -- mtk_dsi_host_send_cmd() waits at most 2 s for its IRQ --
+- * but two of those bounds do not abort anything: mtk_dsi_wait_for_idle()
+- * spends up to 2 s polling and then merely warns and resets the engine, and
+- * the mode switch adds another 500 ms. So a panel that answers slowly, or not
+- * at all, can spend minutes here without any single call "hanging".
+- *
+- * That is fatal rather than merely slow, because the RGU hardware watchdog
+- * fires at ~31 s and nothing pets it this early in boot. The result is a
+- * reset loop that looks, on the host, exactly like a flaky USB cable -- which
+- * is how it was misdiagnosed for most of an evening on 2026-08-20.
+- *
+- * So the sequence carries a wall-clock budget checked between commands. When
+- * it is exhausted the sequence aborts and names the command it stopped at,
+- * prepare() fails, and the kernel carries on booting with no image. A dark
+- * panel is a bad outcome; a watchdog loop is a dead device, and the whole
+- * point is that the first can never become the second.
+- *
+- * The budget is a module parameter so a diagnostic boot can widen it from the
+- * kernel command line without a rebuild:
+- *     panel_solomon_ssd2092.init_budget_ms=30000
+- */
+-static unsigned int init_budget_ms = 8000;
+-module_param(init_budget_ms, uint, 0644);
+-MODULE_PARM_DESC(init_budget_ms,
+-		 "wall-clock budget for the panel init sequence, ms (0 = unbounded; must stay well under the ~31 s watchdog)");
+-
+-static bool init_verbose;
+-module_param(init_verbose, bool, 0644);
+-MODULE_PARM_DESC(init_verbose,
+-		 "log every init command with its index and elapsed time (names the stalling command)");
+-
+-struct ssd2092_init_ctx {
+-	struct mipi_dsi_device *dsi;
+-	unsigned long start;
+-	unsigned long deadline;
+-	unsigned int index;
+-};
+-
+-static int ssd2092_init_cmd(struct ssd2092_init_ctx *c, const u8 *d, size_t len)
+-{
+-	unsigned long t0 = jiffies;
+-	ssize_t ret;
+-	unsigned int ms;
+-
+-	if (init_budget_ms && time_after(jiffies, c->deadline)) {
+-		dev_err(&c->dsi->dev,
+-			"init sequence exceeded its %u ms budget at command %u (0x%02x); aborting so the boot survives\n",
+-			init_budget_ms, c->index, d[0]);
+-		return -ETIMEDOUT;
+-	}
+-
+-	/*
+-	 * Packet-type dispatch, unchanged: commands >= 0xB0 are Novatek
+-	 * manufacturer registers and must go as GENERIC packets.
+-	 */
+-	if (d[0] >= 0xb0)
+-		ret = mipi_dsi_generic_write(c->dsi, d, len);
+-	else
+-		ret = mipi_dsi_dcs_write_buffer(c->dsi, d, len);
+-
+-	ms = jiffies_to_msecs(jiffies - t0);
+-	if (ret < 0) {
+-		dev_err(&c->dsi->dev,
+-			"init command %u (0x%02x) failed after %u ms: %zd\n",
+-			c->index, d[0], ms, ret);
+-		return ret;
+-	}
+-	/*
+-	 * Report slow commands even on success. A command that takes a second
+-	 * is the one eating the budget, and knowing which one it is turns
+-	 * fixing this from a guess into a bisect.
+-	 */
+-	if (init_verbose)
+-		dev_info(&c->dsi->dev, "init command %u (0x%02x) ok in %u ms\n",
+-			 c->index, d[0], ms);
+-	else if (ms >= 200)
+-		dev_warn(&c->dsi->dev, "init command %u (0x%02x) took %u ms\n",
+-			 c->index, d[0], ms);
+-
+-	c->index++;
+-	return 0;
+-}
+-
+-#define ssd2092_dcs(dsi, seq...)					\
+-({									\
+-	static const u8 d[] = { seq };					\
+-	int ret = ssd2092_init_cmd(&ctx, d, ARRAY_SIZE(d));		\
+-	if (ret < 0)							\
+-		return ret;						\
+-})
+-
+-/*
+- * Vendor init_setting[] table, converted 1:1 (same commands, same
+- * parameters, same delays). Ends with sleep-out (0x11) + 120 ms and
+- * display-on (0x29) + 50 ms, as the vendor lcm_init() does.
+- */
+-static int ssd2092_init_sequence(struct ssd2092 *priv)
+-{
+-	struct mipi_dsi_device *dsi = priv->dsi;
+-	struct ssd2092_init_ctx ctx = {
+-		.dsi = dsi,
+-		.start = jiffies,
+-		.deadline = jiffies + msecs_to_jiffies(init_budget_ms),
+-		.index = 0,
+-	};
+-
+-	/*
+-	 * Novatek NT36672 vendor init table, generated mechanically from
+-	 * gemian-3.18 drivers/misc/mediatek/lcm/
+-	 * aeon_nt36672_fhd_dsi_vdo_x600_xinli (.c) init_setting[] (the live
+-	 * "#if 1" branch): 183 commands + 2 delays, in order.
+-	 *
+-	 * Page switches are "FF <page>" followed by "FB 01" (Novatek's
+-	 * commit/unlock); both are >= 0xb0 so the macro sends them as
+-	 * generic packets, as the vendor DSI layer does.  The gamma block
+-	 * is deliberately written twice -- pages 0x20 and 0x21 -- with
+-	 * identical bytes (positive and negative polarity).  Sleep-out
+-	 * (0x11) and display-on (0x29) are 1-parameter short writes here,
+-	 * matching the vendor table, not the 0-parameter forms that
+-	 * mipi_dsi_dcs_exit_sleep_mode()/_set_display_on() emit.
+-	 */
+-	ssd2092_dcs(dsi, 0xff, 0x20);
+-	ssd2092_dcs(dsi, 0xfb, 0x01);
+-	ssd2092_dcs(dsi, 0x01, 0x33);
+-	ssd2092_dcs(dsi, 0x06, 0x99);
+-	ssd2092_dcs(dsi, 0x07, 0x9e);
+-	ssd2092_dcs(dsi, 0x0e, 0x30);
+-	ssd2092_dcs(dsi, 0x0f, 0x2e);
+-	ssd2092_dcs(dsi, 0x1d, 0x33);
+-	ssd2092_dcs(dsi, 0x6d, 0x66);
+-	ssd2092_dcs(dsi, 0x68, 0x03);
+-	ssd2092_dcs(dsi, 0x69, 0x99);
+-	ssd2092_dcs(dsi, 0x89, 0x0f);
+-	ssd2092_dcs(dsi, 0x95, 0xcd);
+-	ssd2092_dcs(dsi, 0x96, 0xcd);
+-	ssd2092_dcs(dsi, 0xff, 0x24);
+-	ssd2092_dcs(dsi, 0xfb, 0x01);
+-	ssd2092_dcs(dsi, 0x00, 0x01);
+-	ssd2092_dcs(dsi, 0x01, 0x1c);
+-	ssd2092_dcs(dsi, 0x02, 0x0b);
+-	ssd2092_dcs(dsi, 0x03, 0x0c);
+-	ssd2092_dcs(dsi, 0x04, 0x29);
+-	ssd2092_dcs(dsi, 0x05, 0x0f);
+-	ssd2092_dcs(dsi, 0x06, 0x0f);
+-	ssd2092_dcs(dsi, 0x07, 0x03);
+-	ssd2092_dcs(dsi, 0x08, 0x05);
+-	ssd2092_dcs(dsi, 0x09, 0x22);
+-	ssd2092_dcs(dsi, 0x0a, 0x00);
+-	ssd2092_dcs(dsi, 0x0b, 0x24);
+-	ssd2092_dcs(dsi, 0x0c, 0x13);
+-	ssd2092_dcs(dsi, 0x0d, 0x13);
+-	ssd2092_dcs(dsi, 0x0e, 0x15);
+-	ssd2092_dcs(dsi, 0x0f, 0x15);
+-	ssd2092_dcs(dsi, 0x10, 0x17);
+-	ssd2092_dcs(dsi, 0x11, 0x17);
+-	ssd2092_dcs(dsi, 0x12, 0x01);
+-	ssd2092_dcs(dsi, 0x13, 0x1c);
+-	ssd2092_dcs(dsi, 0x14, 0x0b);
+-	ssd2092_dcs(dsi, 0x15, 0x0c);
+-	ssd2092_dcs(dsi, 0x16, 0x29);
+-	ssd2092_dcs(dsi, 0x17, 0x0f);
+-	ssd2092_dcs(dsi, 0x18, 0x0f);
+-	ssd2092_dcs(dsi, 0x19, 0x04);
+-	ssd2092_dcs(dsi, 0x1a, 0x06);
+-	ssd2092_dcs(dsi, 0x1b, 0x23);
+-	ssd2092_dcs(dsi, 0x1c, 0x0f);
+-	ssd2092_dcs(dsi, 0x1d, 0x24);
+-	ssd2092_dcs(dsi, 0x1e, 0x13);
+-	ssd2092_dcs(dsi, 0x1f, 0x13);
+-	ssd2092_dcs(dsi, 0x20, 0x15);
+-	ssd2092_dcs(dsi, 0x21, 0x15);
+-	ssd2092_dcs(dsi, 0x22, 0x17);
+-	ssd2092_dcs(dsi, 0x23, 0x17);
+-	ssd2092_dcs(dsi, 0x2f, 0x04);
+-	ssd2092_dcs(dsi, 0x30, 0x08);
+-	ssd2092_dcs(dsi, 0x31, 0x04);
+-	ssd2092_dcs(dsi, 0x32, 0x08);
+-	ssd2092_dcs(dsi, 0x33, 0x04);
+-	ssd2092_dcs(dsi, 0x34, 0x04);
+-	ssd2092_dcs(dsi, 0x35, 0x00);
+-	ssd2092_dcs(dsi, 0x37, 0x09);
+-	ssd2092_dcs(dsi, 0x38, 0x75);
+-	ssd2092_dcs(dsi, 0x39, 0x75);
+-	ssd2092_dcs(dsi, 0x3b, 0xc0);
+-	ssd2092_dcs(dsi, 0x3f, 0x75);
+-	ssd2092_dcs(dsi, 0x60, 0x10);
+-	ssd2092_dcs(dsi, 0x61, 0x00);
+-	ssd2092_dcs(dsi, 0x68, 0xc2);
+-	ssd2092_dcs(dsi, 0x78, 0x80);
+-	ssd2092_dcs(dsi, 0x79, 0x23);
+-	ssd2092_dcs(dsi, 0x7a, 0x10);
+-	ssd2092_dcs(dsi, 0x7b, 0x9b);
+-	ssd2092_dcs(dsi, 0x7c, 0x80);
+-	ssd2092_dcs(dsi, 0x7d, 0x06);
+-	ssd2092_dcs(dsi, 0x7e, 0x02);
+-	ssd2092_dcs(dsi, 0x8e, 0xf0);
+-	ssd2092_dcs(dsi, 0x92, 0x76);
+-	ssd2092_dcs(dsi, 0x93, 0x0a);
+-	ssd2092_dcs(dsi, 0x94, 0x0a);
+-	ssd2092_dcs(dsi, 0x99, 0x33);
+-	ssd2092_dcs(dsi, 0x9b, 0xff);
+-	ssd2092_dcs(dsi, 0x9f, 0x00);
+-	ssd2092_dcs(dsi, 0xa3, 0x91);
+-	ssd2092_dcs(dsi, 0xb3, 0x00);
+-	ssd2092_dcs(dsi, 0xb4, 0x00);
+-	ssd2092_dcs(dsi, 0xb5, 0x04);
+-	ssd2092_dcs(dsi, 0xdc, 0x40);
+-	ssd2092_dcs(dsi, 0xdd, 0x03);
+-	ssd2092_dcs(dsi, 0xde, 0x01);
+-	ssd2092_dcs(dsi, 0xdf, 0x3d);
+-	ssd2092_dcs(dsi, 0xe0, 0x3d);
+-	ssd2092_dcs(dsi, 0xe1, 0x22);
+-	ssd2092_dcs(dsi, 0xe2, 0x24);
+-	ssd2092_dcs(dsi, 0xe3, 0x0a);
+-	ssd2092_dcs(dsi, 0xe4, 0x0a);
+-	ssd2092_dcs(dsi, 0xe8, 0x01);
+-	ssd2092_dcs(dsi, 0xe9, 0x10);
+-	ssd2092_dcs(dsi, 0xed, 0x40);
+-	ssd2092_dcs(dsi, 0xff, 0x25);
+-	ssd2092_dcs(dsi, 0xfb, 0x01);
+-	ssd2092_dcs(dsi, 0x0a, 0x81);
+-	ssd2092_dcs(dsi, 0x0b, 0xcd);
+-	ssd2092_dcs(dsi, 0x0c, 0x01);
+-	ssd2092_dcs(dsi, 0x17, 0x82);
+-	ssd2092_dcs(dsi, 0x21, 0x1b);
+-	ssd2092_dcs(dsi, 0x22, 0x1b);
+-	ssd2092_dcs(dsi, 0x24, 0x76);
+-	ssd2092_dcs(dsi, 0x25, 0x76);
+-	ssd2092_dcs(dsi, 0x30, 0x2a);
+-	ssd2092_dcs(dsi, 0x31, 0x2a);
+-	ssd2092_dcs(dsi, 0x38, 0x2a);
+-	ssd2092_dcs(dsi, 0x3f, 0x11);
+-	ssd2092_dcs(dsi, 0x40, 0x3a);
+-	ssd2092_dcs(dsi, 0x4b, 0x31);
+-	ssd2092_dcs(dsi, 0x4c, 0x3a);
+-	ssd2092_dcs(dsi, 0x58, 0x22);
+-	ssd2092_dcs(dsi, 0x59, 0x05);
+-	ssd2092_dcs(dsi, 0x5a, 0x0a);
+-	ssd2092_dcs(dsi, 0x5b, 0x0a);
+-	ssd2092_dcs(dsi, 0x5c, 0x25);
+-	ssd2092_dcs(dsi, 0x5d, 0x80);
+-	ssd2092_dcs(dsi, 0x5e, 0x80);
+-	ssd2092_dcs(dsi, 0x5f, 0x28);
+-	ssd2092_dcs(dsi, 0x62, 0x3f);
+-	ssd2092_dcs(dsi, 0x63, 0x82);
+-	ssd2092_dcs(dsi, 0x65, 0x00);
+-	ssd2092_dcs(dsi, 0x66, 0xdd);
+-	ssd2092_dcs(dsi, 0x6c, 0x6d);
+-	ssd2092_dcs(dsi, 0x71, 0x6d);
+-	ssd2092_dcs(dsi, 0x78, 0x25);
+-	ssd2092_dcs(dsi, 0xc3, 0x00);
+-	ssd2092_dcs(dsi, 0xff, 0x26);
+-	ssd2092_dcs(dsi, 0xfb, 0x01);
+-	ssd2092_dcs(dsi, 0x06, 0xc8);
+-	ssd2092_dcs(dsi, 0x12, 0x5a);
+-	ssd2092_dcs(dsi, 0x19, 0x09);
+-	ssd2092_dcs(dsi, 0x1a, 0x84);
+-	ssd2092_dcs(dsi, 0x1c, 0xfa);
+-	ssd2092_dcs(dsi, 0x1d, 0x09);
+-	ssd2092_dcs(dsi, 0x1e, 0x0b);
+-	ssd2092_dcs(dsi, 0x99, 0x20);
+-	ssd2092_dcs(dsi, 0xff, 0x27);
+-	ssd2092_dcs(dsi, 0xfb, 0x01);
+-	ssd2092_dcs(dsi, 0x13, 0x08);
+-	ssd2092_dcs(dsi, 0x14, 0x43);
+-	ssd2092_dcs(dsi, 0x16, 0xb8);
+-	ssd2092_dcs(dsi, 0x17, 0xb8);
+-	ssd2092_dcs(dsi, 0x7a, 0x02);
+-	ssd2092_dcs(dsi, 0xff, 0x20);
+-	ssd2092_dcs(dsi, 0xfb, 0x01);
+-	ssd2092_dcs(dsi, 0xb0, 0x00, 0xaa, 0x00, 0xb6, 0x00, 0xc8, 0x00, 0xd9, 0x00, 0xea, 0x00, 0xf6, 0x01, 0x07, 0x01, 0x11);
+-	ssd2092_dcs(dsi, 0xb1, 0x01, 0x1c, 0x01, 0x40, 0x01, 0x60, 0x01, 0x90, 0x01, 0xb6, 0x01, 0xf1, 0x02, 0x1b, 0x02, 0x1d);
+-	ssd2092_dcs(dsi, 0xb2, 0x02, 0x46, 0x02, 0x75, 0x02, 0x93, 0x02, 0xbe, 0x02, 0xdc, 0x03, 0x08, 0x03, 0x16, 0x03, 0x24);
+-	ssd2092_dcs(dsi, 0xb3, 0x03, 0x35, 0x03, 0x49, 0x03, 0x62, 0x03, 0x84, 0x03, 0xb3, 0x03, 0xff);
+-	ssd2092_dcs(dsi, 0xb4, 0x01, 0x03, 0x01, 0x09, 0x01, 0x15, 0x01, 0x20, 0x01, 0x2a, 0x01, 0x34, 0x01, 0x3c, 0x01, 0x45);
+-	ssd2092_dcs(dsi, 0xb5, 0x01, 0x4d, 0x01, 0x6a, 0x01, 0x82, 0x01, 0xaa, 0x01, 0xca, 0x01, 0xfe, 0x02, 0x25, 0x02, 0x26);
+-	ssd2092_dcs(dsi, 0xb6, 0x02, 0x4d, 0x02, 0x7a, 0x02, 0x9a, 0x02, 0xc3, 0x02, 0xe1, 0x03, 0x0e, 0x03, 0x1c, 0x03, 0x2a);
+-	ssd2092_dcs(dsi, 0xb7, 0x03, 0x3a, 0x03, 0x4e, 0x03, 0x66, 0x03, 0x88, 0x03, 0xb5, 0x03, 0xff);
+-	ssd2092_dcs(dsi, 0xb8, 0x00, 0x00, 0x00, 0x34, 0x00, 0x6c, 0x00, 0x92, 0x00, 0xad, 0x00, 0xc4, 0x00, 0xdc, 0x00, 0xeb);
+-	ssd2092_dcs(dsi, 0xb9, 0x00, 0xfc, 0x01, 0x2d, 0x01, 0x53, 0x01, 0x8a, 0x01, 0xb3, 0x01, 0xf1, 0x02, 0x1c, 0x02, 0x1d);
+-	ssd2092_dcs(dsi, 0xba, 0x02, 0x46, 0x02, 0x75, 0x02, 0x94, 0x02, 0xbf, 0x02, 0xdd, 0x03, 0x0a, 0x03, 0x16, 0x03, 0x25);
+-	ssd2092_dcs(dsi, 0xbb, 0x03, 0x35, 0x03, 0x49, 0x03, 0x61, 0x03, 0x7d, 0x03, 0xb1, 0x03, 0xff);
+-	ssd2092_dcs(dsi, 0xff, 0x21);
+-	ssd2092_dcs(dsi, 0xfb, 0x01);
+-	ssd2092_dcs(dsi, 0xb0, 0x00, 0xaa, 0x00, 0xb6, 0x00, 0xc8, 0x00, 0xd9, 0x00, 0xea, 0x00, 0xf6, 0x01, 0x07, 0x01, 0x11);
+-	ssd2092_dcs(dsi, 0xb1, 0x01, 0x1c, 0x01, 0x40, 0x01, 0x60, 0x01, 0x90, 0x01, 0xb6, 0x01, 0xf1, 0x02, 0x1b, 0x02, 0x1d);
+-	ssd2092_dcs(dsi, 0xb2, 0x02, 0x46, 0x02, 0x75, 0x02, 0x93, 0x02, 0xbe, 0x02, 0xdc, 0x03, 0x08, 0x03, 0x16, 0x03, 0x24);
+-	ssd2092_dcs(dsi, 0xb3, 0x03, 0x35, 0x03, 0x49, 0x03, 0x62, 0x03, 0x84, 0x03, 0xb3, 0x03, 0xff);
+-	ssd2092_dcs(dsi, 0xb4, 0x01, 0x03, 0x01, 0x09, 0x01, 0x15, 0x01, 0x20, 0x01, 0x2a, 0x01, 0x34, 0x01, 0x3c, 0x01, 0x45);
+-	ssd2092_dcs(dsi, 0xb5, 0x01, 0x4d, 0x01, 0x6a, 0x01, 0x82, 0x01, 0xaa, 0x01, 0xca, 0x01, 0xfe, 0x02, 0x25, 0x02, 0x26);
+-	ssd2092_dcs(dsi, 0xb6, 0x02, 0x4d, 0x02, 0x7a, 0x02, 0x9a, 0x02, 0xc3, 0x02, 0xe1, 0x03, 0x0e, 0x03, 0x1c, 0x03, 0x2a);
+-	ssd2092_dcs(dsi, 0xb7, 0x03, 0x3a, 0x03, 0x4e, 0x03, 0x66, 0x03, 0x88, 0x03, 0xb5, 0x03, 0xff);
+-	ssd2092_dcs(dsi, 0xb8, 0x00, 0x00, 0x00, 0x34, 0x00, 0x6c, 0x00, 0x92, 0x00, 0xad, 0x00, 0xc4, 0x00, 0xdc, 0x00, 0xeb);
+-	ssd2092_dcs(dsi, 0xb9, 0x00, 0xfc, 0x01, 0x2d, 0x01, 0x53, 0x01, 0x8a, 0x01, 0xb3, 0x01, 0xf1, 0x02, 0x1c, 0x02, 0x1d);
+-	ssd2092_dcs(dsi, 0xba, 0x02, 0x46, 0x02, 0x75, 0x02, 0x94, 0x02, 0xbf, 0x02, 0xdd, 0x03, 0x0a, 0x03, 0x16, 0x03, 0x25);
+-	ssd2092_dcs(dsi, 0xbb, 0x03, 0x35, 0x03, 0x49, 0x03, 0x61, 0x03, 0x7d, 0x03, 0xb1, 0x03, 0xff);
+-	ssd2092_dcs(dsi, 0xff, 0x10);
+-	ssd2092_dcs(dsi, 0xfb, 0x01);
+-	ssd2092_dcs(dsi, 0x51, 0xff);
+-	ssd2092_dcs(dsi, 0x53, 0x24);
+-	ssd2092_dcs(dsi, 0x55, 0x00);
+-	ssd2092_dcs(dsi, 0x36, 0x03);
+-	ssd2092_dcs(dsi, 0x11, 0x00);
+-	msleep(120);
+-	ssd2092_dcs(dsi, 0x29, 0x00);
+-	msleep(10);
+-	dev_info(&dsi->dev, "init sequence complete: %u commands in %u ms\n",
+-		 ctx.index, jiffies_to_msecs(jiffies - ctx.start));
+-	return 0;
+-}
+-
+-static int ssd2092_prepare(struct drm_panel *panel)
+-{
+-	struct ssd2092 *priv = panel_to_ssd2092(panel);
+-	int ret;
+-
+-	if (priv->prepared)
+-		return 0;
+-
+-	/* Vendor lcm_poweron(): reset asserted while bias comes up. */
+-	gpiod_set_value_cansleep(priv->reset_gpio, 1);
+-
+-	ret = regulator_enable(priv->avdd);
+-	if (ret < 0) {
+-		dev_err(panel->dev, "failed to enable avdd: %d\n", ret);
+-		return ret;
+-	}
+-
+-	ret = regulator_enable(priv->avee);
+-	if (ret < 0) {
+-		dev_err(panel->dev, "failed to enable avee: %d\n", ret);
+-		goto disable_avdd;
+-	}
+-
+-	msleep(20);
+-
+-	/* Vendor reset dance: release 10 ms, assert 10 ms, release 20 ms. */
+-	gpiod_set_value_cansleep(priv->reset_gpio, 0);
+-	msleep(10);
+-	gpiod_set_value_cansleep(priv->reset_gpio, 1);
+-	msleep(10);
+-	gpiod_set_value_cansleep(priv->reset_gpio, 0);
+-	msleep(20);
+-
+-	ret = ssd2092_init_sequence(priv);
+-	if (ret < 0) {
+-		dev_err(panel->dev, "init sequence failed: %d\n", ret);
+-		goto disable_avee;
+-	}
+-
+-	priv->prepared = true;
+-	return 0;
+-
+-disable_avee:
+-	/* Leave reset asserted so a retry starts from a known state. */
+-	gpiod_set_value_cansleep(priv->reset_gpio, 1);
+-	regulator_disable(priv->avee);
+-disable_avdd:
+-	regulator_disable(priv->avdd);
+-	return ret;
+-}
+-
+-static int ssd2092_enable(struct drm_panel *panel)
+-{
+-	struct ssd2092 *priv = panel_to_ssd2092(panel);
+-
+-	if (priv->enabled)
+-		return 0;
+-
+-	/* Sleep-out and display-on are part of the vendor init table. */
+-	if (priv->backlight)
+-		backlight_enable(priv->backlight);
+-
+-	priv->enabled = true;
+-	return 0;
+-}
+-
+-static int ssd2092_disable(struct drm_panel *panel)
+-{
+-	struct ssd2092 *priv = panel_to_ssd2092(panel);
+-	struct mipi_dsi_device *dsi = priv->dsi;
+-
+-	if (!priv->enabled)
+-		return 0;
+-
+-	if (priv->backlight)
+-		backlight_disable(priv->backlight);
+-
+-	/* Vendor lcm_suspend_setting: display off, 50 ms, sleep in, 120 ms. */
+-	mipi_dsi_dcs_set_display_off(dsi);
+-	msleep(50);
+-	mipi_dsi_dcs_enter_sleep_mode(dsi);
+-	msleep(120);
+-
+-	priv->enabled = false;
+-	return 0;
+-}
+-
+-static int ssd2092_unprepare(struct drm_panel *panel)
+-{
+-	struct ssd2092 *priv = panel_to_ssd2092(panel);
+-
+-	if (!priv->prepared)
+-		return 0;
+-
+-	gpiod_set_value_cansleep(priv->reset_gpio, 1);
+-	msleep(10);
+-
+-	regulator_disable(priv->avee);
+-	regulator_disable(priv->avdd);
+-
+-	priv->prepared = false;
+-	return 0;
+-}
+-
+-/*
+- * Timing from the vendor KERNEL video-mode LCM driver
+- * (aeon_ssd2092_fhd_dsi_solomon.c: HFP=26 HSA=4 HBP=20, VFP=76 VSA=1
+- * VBP=43, PLL_CLOCK=502 -> 1004 Mbps/lane -> pixclk 1004e6*4/24 =
+- * 167333 kHz, ~65 Hz).  Earlier revisions reverse-engineered timings
+- * from LK's register dump instead (VSA=3 VBP=15 VFP=10, 880 Mbps) --
+- * but LK drives this panel in COMMAND mode for its one-shot splash, so
+- * its video porch registers are leftovers that don't apply; using them
+- * produced folded lines and loss of sync (builds #136/#105-#111,
+- * boot.md).  The vendor kernel values gave the first stable fbcon on
+- * glass (build #138, banner #122, 2026-07-12).
+- */
+-/*
+- * 2026-08-20: retargeted to the NT36672 variant.  LK's atag,videolfb names
+- * this unit's panel "aeon_nt36672_fhd_dsi_vdo_x600_xinli" (Novatek NT36672),
+- * NOT the Solomon SSD2092 this file was written for -- the Gemini shipped in
+- * two panel variants and the vendor tree carries an LCM for each.  Values
+- * below are the vendor LCM's (aeon_nt36672_fhd_dsi_vdo_x600_xinli.c:689-703):
+- * HSA/HBP/HFP = 10/42/42, VSA/VBP/VFP = 3/15/10, BURST video, PLL_CLOCK 440.
+- * clock = 880000 kbps * 4 lanes / 24 bpp = 146667 kHz reproduces that PLL via
+- * mtk_dsi's data_rate = clock * bpp / lanes.
+- *
+- * Cross-check: run through the vendor word-count formula these give
+- * HSA_WC/HBP_WC/HFP_WC = 0x1c/0x94/0x74, byte-exact with LK's own golden DSI
+- * dump (boot.md) -- the previous SSD2092 numbers produced 0x02/0x32/0x4e and
+- * tripped mtk_dsi's "HFP + HBP less than d-phy" warning.
+- */
+-static const struct drm_display_mode ssd2092_mode = {
+-	.clock		= 146667,
+-	.hdisplay	= 1080,
+-	.hsync_start	= 1080 + 42,
+-	.hsync_end	= 1080 + 42 + 10,
+-	.htotal		= 1080 + 42 + 10 + 42,
+-	.vdisplay	= 2160,
+-	.vsync_start	= 2160 + 10,
+-	.vsync_end	= 2160 + 10 + 3,
+-	.vtotal		= 2160 + 10 + 3 + 15,
+-	.width_mm	= 68,
+-	.height_mm	= 136,
+-};
+-
+-static int ssd2092_get_modes(struct drm_panel *panel,
+-			     struct drm_connector *connector)
+-{
+-	struct drm_display_mode *mode;
+-
+-	mode = drm_mode_duplicate(connector->dev, &ssd2092_mode);
+-	if (!mode)
+-		return -ENOMEM;
+-
+-	drm_mode_set_name(mode);
+-	mode->type = DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED;
+-	drm_mode_probed_add(connector, mode);
+-
+-	connector->display_info.width_mm = ssd2092_mode.width_mm;
+-	connector->display_info.height_mm = ssd2092_mode.height_mm;
+-
+-	return 1;
+-}
+-
+-static const struct drm_panel_funcs ssd2092_panel_funcs = {
+-	.prepare	= ssd2092_prepare,
+-	.enable		= ssd2092_enable,
+-	.disable	= ssd2092_disable,
+-	.unprepare	= ssd2092_unprepare,
+-	.get_modes	= ssd2092_get_modes,
+-};
+-
+-/*
+- * ASK THE PANEL, not the SoC.
+- *
+- * Every other check available to the panel gate reads state the SoC was
+- * programmed with — which proves we sent the right thing, not that the panel
+- * accepted it. RDDPM (DCS 0x0A, Get Power Mode) is the panel controller's own
+- * account of itself, and the vendor's ESD table declares 0x9C for a correctly
+- * initialised panel: booster on, sleep out, display on. The difference matters:
+- * during the 2026-07-11 investigation the init "succeeded" and every host-side
+- * register looked right while RDDPM read 0x1C, because the manufacturer
+- * registers were being sent as DCS instead of generic packets and the panel
+- * was silently ignoring them.
+- *
+- * There is no userspace path for a DCS read, so the gate had to skip this
+- * check entirely. This exposes one.
+- *
+- * Reads are only attempted while the panel is prepared; the DSI host switches
+- * to command mode for the transfer and back afterwards, and that transfer is
+- * bounded by mtk_dsi (2 s), so a dead panel cannot wedge a reader here.
+- */
+-static int ssd2092_rddpm_show(struct seq_file *s, void *unused)
+-{
+-	struct ssd2092 *priv = s->private;
+-	u8 val = 0;
+-	int ret;
+-
+-	if (!priv->prepared) {
+-		seq_puts(s, "unavailable: panel not prepared\n");
+-		return 0;
+-	}
+-
+-	ret = mipi_dsi_dcs_read(priv->dsi, MIPI_DCS_GET_POWER_MODE, &val, 1);
+-	if (ret < 0) {
+-		seq_printf(s, "error: %d\n", ret);
+-		return 0;
+-	}
+-	if (ret != 1) {
+-		seq_printf(s, "error: short read (%d bytes)\n", ret);
+-		return 0;
+-	}
+-
+-	seq_printf(s, "0x%02x\n", val);
+-	return 0;
+-}
+-DEFINE_SHOW_ATTRIBUTE(ssd2092_rddpm);
+-
+-static int ssd2092_probe(struct mipi_dsi_device *dsi)
+-{
+-	struct device *dev = &dsi->dev;
+-	struct ssd2092 *priv;
+-	int ret;
+-
+-	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
+-	if (!priv)
+-		return -ENOMEM;
+-
+-	priv->dsi = dsi;
+-	mipi_dsi_set_drvdata(dsi, priv);
+-
+-	priv->avdd = devm_regulator_get(dev, "avdd");
+-	if (IS_ERR(priv->avdd))
+-		return dev_err_probe(dev, PTR_ERR(priv->avdd), "avdd regulator\n");
+-
+-	priv->avee = devm_regulator_get(dev, "avee");
+-	if (IS_ERR(priv->avee))
+-		return dev_err_probe(dev, PTR_ERR(priv->avee), "avee regulator\n");
+-
+-	priv->reset_gpio = devm_gpiod_get(dev, "reset", GPIOD_OUT_HIGH);
+-	if (IS_ERR(priv->reset_gpio))
+-		return dev_err_probe(dev, PTR_ERR(priv->reset_gpio), "reset gpio\n");
+-
+-	priv->backlight = devm_of_find_backlight(dev);
+-	if (IS_ERR(priv->backlight))
+-		return dev_err_probe(dev, PTR_ERR(priv->backlight), "backlight\n");
+-
+-	drm_panel_init(&priv->panel, dev, &ssd2092_panel_funcs,
+-		       DRM_MODE_CONNECTOR_DSI);
+-
+-	drm_panel_add(&priv->panel);
+-
+-	dsi->lanes = 4;
+-	dsi->format = MIPI_DSI_FMT_RGB888;
+-	/*
+-	 * LK's working TXRX_CTRL is 0x0001003c: EOT packets enabled (bit 6
+-	 * DIS_EOT clear) and HS clock allowed into LP between transmissions
+-	 * (bit 16 HSTX_CKLP_EN set).  mtk_dsi's DIS_EOT handling is inverted
+-	 * relative to the flag name: it sets DIS_EOT unless the panel asks
+-	 * for MIPI_DSI_MODE_NO_EOT_PACKET — so NO_EOT_PACKET here *enables*
+-	 * EOT on the wire, and CLOCK_NON_CONTINUOUS sets HSTX_CKLP_EN,
+-	 * making the register bit-identical to LK's.
+-	 */
+-	/* NT36672 variant: vendor LCM uses BURST_VDO_MODE (see mode comment). */
+-	dsi->mode_flags = MIPI_DSI_MODE_VIDEO | MIPI_DSI_MODE_VIDEO_BURST |
+-			  MIPI_DSI_MODE_LPM | MIPI_DSI_MODE_NO_EOT_PACKET |
+-			  MIPI_DSI_CLOCK_NON_CONTINUOUS;
+-
+-	ret = mipi_dsi_attach(dsi);
+-	if (ret < 0) {
+-		dev_err(dev, "failed to attach DSI: %d\n", ret);
+-		drm_panel_remove(&priv->panel);
+-		return ret;
+-	}
+-
+-	/*
+-	 * Diagnostics live under a fixed, driver-owned path rather than under
+-	 * the DRM device's directory, so the gate can find them without
+-	 * knowing which card number the panel landed on.
+-	 */
+-	priv->debugfs = debugfs_create_dir("gemini-panel", NULL);
+-	debugfs_create_file("rddpm", 0444, priv->debugfs, priv,
+-			    &ssd2092_rddpm_fops);
+-
+-	dev_info(dev, "Solomon SSD2092 FHD DSI panel registered\n");
+-	return 0;
+-}
+-
+-static void ssd2092_remove(struct mipi_dsi_device *dsi)
+-{
+-	struct ssd2092 *priv = mipi_dsi_get_drvdata(dsi);
+-
+-	debugfs_remove_recursive(priv->debugfs);
+-	mipi_dsi_detach(dsi);
+-	drm_panel_remove(&priv->panel);
+-}
+-
+-static const struct of_device_id ssd2092_of_match[] = {
+-	{ .compatible = "solomon,ssd2092" },
+-	{ }
+-};
+-MODULE_DEVICE_TABLE(of, ssd2092_of_match);
+-
+-static struct mipi_dsi_driver ssd2092_driver = {
+-	.probe  = ssd2092_probe,
+-	.remove = ssd2092_remove,
+-	.driver = {
+-		.name = "panel-solomon-ssd2092",
+-		.of_match_table = ssd2092_of_match,
+-	},
+-};
+-module_mipi_dsi_driver(ssd2092_driver);
+-
+-MODULE_AUTHOR("Ben Hamilton <ben@wakatipu.co>");
+-MODULE_DESCRIPTION("Solomon SSD2092 FHD DSI panel (Gemini PDA)");
+-MODULE_LICENSE("GPL");
+--- /dev/null
++++ b/drivers/gpu/drm/panel/panel-gemini-fhd.c
+@@ -0,0 +1,1095 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Planet Computers Gemini PDA FHD DSI panel driver
++ *
++ * 5.99" 1080x2160 MIPI DSI video-mode panel on the MT6797X (Helio X27).
++ *
++ * THE GEMINI SHIPPED WITH TWO DIFFERENT PANELS, wired identically, so the
++ * device tree cannot say which one is present. The stock LK bootloader probes
++ * it at every boot and publishes the LCM's name; this driver reads that and
++ * selects the matching timings, DSI mode and init sequence at runtime, so one
++ * image serves both:
++ *
++ *   aeon_nt36672_fhd_dsi_vdo_x600_xinli  Novatek NT36672, a TDDI part (the
++ *                                        touch controller is on the same die
++ *                                        and power domain — see
++ *                                        drivers/input/touchscreen/gemini-nt36xxx.c)
++ *   aeon_ssd2092_fhd_dsi_solomon         Solomon SSD2092, panel ID 0x01572098
++ *
++ * This file was called panel-solomon-ssd2092.c and asserted the SSD2092
++ * identity in this comment for six weeks while driving an NT36672, which is a
++ * large part of why the touchscreen bug (B-31) survived as long as it did:
++ * every reader who came to the display looking for a Novatek part found a
++ * Solomon one and moved on. The name now matches the hardware, which is to say
++ * it names neither panel.
++ *
++ * All hardware values (timings, lane count, init sequences, reset sequence)
++ * come from the vendor 3.18 kernel LCM drivers:
++ *   drivers/misc/mediatek/lcm/aeon_nt36672_fhd_dsi_vdo_x600_xinli/
++ *   drivers/misc/mediatek/lcm/aeon_ssd2092_fhd_dsi_solomon/
++ * (gemian-android-kernel-3.18-android8 tree). Only the NT36672 path has ever
++ * run on hardware; see the comment on ssd2092_init_sequence().
++ *
++ * LCD bias: dual-output +/-5V charge pump (vendor calls it lp3101, same part
++ * family/address as TPS65132), I2C, addr 0x3E. Exposed here as avdd/avee
++ * regulator supplies.
++ */
++
++#include <linux/backlight.h>
++#include <linux/debugfs.h>
++#include <linux/delay.h>
++#include <linux/gpio/consumer.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/regulator/consumer.h>
++
++#include <video/mipi_display.h>
++
++#include <drm/drm_crtc.h>
++#include <drm/drm_mipi_dsi.h>
++#include <drm/drm_modes.h>
++#include <drm/drm_panel.h>
++
++/*
++ * One fitted panel. The Gemini shipped with two, and which one is present is
++ * not knowable from the device tree: the board is identical either way. LK
++ * probes it at every boot and publishes the LCM's name, so that is what we
++ * ask. See gemini_panel_detect().
++ */
++struct gemini_panel;
++
++struct gemini_panel_variant {
++	const char			*lcm;	/* LK's atag,videolfb name */
++	const char			*name;	/* for humans and the log */
++	const struct drm_display_mode	*mode;
++	unsigned long			mode_flags;
++	int				(*init)(struct gemini_panel *priv);
++};
++
++struct gemini_panel {
++	const struct gemini_panel_variant *variant;
++	struct drm_panel panel;
++	struct mipi_dsi_device *dsi;
++
++	struct regulator *avdd;
++	struct regulator *avee;
++	struct gpio_desc *reset_gpio;
++	struct backlight_device *backlight;
++
++	bool prepared;
++	bool enabled;
++
++	struct dentry *debugfs;
++};
++
++static inline struct gemini_panel *panel_to_gemini_panel(struct drm_panel *panel)
++{
++	return container_of(panel, struct gemini_panel, panel);
++}
++
++/*
++ * PANEL IDENTITY (corrected 2026-08-20): this driver now targets the
++ * Novatek NT36672 variant, which is what LK reports for this unit in
++ * chosen/atag,videolfb ("aeon_nt36672_fhd_dsi_vdo_x600_xinli").  The
++ * Gemini shipped with at least two panel variants and the vendor tree
++ * compiles an LCM for each (CONFIG_CUSTOM_KERNEL_LCM lists both);
++ * LK picks one by string at boot.  The file/symbol names still say
++ * ssd2092 -- renaming is a follow-up, deliberately not mixed into the
++ * change that makes the panel light up.
++ *
++ * Packet-type dispatch matches the vendor DSI layer exactly
++ * (ddp_dsi.c DSI_set_cmdq_V2): commands >= 0xB0 (manufacturer
++ * registers -- all the analog/booster/gamma configuration) are sent
++ * as GENERIC packets (data ID 0x23/0x29); commands < 0xB0 (standard
++ * MIPI DCS) as DCS packets (0x05/0x15/0x39).  Sending the 0xB0+
++ * registers as DCS makes the panel silently ignore them: init
++ * "succeeds", status reads look sane, but the booster never starts
++ * (RDDPM 0x0a reads 0x1c instead of 0x9c) and the glass stays dark --
++ * root-caused 2026-07-11 after every other host-side difference had
++ * been eliminated.
++ */
++/*
++ * BOUNDED INITIALISATION (B-24).
++ *
++ * The init table is 183 commands and runs inside drm_panel_prepare(), which
++ * runs under the CRTC enable path during boot. Each command is individually
++ * bounded already -- mtk_dsi_host_send_cmd() waits at most 2 s for its IRQ --
++ * but two of those bounds do not abort anything: mtk_dsi_wait_for_idle()
++ * spends up to 2 s polling and then merely warns and resets the engine, and
++ * the mode switch adds another 500 ms. So a panel that answers slowly, or not
++ * at all, can spend minutes here without any single call "hanging".
++ *
++ * That is fatal rather than merely slow, because the RGU hardware watchdog
++ * fires at ~31 s and nothing pets it this early in boot. The result is a
++ * reset loop that looks, on the host, exactly like a flaky USB cable -- which
++ * is how it was misdiagnosed for most of an evening on 2026-08-20.
++ *
++ * So the sequence carries a wall-clock budget checked between commands. When
++ * it is exhausted the sequence aborts and names the command it stopped at,
++ * prepare() fails, and the kernel carries on booting with no image. A dark
++ * panel is a bad outcome; a watchdog loop is a dead device, and the whole
++ * point is that the first can never become the second.
++ *
++ * The budget is a module parameter so a diagnostic boot can widen it from the
++ * kernel command line without a rebuild:
++ *     panel_solomon_ssd2092.init_budget_ms=30000
++ */
++static unsigned int init_budget_ms = 8000;
++module_param(init_budget_ms, uint, 0644);
++MODULE_PARM_DESC(init_budget_ms,
++		 "wall-clock budget for the panel init sequence, ms (0 = unbounded; must stay well under the ~31 s watchdog)");
++
++static bool init_verbose;
++module_param(init_verbose, bool, 0644);
++MODULE_PARM_DESC(init_verbose,
++		 "log every init command with its index and elapsed time (names the stalling command)");
++
++struct gemini_panel_init_ctx {
++	struct mipi_dsi_device *dsi;
++	unsigned long start;
++	unsigned long deadline;
++	unsigned int index;
++};
++
++static int gemini_panel_init_cmd(struct gemini_panel_init_ctx *c, const u8 *d, size_t len)
++{
++	unsigned long t0 = jiffies;
++	ssize_t ret;
++	unsigned int ms;
++
++	if (init_budget_ms && time_after(jiffies, c->deadline)) {
++		dev_err(&c->dsi->dev,
++			"init sequence exceeded its %u ms budget at command %u (0x%02x); aborting so the boot survives\n",
++			init_budget_ms, c->index, d[0]);
++		return -ETIMEDOUT;
++	}
++
++	/*
++	 * Packet-type dispatch, unchanged: commands >= 0xB0 are Novatek
++	 * manufacturer registers and must go as GENERIC packets.
++	 */
++	if (d[0] >= 0xb0)
++		ret = mipi_dsi_generic_write(c->dsi, d, len);
++	else
++		ret = mipi_dsi_dcs_write_buffer(c->dsi, d, len);
++
++	ms = jiffies_to_msecs(jiffies - t0);
++	if (ret < 0) {
++		dev_err(&c->dsi->dev,
++			"init command %u (0x%02x) failed after %u ms: %zd\n",
++			c->index, d[0], ms, ret);
++		return ret;
++	}
++	/*
++	 * Report slow commands even on success. A command that takes a second
++	 * is the one eating the budget, and knowing which one it is turns
++	 * fixing this from a guess into a bisect.
++	 */
++	if (init_verbose)
++		dev_info(&c->dsi->dev, "init command %u (0x%02x) ok in %u ms\n",
++			 c->index, d[0], ms);
++	else if (ms >= 200)
++		dev_warn(&c->dsi->dev, "init command %u (0x%02x) took %u ms\n",
++			 c->index, d[0], ms);
++
++	c->index++;
++	return 0;
++}
++
++#define gemini_dcs(dsi, seq...)					\
++({									\
++	static const u8 d[] = { seq };					\
++	int ret = gemini_panel_init_cmd(&ctx, d, ARRAY_SIZE(d));		\
++	if (ret < 0)							\
++		return ret;						\
++})
++
++/*
++ * Vendor init_setting[] table, converted 1:1 (same commands, same
++ * parameters, same delays). Ends with sleep-out (0x11) + 120 ms and
++ * display-on (0x29) + 50 ms, as the vendor lcm_init() does.
++ */
++static int nt36672_init_sequence(struct gemini_panel *priv)
++{
++	struct mipi_dsi_device *dsi = priv->dsi;
++	struct gemini_panel_init_ctx ctx = {
++		.dsi = dsi,
++		.start = jiffies,
++		.deadline = jiffies + msecs_to_jiffies(init_budget_ms),
++		.index = 0,
++	};
++
++	/*
++	 * Novatek NT36672 vendor init table, generated mechanically from
++	 * gemian-3.18 drivers/misc/mediatek/lcm/
++	 * aeon_nt36672_fhd_dsi_vdo_x600_xinli (.c) init_setting[] (the live
++	 * "#if 1" branch): 183 commands + 2 delays, in order.
++	 *
++	 * Page switches are "FF <page>" followed by "FB 01" (Novatek's
++	 * commit/unlock); both are >= 0xb0 so the macro sends them as
++	 * generic packets, as the vendor DSI layer does.  The gamma block
++	 * is deliberately written twice -- pages 0x20 and 0x21 -- with
++	 * identical bytes (positive and negative polarity).  Sleep-out
++	 * (0x11) and display-on (0x29) are 1-parameter short writes here,
++	 * matching the vendor table, not the 0-parameter forms that
++	 * mipi_dsi_dcs_exit_sleep_mode()/_set_display_on() emit.
++	 */
++	gemini_dcs(dsi, 0xff, 0x20);
++	gemini_dcs(dsi, 0xfb, 0x01);
++	gemini_dcs(dsi, 0x01, 0x33);
++	gemini_dcs(dsi, 0x06, 0x99);
++	gemini_dcs(dsi, 0x07, 0x9e);
++	gemini_dcs(dsi, 0x0e, 0x30);
++	gemini_dcs(dsi, 0x0f, 0x2e);
++	gemini_dcs(dsi, 0x1d, 0x33);
++	gemini_dcs(dsi, 0x6d, 0x66);
++	gemini_dcs(dsi, 0x68, 0x03);
++	gemini_dcs(dsi, 0x69, 0x99);
++	gemini_dcs(dsi, 0x89, 0x0f);
++	gemini_dcs(dsi, 0x95, 0xcd);
++	gemini_dcs(dsi, 0x96, 0xcd);
++	gemini_dcs(dsi, 0xff, 0x24);
++	gemini_dcs(dsi, 0xfb, 0x01);
++	gemini_dcs(dsi, 0x00, 0x01);
++	gemini_dcs(dsi, 0x01, 0x1c);
++	gemini_dcs(dsi, 0x02, 0x0b);
++	gemini_dcs(dsi, 0x03, 0x0c);
++	gemini_dcs(dsi, 0x04, 0x29);
++	gemini_dcs(dsi, 0x05, 0x0f);
++	gemini_dcs(dsi, 0x06, 0x0f);
++	gemini_dcs(dsi, 0x07, 0x03);
++	gemini_dcs(dsi, 0x08, 0x05);
++	gemini_dcs(dsi, 0x09, 0x22);
++	gemini_dcs(dsi, 0x0a, 0x00);
++	gemini_dcs(dsi, 0x0b, 0x24);
++	gemini_dcs(dsi, 0x0c, 0x13);
++	gemini_dcs(dsi, 0x0d, 0x13);
++	gemini_dcs(dsi, 0x0e, 0x15);
++	gemini_dcs(dsi, 0x0f, 0x15);
++	gemini_dcs(dsi, 0x10, 0x17);
++	gemini_dcs(dsi, 0x11, 0x17);
++	gemini_dcs(dsi, 0x12, 0x01);
++	gemini_dcs(dsi, 0x13, 0x1c);
++	gemini_dcs(dsi, 0x14, 0x0b);
++	gemini_dcs(dsi, 0x15, 0x0c);
++	gemini_dcs(dsi, 0x16, 0x29);
++	gemini_dcs(dsi, 0x17, 0x0f);
++	gemini_dcs(dsi, 0x18, 0x0f);
++	gemini_dcs(dsi, 0x19, 0x04);
++	gemini_dcs(dsi, 0x1a, 0x06);
++	gemini_dcs(dsi, 0x1b, 0x23);
++	gemini_dcs(dsi, 0x1c, 0x0f);
++	gemini_dcs(dsi, 0x1d, 0x24);
++	gemini_dcs(dsi, 0x1e, 0x13);
++	gemini_dcs(dsi, 0x1f, 0x13);
++	gemini_dcs(dsi, 0x20, 0x15);
++	gemini_dcs(dsi, 0x21, 0x15);
++	gemini_dcs(dsi, 0x22, 0x17);
++	gemini_dcs(dsi, 0x23, 0x17);
++	gemini_dcs(dsi, 0x2f, 0x04);
++	gemini_dcs(dsi, 0x30, 0x08);
++	gemini_dcs(dsi, 0x31, 0x04);
++	gemini_dcs(dsi, 0x32, 0x08);
++	gemini_dcs(dsi, 0x33, 0x04);
++	gemini_dcs(dsi, 0x34, 0x04);
++	gemini_dcs(dsi, 0x35, 0x00);
++	gemini_dcs(dsi, 0x37, 0x09);
++	gemini_dcs(dsi, 0x38, 0x75);
++	gemini_dcs(dsi, 0x39, 0x75);
++	gemini_dcs(dsi, 0x3b, 0xc0);
++	gemini_dcs(dsi, 0x3f, 0x75);
++	gemini_dcs(dsi, 0x60, 0x10);
++	gemini_dcs(dsi, 0x61, 0x00);
++	gemini_dcs(dsi, 0x68, 0xc2);
++	gemini_dcs(dsi, 0x78, 0x80);
++	gemini_dcs(dsi, 0x79, 0x23);
++	gemini_dcs(dsi, 0x7a, 0x10);
++	gemini_dcs(dsi, 0x7b, 0x9b);
++	gemini_dcs(dsi, 0x7c, 0x80);
++	gemini_dcs(dsi, 0x7d, 0x06);
++	gemini_dcs(dsi, 0x7e, 0x02);
++	gemini_dcs(dsi, 0x8e, 0xf0);
++	gemini_dcs(dsi, 0x92, 0x76);
++	gemini_dcs(dsi, 0x93, 0x0a);
++	gemini_dcs(dsi, 0x94, 0x0a);
++	gemini_dcs(dsi, 0x99, 0x33);
++	gemini_dcs(dsi, 0x9b, 0xff);
++	gemini_dcs(dsi, 0x9f, 0x00);
++	gemini_dcs(dsi, 0xa3, 0x91);
++	gemini_dcs(dsi, 0xb3, 0x00);
++	gemini_dcs(dsi, 0xb4, 0x00);
++	gemini_dcs(dsi, 0xb5, 0x04);
++	gemini_dcs(dsi, 0xdc, 0x40);
++	gemini_dcs(dsi, 0xdd, 0x03);
++	gemini_dcs(dsi, 0xde, 0x01);
++	gemini_dcs(dsi, 0xdf, 0x3d);
++	gemini_dcs(dsi, 0xe0, 0x3d);
++	gemini_dcs(dsi, 0xe1, 0x22);
++	gemini_dcs(dsi, 0xe2, 0x24);
++	gemini_dcs(dsi, 0xe3, 0x0a);
++	gemini_dcs(dsi, 0xe4, 0x0a);
++	gemini_dcs(dsi, 0xe8, 0x01);
++	gemini_dcs(dsi, 0xe9, 0x10);
++	gemini_dcs(dsi, 0xed, 0x40);
++	gemini_dcs(dsi, 0xff, 0x25);
++	gemini_dcs(dsi, 0xfb, 0x01);
++	gemini_dcs(dsi, 0x0a, 0x81);
++	gemini_dcs(dsi, 0x0b, 0xcd);
++	gemini_dcs(dsi, 0x0c, 0x01);
++	gemini_dcs(dsi, 0x17, 0x82);
++	gemini_dcs(dsi, 0x21, 0x1b);
++	gemini_dcs(dsi, 0x22, 0x1b);
++	gemini_dcs(dsi, 0x24, 0x76);
++	gemini_dcs(dsi, 0x25, 0x76);
++	gemini_dcs(dsi, 0x30, 0x2a);
++	gemini_dcs(dsi, 0x31, 0x2a);
++	gemini_dcs(dsi, 0x38, 0x2a);
++	gemini_dcs(dsi, 0x3f, 0x11);
++	gemini_dcs(dsi, 0x40, 0x3a);
++	gemini_dcs(dsi, 0x4b, 0x31);
++	gemini_dcs(dsi, 0x4c, 0x3a);
++	gemini_dcs(dsi, 0x58, 0x22);
++	gemini_dcs(dsi, 0x59, 0x05);
++	gemini_dcs(dsi, 0x5a, 0x0a);
++	gemini_dcs(dsi, 0x5b, 0x0a);
++	gemini_dcs(dsi, 0x5c, 0x25);
++	gemini_dcs(dsi, 0x5d, 0x80);
++	gemini_dcs(dsi, 0x5e, 0x80);
++	gemini_dcs(dsi, 0x5f, 0x28);
++	gemini_dcs(dsi, 0x62, 0x3f);
++	gemini_dcs(dsi, 0x63, 0x82);
++	gemini_dcs(dsi, 0x65, 0x00);
++	gemini_dcs(dsi, 0x66, 0xdd);
++	gemini_dcs(dsi, 0x6c, 0x6d);
++	gemini_dcs(dsi, 0x71, 0x6d);
++	gemini_dcs(dsi, 0x78, 0x25);
++	gemini_dcs(dsi, 0xc3, 0x00);
++	gemini_dcs(dsi, 0xff, 0x26);
++	gemini_dcs(dsi, 0xfb, 0x01);
++	gemini_dcs(dsi, 0x06, 0xc8);
++	gemini_dcs(dsi, 0x12, 0x5a);
++	gemini_dcs(dsi, 0x19, 0x09);
++	gemini_dcs(dsi, 0x1a, 0x84);
++	gemini_dcs(dsi, 0x1c, 0xfa);
++	gemini_dcs(dsi, 0x1d, 0x09);
++	gemini_dcs(dsi, 0x1e, 0x0b);
++	gemini_dcs(dsi, 0x99, 0x20);
++	gemini_dcs(dsi, 0xff, 0x27);
++	gemini_dcs(dsi, 0xfb, 0x01);
++	gemini_dcs(dsi, 0x13, 0x08);
++	gemini_dcs(dsi, 0x14, 0x43);
++	gemini_dcs(dsi, 0x16, 0xb8);
++	gemini_dcs(dsi, 0x17, 0xb8);
++	gemini_dcs(dsi, 0x7a, 0x02);
++	gemini_dcs(dsi, 0xff, 0x20);
++	gemini_dcs(dsi, 0xfb, 0x01);
++	gemini_dcs(dsi, 0xb0, 0x00, 0xaa, 0x00, 0xb6, 0x00, 0xc8, 0x00, 0xd9, 0x00, 0xea, 0x00, 0xf6, 0x01, 0x07, 0x01, 0x11);
++	gemini_dcs(dsi, 0xb1, 0x01, 0x1c, 0x01, 0x40, 0x01, 0x60, 0x01, 0x90, 0x01, 0xb6, 0x01, 0xf1, 0x02, 0x1b, 0x02, 0x1d);
++	gemini_dcs(dsi, 0xb2, 0x02, 0x46, 0x02, 0x75, 0x02, 0x93, 0x02, 0xbe, 0x02, 0xdc, 0x03, 0x08, 0x03, 0x16, 0x03, 0x24);
++	gemini_dcs(dsi, 0xb3, 0x03, 0x35, 0x03, 0x49, 0x03, 0x62, 0x03, 0x84, 0x03, 0xb3, 0x03, 0xff);
++	gemini_dcs(dsi, 0xb4, 0x01, 0x03, 0x01, 0x09, 0x01, 0x15, 0x01, 0x20, 0x01, 0x2a, 0x01, 0x34, 0x01, 0x3c, 0x01, 0x45);
++	gemini_dcs(dsi, 0xb5, 0x01, 0x4d, 0x01, 0x6a, 0x01, 0x82, 0x01, 0xaa, 0x01, 0xca, 0x01, 0xfe, 0x02, 0x25, 0x02, 0x26);
++	gemini_dcs(dsi, 0xb6, 0x02, 0x4d, 0x02, 0x7a, 0x02, 0x9a, 0x02, 0xc3, 0x02, 0xe1, 0x03, 0x0e, 0x03, 0x1c, 0x03, 0x2a);
++	gemini_dcs(dsi, 0xb7, 0x03, 0x3a, 0x03, 0x4e, 0x03, 0x66, 0x03, 0x88, 0x03, 0xb5, 0x03, 0xff);
++	gemini_dcs(dsi, 0xb8, 0x00, 0x00, 0x00, 0x34, 0x00, 0x6c, 0x00, 0x92, 0x00, 0xad, 0x00, 0xc4, 0x00, 0xdc, 0x00, 0xeb);
++	gemini_dcs(dsi, 0xb9, 0x00, 0xfc, 0x01, 0x2d, 0x01, 0x53, 0x01, 0x8a, 0x01, 0xb3, 0x01, 0xf1, 0x02, 0x1c, 0x02, 0x1d);
++	gemini_dcs(dsi, 0xba, 0x02, 0x46, 0x02, 0x75, 0x02, 0x94, 0x02, 0xbf, 0x02, 0xdd, 0x03, 0x0a, 0x03, 0x16, 0x03, 0x25);
++	gemini_dcs(dsi, 0xbb, 0x03, 0x35, 0x03, 0x49, 0x03, 0x61, 0x03, 0x7d, 0x03, 0xb1, 0x03, 0xff);
++	gemini_dcs(dsi, 0xff, 0x21);
++	gemini_dcs(dsi, 0xfb, 0x01);
++	gemini_dcs(dsi, 0xb0, 0x00, 0xaa, 0x00, 0xb6, 0x00, 0xc8, 0x00, 0xd9, 0x00, 0xea, 0x00, 0xf6, 0x01, 0x07, 0x01, 0x11);
++	gemini_dcs(dsi, 0xb1, 0x01, 0x1c, 0x01, 0x40, 0x01, 0x60, 0x01, 0x90, 0x01, 0xb6, 0x01, 0xf1, 0x02, 0x1b, 0x02, 0x1d);
++	gemini_dcs(dsi, 0xb2, 0x02, 0x46, 0x02, 0x75, 0x02, 0x93, 0x02, 0xbe, 0x02, 0xdc, 0x03, 0x08, 0x03, 0x16, 0x03, 0x24);
++	gemini_dcs(dsi, 0xb3, 0x03, 0x35, 0x03, 0x49, 0x03, 0x62, 0x03, 0x84, 0x03, 0xb3, 0x03, 0xff);
++	gemini_dcs(dsi, 0xb4, 0x01, 0x03, 0x01, 0x09, 0x01, 0x15, 0x01, 0x20, 0x01, 0x2a, 0x01, 0x34, 0x01, 0x3c, 0x01, 0x45);
++	gemini_dcs(dsi, 0xb5, 0x01, 0x4d, 0x01, 0x6a, 0x01, 0x82, 0x01, 0xaa, 0x01, 0xca, 0x01, 0xfe, 0x02, 0x25, 0x02, 0x26);
++	gemini_dcs(dsi, 0xb6, 0x02, 0x4d, 0x02, 0x7a, 0x02, 0x9a, 0x02, 0xc3, 0x02, 0xe1, 0x03, 0x0e, 0x03, 0x1c, 0x03, 0x2a);
++	gemini_dcs(dsi, 0xb7, 0x03, 0x3a, 0x03, 0x4e, 0x03, 0x66, 0x03, 0x88, 0x03, 0xb5, 0x03, 0xff);
++	gemini_dcs(dsi, 0xb8, 0x00, 0x00, 0x00, 0x34, 0x00, 0x6c, 0x00, 0x92, 0x00, 0xad, 0x00, 0xc4, 0x00, 0xdc, 0x00, 0xeb);
++	gemini_dcs(dsi, 0xb9, 0x00, 0xfc, 0x01, 0x2d, 0x01, 0x53, 0x01, 0x8a, 0x01, 0xb3, 0x01, 0xf1, 0x02, 0x1c, 0x02, 0x1d);
++	gemini_dcs(dsi, 0xba, 0x02, 0x46, 0x02, 0x75, 0x02, 0x94, 0x02, 0xbf, 0x02, 0xdd, 0x03, 0x0a, 0x03, 0x16, 0x03, 0x25);
++	gemini_dcs(dsi, 0xbb, 0x03, 0x35, 0x03, 0x49, 0x03, 0x61, 0x03, 0x7d, 0x03, 0xb1, 0x03, 0xff);
++	gemini_dcs(dsi, 0xff, 0x10);
++	gemini_dcs(dsi, 0xfb, 0x01);
++	gemini_dcs(dsi, 0x51, 0xff);
++	gemini_dcs(dsi, 0x53, 0x24);
++	gemini_dcs(dsi, 0x55, 0x00);
++	gemini_dcs(dsi, 0x36, 0x03);
++	gemini_dcs(dsi, 0x11, 0x00);
++	msleep(120);
++	gemini_dcs(dsi, 0x29, 0x00);
++	msleep(10);
++	dev_info(&dsi->dev, "init sequence complete: %u commands in %u ms\n",
++		 ctx.index, jiffies_to_msecs(jiffies - ctx.start));
++	return 0;
++}
++
++static int gemini_panel_prepare(struct drm_panel *panel)
++{
++	struct gemini_panel *priv = panel_to_gemini_panel(panel);
++	int ret;
++
++	if (priv->prepared)
++		return 0;
++
++	/* Vendor lcm_poweron(): reset asserted while bias comes up. */
++	gpiod_set_value_cansleep(priv->reset_gpio, 1);
++
++	ret = regulator_enable(priv->avdd);
++	if (ret < 0) {
++		dev_err(panel->dev, "failed to enable avdd: %d\n", ret);
++		return ret;
++	}
++
++	ret = regulator_enable(priv->avee);
++	if (ret < 0) {
++		dev_err(panel->dev, "failed to enable avee: %d\n", ret);
++		goto disable_avdd;
++	}
++
++	msleep(20);
++
++	/* Vendor reset dance: release 10 ms, assert 10 ms, release 20 ms. */
++	gpiod_set_value_cansleep(priv->reset_gpio, 0);
++	msleep(10);
++	gpiod_set_value_cansleep(priv->reset_gpio, 1);
++	msleep(10);
++	gpiod_set_value_cansleep(priv->reset_gpio, 0);
++	msleep(20);
++
++	ret = priv->variant->init(priv);
++	if (ret < 0) {
++		dev_err(panel->dev, "init sequence failed: %d\n", ret);
++		goto disable_avee;
++	}
++
++	priv->prepared = true;
++	return 0;
++
++disable_avee:
++	/* Leave reset asserted so a retry starts from a known state. */
++	gpiod_set_value_cansleep(priv->reset_gpio, 1);
++	regulator_disable(priv->avee);
++disable_avdd:
++	regulator_disable(priv->avdd);
++	return ret;
++}
++
++static int gemini_panel_enable(struct drm_panel *panel)
++{
++	struct gemini_panel *priv = panel_to_gemini_panel(panel);
++
++	if (priv->enabled)
++		return 0;
++
++	/* Sleep-out and display-on are part of the vendor init table. */
++	if (priv->backlight)
++		backlight_enable(priv->backlight);
++
++	priv->enabled = true;
++	return 0;
++}
++
++static int gemini_panel_disable(struct drm_panel *panel)
++{
++	struct gemini_panel *priv = panel_to_gemini_panel(panel);
++	struct mipi_dsi_device *dsi = priv->dsi;
++
++	if (!priv->enabled)
++		return 0;
++
++	if (priv->backlight)
++		backlight_disable(priv->backlight);
++
++	/* Vendor lcm_suspend_setting: display off, 50 ms, sleep in, 120 ms. */
++	mipi_dsi_dcs_set_display_off(dsi);
++	msleep(50);
++	mipi_dsi_dcs_enter_sleep_mode(dsi);
++	msleep(120);
++
++	priv->enabled = false;
++	return 0;
++}
++
++static int gemini_panel_unprepare(struct drm_panel *panel)
++{
++	struct gemini_panel *priv = panel_to_gemini_panel(panel);
++
++	if (!priv->prepared)
++		return 0;
++
++	gpiod_set_value_cansleep(priv->reset_gpio, 1);
++	msleep(10);
++
++	regulator_disable(priv->avee);
++	regulator_disable(priv->avdd);
++
++	priv->prepared = false;
++	return 0;
++}
++
++/*
++ * Timing from the vendor KERNEL video-mode LCM driver
++ * (aeon_ssd2092_fhd_dsi_solomon.c: HFP=26 HSA=4 HBP=20, VFP=76 VSA=1
++ * VBP=43, PLL_CLOCK=502 -> 1004 Mbps/lane -> pixclk 1004e6*4/24 =
++ * 167333 kHz, ~65 Hz).  Earlier revisions reverse-engineered timings
++ * from LK's register dump instead (VSA=3 VBP=15 VFP=10, 880 Mbps) --
++ * but LK drives this panel in COMMAND mode for its one-shot splash, so
++ * its video porch registers are leftovers that don't apply; using them
++ * produced folded lines and loss of sync (builds #136/#105-#111,
++ * boot.md).  The vendor kernel values gave the first stable fbcon on
++ * glass (build #138, banner #122, 2026-07-12).
++ */
++/*
++ * 2026-08-20: retargeted to the NT36672 variant.  LK's atag,videolfb names
++ * this unit's panel "aeon_nt36672_fhd_dsi_vdo_x600_xinli" (Novatek NT36672),
++ * NOT the Solomon SSD2092 this file was written for -- the Gemini shipped in
++ * two panel variants and the vendor tree carries an LCM for each.  Values
++ * below are the vendor LCM's (aeon_nt36672_fhd_dsi_vdo_x600_xinli.c:689-703):
++ * HSA/HBP/HFP = 10/42/42, VSA/VBP/VFP = 3/15/10, BURST video, PLL_CLOCK 440.
++ * clock = 880000 kbps * 4 lanes / 24 bpp = 146667 kHz reproduces that PLL via
++ * mtk_dsi's data_rate = clock * bpp / lanes.
++ *
++ * Cross-check: run through the vendor word-count formula these give
++ * HSA_WC/HBP_WC/HFP_WC = 0x1c/0x94/0x74, byte-exact with LK's own golden DSI
++ * dump (boot.md) -- the previous SSD2092 numbers produced 0x02/0x32/0x4e and
++ * tripped mtk_dsi's "HFP + HBP less than d-phy" warning.
++ */
++static const struct drm_display_mode nt36672_mode = {
++	.clock		= 146667,
++	.hdisplay	= 1080,
++	.hsync_start	= 1080 + 42,
++	.hsync_end	= 1080 + 42 + 10,
++	.htotal		= 1080 + 42 + 10 + 42,
++	.vdisplay	= 2160,
++	.vsync_start	= 2160 + 10,
++	.vsync_end	= 2160 + 10 + 3,
++	.vtotal		= 2160 + 10 + 3 + 15,
++	.width_mm	= 68,
++	.height_mm	= 136,
++};
++
++
++/*
++ * The OTHER variant, kept rather than deleted.
++ *
++ * The Gemini shipped with two panels and the vendor tree carries an LCM
++ * driver for each. This file was originally written for the Solomon
++ * SSD2092 one, then retargeted in place when LK turned out to name this
++ * unit's panel aeon_nt36672_fhd_dsi_vdo_x600_xinli — which threw the
++ * SSD2092's init sequence away. It is restored here verbatim from the
++ * driver's first version (patches/v6.6/panel/0005), transcribed from
++ * gemian-3.18 drivers/misc/mediatek/lcm/aeon_ssd2092_fhd_dsi_solomon/.
++ *
++ * UNVERIFIED ON HARDWARE. No SSD2092 unit exists in this lab, so this path
++ * has never run. It is here so that a build serves both panels rather than
++ * bricking the display on the other one, and so the transcription is not
++ * lost a second time.
++ */
++static int ssd2092_init_sequence(struct gemini_panel *priv)
++{
++	struct mipi_dsi_device *dsi = priv->dsi;
++	struct gemini_panel_init_ctx ctx = {
++		.dsi = dsi,
++		.start = jiffies,
++		.deadline = jiffies + msecs_to_jiffies(init_budget_ms),
++		.index = 0,
++	};
++
++	gemini_dcs(dsi, 0x28);
++	gemini_dcs(dsi, 0x10);
++	gemini_dcs(dsi, 0xb5, 0x00, 0x00);
++	gemini_dcs(dsi, 0xb3, 0x03, 0x96);
++	gemini_dcs(dsi, 0xb4, 0x21, 0xff);
++	gemini_dcs(dsi, 0xe1, 0x00, 0x00);
++	gemini_dcs(dsi, 0xe1, 0x03, 0x00, 0x10);
++	gemini_dcs(dsi, 0xb0, 0x04, 0x01);
++	gemini_dcs(dsi, 0xb0, 0x07, 0x14);
++	gemini_dcs(dsi, 0xc6, 0x04, 0x2d);
++	gemini_dcs(dsi, 0xb9, 0x0e, 0x44);
++	gemini_dcs(dsi, 0xc1, 0x0c, 0x26);
++	gemini_dcs(dsi, 0xc1, 0x08, 0x99);
++	gemini_dcs(dsi, 0xb9, 0x23, 0x00);
++	gemini_dcs(dsi, 0xc2, 0x04, 0x0f);
++	gemini_dcs(dsi, 0xb9, 0x11, 0x22);
++	gemini_dcs(dsi, 0xb9, 0x12, 0x22);
++	gemini_dcs(dsi, 0xb9, 0x13, 0x22);
++	gemini_dcs(dsi, 0xb3, 0x19, 0x0b);
++	gemini_dcs(dsi, 0xb0, 0x3d, 0xc8);
++	gemini_dcs(dsi, 0xb3, 0x0f, 0x20);
++	gemini_dcs(dsi, 0x36, 0x02);
++	gemini_dcs(dsi, 0xc7, 0x01, 0x09);
++	gemini_dcs(dsi, 0xb3, 0x15, 0x80);
++	gemini_dcs(dsi, 0xb3, 0x1e, 0x02);
++	gemini_dcs(dsi, 0xb3, 0x14, 0xc0);
++	gemini_dcs(dsi, 0xb3, 0x16, 0x50);
++	gemini_dcs(dsi, 0xb3, 0x1c, 0xe4);
++	gemini_dcs(dsi, 0xb3, 0x28, 0x09);
++	gemini_dcs(dsi, 0xb3, 0x24, 0x19);
++	gemini_dcs(dsi, 0xb0, 0x12, 0x00);
++	gemini_dcs(dsi, 0xb0, 0x13, 0x14);
++	gemini_dcs(dsi, 0xb0, 0x1a, 0x00);
++	gemini_dcs(dsi, 0xb0, 0x1b, 0x14);
++	gemini_dcs(dsi, 0xc1, 0x0d, 0x87);
++	gemini_dcs(dsi, 0xc1, 0x0e, 0x87);
++	gemini_dcs(dsi, 0xc3, 0x00, 0x10, 0x2e, 0x3e, 0x48, 0x5e, 0x6b, 0x7a, 0x83, 0x97, 0xa3, 0xa8, 0xa5, 0xac, 0xad, 0xb5, 0xc1, 0xc4, 0x4e, 0x4f, 0x59, 0x5a);
++	gemini_dcs(dsi, 0xc3, 0x15, 0x10, 0x2e, 0x3e, 0x48, 0x5e, 0x6b, 0x7a, 0x83, 0x97, 0xa3, 0xa8, 0xa5, 0xac, 0xad, 0xb5, 0xc1, 0xc4, 0x4e, 0x4f, 0x59, 0x5a);
++	gemini_dcs(dsi, 0xbb, 0x01, 0x8a);
++	gemini_dcs(dsi, 0xbb, 0x02, 0x23);
++	gemini_dcs(dsi, 0xbb, 0x03, 0xbc);
++	gemini_dcs(dsi, 0xbb, 0x04, 0xc0);
++	gemini_dcs(dsi, 0xbb, 0x05, 0x19);
++	gemini_dcs(dsi, 0xbb, 0x06, 0x37);
++	gemini_dcs(dsi, 0xbb, 0x07, 0xee);
++	gemini_dcs(dsi, 0xbb, 0x08, 0xdd);
++	gemini_dcs(dsi, 0xbb, 0x09, 0xcc);
++	gemini_dcs(dsi, 0xbb, 0x0a, 0x36);
++	gemini_dcs(dsi, 0xbb, 0x0b, 0x70);
++	gemini_dcs(dsi, 0xbb, 0x0c, 0x00);
++	gemini_dcs(dsi, 0xbb, 0x0d, 0x8a);
++	gemini_dcs(dsi, 0xbb, 0x0e, 0x23);
++	gemini_dcs(dsi, 0xbb, 0x0f, 0xbc);
++	gemini_dcs(dsi, 0xbb, 0x10, 0xc0);
++	gemini_dcs(dsi, 0xbb, 0x11, 0x18);
++	gemini_dcs(dsi, 0xbb, 0x12, 0xa7);
++	gemini_dcs(dsi, 0xbb, 0x13, 0xee);
++	gemini_dcs(dsi, 0xbb, 0x14, 0xdd);
++	gemini_dcs(dsi, 0xbb, 0x15, 0xcc);
++	gemini_dcs(dsi, 0xbb, 0x16, 0x36);
++	gemini_dcs(dsi, 0xbb, 0x17, 0x70);
++	gemini_dcs(dsi, 0xbb, 0x18, 0x00);
++	gemini_dcs(dsi, 0xbb, 0x31, 0x01);
++	gemini_dcs(dsi, 0xbd, 0x00, 0xf0);
++	gemini_dcs(dsi, 0xbd, 0x01, 0xf0);
++	gemini_dcs(dsi, 0xbd, 0x02, 0xf0);
++	gemini_dcs(dsi, 0xbd, 0x03, 0xf0);
++	gemini_dcs(dsi, 0xbd, 0x1a, 0x02);
++	gemini_dcs(dsi, 0xbd, 0x1b, 0x24);
++	gemini_dcs(dsi, 0xbd, 0x1d, 0x01);
++	gemini_dcs(dsi, 0xbd, 0x1e, 0x01);
++	gemini_dcs(dsi, 0xbd, 0x21, 0x00);
++	gemini_dcs(dsi, 0xbd, 0x1f, 0x79);
++	gemini_dcs(dsi, 0xbd, 0x20, 0x14);
++	gemini_dcs(dsi, 0xbd, 0x22, 0x89);
++	gemini_dcs(dsi, 0xbd, 0x23, 0x13);
++	gemini_dcs(dsi, 0xbd, 0x24, 0x35);
++	gemini_dcs(dsi, 0xbd, 0x26, 0x01);
++	gemini_dcs(dsi, 0xbd, 0x27, 0x01);
++	gemini_dcs(dsi, 0xbd, 0x2a, 0x00);
++	gemini_dcs(dsi, 0xbd, 0x28, 0x79);
++	gemini_dcs(dsi, 0xbd, 0x29, 0x14);
++	gemini_dcs(dsi, 0xbd, 0x2b, 0x89);
++	gemini_dcs(dsi, 0xbd, 0x2c, 0x33);
++	gemini_dcs(dsi, 0xbd, 0x2d, 0x33);
++	gemini_dcs(dsi, 0xbd, 0x2e, 0x11);
++	gemini_dcs(dsi, 0xbd, 0x2f, 0x11);
++	gemini_dcs(dsi, 0xbd, 0x31, 0x22);
++	gemini_dcs(dsi, 0xbd, 0x32, 0x01);
++	gemini_dcs(dsi, 0xbd, 0x33, 0x04);
++	gemini_dcs(dsi, 0xbd, 0x34, 0x11);
++	gemini_dcs(dsi, 0xbd, 0x35, 0x11);
++	gemini_dcs(dsi, 0xbd, 0x37, 0x22);
++	gemini_dcs(dsi, 0xbd, 0x38, 0x01);
++	gemini_dcs(dsi, 0xbd, 0x39, 0x04);
++	gemini_dcs(dsi, 0xbd, 0x3a, 0x1e);
++	gemini_dcs(dsi, 0xbd, 0x3b, 0x1e);
++	gemini_dcs(dsi, 0xbd, 0x3c, 0x1e);
++	gemini_dcs(dsi, 0xbd, 0x3d, 0x1e);
++	gemini_dcs(dsi, 0xbd, 0x40, 0xaa);
++	gemini_dcs(dsi, 0xbd, 0x42, 0x1e);
++	gemini_dcs(dsi, 0xbd, 0x43, 0x1e);
++	gemini_dcs(dsi, 0xbd, 0x44, 0x1e);
++	gemini_dcs(dsi, 0xbd, 0x45, 0x1e);
++	gemini_dcs(dsi, 0xbd, 0x48, 0xaa);
++	gemini_dcs(dsi, 0xba, 0x02, 0x05);
++	gemini_dcs(dsi, 0xba, 0x03, 0x01);
++	gemini_dcs(dsi, 0xbc, 0x1e, 0x71);
++	gemini_dcs(dsi, 0xbc, 0x24, 0x83);
++	gemini_dcs(dsi, 0xb8, 0x03, 0xa9);
++	gemini_dcs(dsi, 0xba, 0x15, 0x41);
++	gemini_dcs(dsi, 0xbb, 0x19, 0x8a);
++	gemini_dcs(dsi, 0xbb, 0x1a, 0x32);
++	gemini_dcs(dsi, 0xbb, 0x1b, 0xbc);
++	gemini_dcs(dsi, 0xbb, 0x1c, 0xc2);
++	gemini_dcs(dsi, 0xbb, 0x1d, 0x39);
++	gemini_dcs(dsi, 0xbb, 0x1e, 0x37);
++	gemini_dcs(dsi, 0xbb, 0x1f, 0xee);
++	gemini_dcs(dsi, 0xbb, 0x20, 0xdd);
++	gemini_dcs(dsi, 0xbb, 0x21, 0xcc);
++	gemini_dcs(dsi, 0xbb, 0x22, 0x36);
++	gemini_dcs(dsi, 0xbb, 0x23, 0x70);
++	gemini_dcs(dsi, 0xbb, 0x24, 0x00);
++	gemini_dcs(dsi, 0xbb, 0x25, 0x8a);
++	gemini_dcs(dsi, 0xbb, 0x26, 0x32);
++	gemini_dcs(dsi, 0xbb, 0x27, 0xbc);
++	gemini_dcs(dsi, 0xbb, 0x28, 0xc2);
++	gemini_dcs(dsi, 0xbb, 0x29, 0x38);
++	gemini_dcs(dsi, 0xbb, 0x2a, 0xa7);
++	gemini_dcs(dsi, 0xbb, 0x2b, 0xee);
++	gemini_dcs(dsi, 0xbb, 0x2c, 0xdd);
++	gemini_dcs(dsi, 0xbb, 0x2d, 0xcc);
++	gemini_dcs(dsi, 0xbb, 0x2e, 0x36);
++	gemini_dcs(dsi, 0xbb, 0x2f, 0x70);
++	gemini_dcs(dsi, 0xbb, 0x30, 0x00);
++	gemini_dcs(dsi, 0xb8, 0x15, 0xa2);
++	gemini_dcs(dsi, 0xb0, 0x39, 0x00);
++	gemini_dcs(dsi, 0xc6, 0x00, 0x03, 0x40);
++	gemini_dcs(dsi, 0xb3, 0x18, 0x00);
++	gemini_dcs(dsi, 0xba, 0x17, 0x28);
++	gemini_dcs(dsi, 0xba, 0x23, 0x15);
++	gemini_dcs(dsi, 0xb0, 0x06, 0x2c);
++	gemini_dcs(dsi, 0xba, 0x17, 0x28);
++	gemini_dcs(dsi, 0xba, 0x23, 0x15);
++	gemini_dcs(dsi, 0xba, 0x16, 0x00);
++	gemini_dcs(dsi, 0xba, 0x28, 0x02, 0x02);
++	gemini_dcs(dsi, 0xba, 0x0f, 0x8c);
++	gemini_dcs(dsi, 0xba, 0x10, 0x0c);
++	gemini_dcs(dsi, 0xba, 0x11, 0x23);
++	gemini_dcs(dsi, 0xba, 0x12, 0x9d, 0x9d, 0x9d);
++	gemini_dcs(dsi, 0xba, 0x25, 0x22);
++	gemini_dcs(dsi, 0xba, 0x0d, 0x40, 0x02);
++	gemini_dcs(dsi, 0xba, 0x2f, 0x8c);
++	gemini_dcs(dsi, 0xc2, 0x04, 0x00);
++	gemini_dcs(dsi, 0xc2, 0x05, 0xc0);
++	gemini_dcs(dsi, 0xb9, 0x11, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00);
++	gemini_dcs(dsi, 0xba, 0x15, 0x33);
++	gemini_dcs(dsi, 0xb9, 0x00, 0x5f, 0x5f, 0x61, 0x0a);
++	gemini_dcs(dsi, 0xbd, 0x08, 0x07);
++	gemini_dcs(dsi, 0xbd, 0x09, 0x07);
++	gemini_dcs(dsi, 0xbc, 0x03, 0x00);
++	gemini_dcs(dsi, 0xbc, 0x04, 0x00);
++	gemini_dcs(dsi, 0xbc, 0x05, 0x00);
++	gemini_dcs(dsi, 0xbc, 0x07, 0x10);
++	gemini_dcs(dsi, 0xbc, 0x08, 0x10);
++	gemini_dcs(dsi, 0xbc, 0x09, 0x10);
++	gemini_dcs(dsi, 0xb9, 0x11, 0x00);
++	gemini_dcs(dsi, 0xb9, 0x12, 0x00);
++	gemini_dcs(dsi, 0xb9, 0x13, 0x00);
++	gemini_dcs(dsi, 0xb9, 0x1d, 0x00);
++	gemini_dcs(dsi, 0xb9, 0x1e, 0x00);
++	gemini_dcs(dsi, 0xb9, 0x1f, 0x00);
++	gemini_dcs(dsi, 0xc2, 0x00, 0x07);
++	gemini_dcs(dsi, 0xc1, 0x0b, 0x1f);
++	gemini_dcs(dsi, 0xb1, 0x05, 0x2f);
++	gemini_dcs(dsi, 0x35, 0x00);
++	gemini_dcs(dsi, 0xb0, 0x01, 0x08, 0x70);
++	gemini_dcs(dsi, 0xb9, 0x25, 0xa0);
++	gemini_dcs(dsi, 0xba, 0x2f, 0xcc);
++	gemini_dcs(dsi, 0xc1, 0x02, 0xb0);
++	gemini_dcs(dsi, 0xb3, 0x1c, 0xc4);
++	gemini_dcs(dsi, 0xb3, 0x1d, 0x80);
++	gemini_dcs(dsi, 0xbd, 0x11, 0x02, 0x22);
++	gemini_dcs(dsi, 0x36, 0x09);
++	gemini_dcs(dsi, 0x11, 0x00);
++	msleep(120);
++	gemini_dcs(dsi, 0x29, 0x00);
++	msleep(50);
++
++	return 0;
++}
++
++/*
++ * Timing from the vendor SSD2092 kernel LCM (aeon_ssd2092_fhd_dsi_solomon.c:
++ * HFP=26 HSA=4 HBP=20, VFP=76 VSA=1 VBP=43, PLL_CLOCK=502 -> 1004 Mbps/lane
++ * -> pixclk 1004e6*4/24 = 167333 kHz). SYNC_PULSE video mode, not burst.
++ */
++static const struct drm_display_mode ssd2092_mode = {
++	.clock		= 167333,
++	.hdisplay	= 1080,
++	.hsync_start	= 1080 + 26,
++	.hsync_end	= 1080 + 26 + 4,
++	.htotal		= 1080 + 26 + 4 + 20,
++	.vdisplay	= 2160,
++	.vsync_start	= 2160 + 76,
++	.vsync_end	= 2160 + 76 + 1,
++	.vtotal		= 2160 + 76 + 1 + 43,
++	.width_mm	= 68,
++	.height_mm	= 136,
++};
++
++
++/*
++ * Known panels, by the name LK publishes.
++ *
++ * The Gemini shipped in two panel variants with identical wiring, so the
++ * device tree cannot tell them apart and a build that assumes one produces a
++ * dark screen on the other. The stock LK bootloader probes the fitted panel at
++ * every boot and hands the result to the kernel in the videolfb ATAG, which
++ * arrives as /chosen/atag,videolfb: an 8-byte framebuffer base, an
++ * "lcm found" flag, fps, vram size, then the LCM's name as a NUL-terminated
++ * string. On this unit that string reads
++ * "aeon_nt36672_fhd_dsi_vdo_x600_xinli".
++ *
++ * That is the same identity the vendor kernel selects its LCM driver by, so it
++ * is the right thing to key on rather than anything we could guess from the
++ * board.
++ */
++#define VIDEOLFB_LCMNAME_OFFSET	20	/* u64 fb_base, u32 islcmfound, fps, vram */
++
++static const struct gemini_panel_variant gemini_panel_variants[] = {
++	{
++		.lcm		= "aeon_nt36672_fhd_dsi_vdo_x600_xinli",
++		.name		= "Novatek NT36672 (TDDI)",
++		.mode		= &nt36672_mode,
++		.init		= nt36672_init_sequence,
++		/*
++		 * BURST, per the vendor LCM. See the mode comment for why the
++		 * EOT/clock-lane flags are the way round they are.
++		 */
++		.mode_flags	= MIPI_DSI_MODE_VIDEO | MIPI_DSI_MODE_VIDEO_BURST |
++				  MIPI_DSI_MODE_LPM | MIPI_DSI_MODE_NO_EOT_PACKET |
++				  MIPI_DSI_CLOCK_NON_CONTINUOUS,
++	},
++	{
++		.lcm		= "aeon_ssd2092_fhd_dsi_solomon",
++		.name		= "Solomon SSD2092",
++		.mode		= &ssd2092_mode,
++		.init		= ssd2092_init_sequence,
++		/* SYNC_PULSE_VDO_MODE in the vendor LCM, not burst. */
++		.mode_flags	= MIPI_DSI_MODE_VIDEO | MIPI_DSI_MODE_VIDEO_SYNC_PULSE |
++				  MIPI_DSI_MODE_LPM | MIPI_DSI_MODE_NO_EOT_PACKET |
++				  MIPI_DSI_CLOCK_NON_CONTINUOUS,
++	},
++};
++
++/* Which panel LK says is fitted, or NULL if it did not say anything we know. */
++static const struct gemini_panel_variant *gemini_panel_detect(struct device *dev,
++							      const char **lcm_out)
++{
++	struct device_node *chosen;
++	const char *lcm = NULL;
++	const u8 *tag;
++	int len, i;
++
++	*lcm_out = NULL;
++
++	chosen = of_find_node_by_path("/chosen");
++	if (!chosen)
++		return NULL;
++
++	tag = of_get_property(chosen, "atag,videolfb", &len);
++	if (tag && len > VIDEOLFB_LCMNAME_OFFSET) {
++		const char *s = (const char *)tag + VIDEOLFB_LCMNAME_OFFSET;
++
++		/* Only trust it if it is actually NUL-terminated inside the tag. */
++		if (memchr(s, 0, len - VIDEOLFB_LCMNAME_OFFSET))
++			lcm = s;
++	}
++	of_node_put(chosen);
++
++	if (!lcm || !*lcm)
++		return NULL;
++
++	*lcm_out = lcm;
++
++	for (i = 0; i < ARRAY_SIZE(gemini_panel_variants); i++)
++		if (!strcmp(lcm, gemini_panel_variants[i].lcm))
++			return &gemini_panel_variants[i];
++
++	dev_warn(dev, "bootloader reports panel \"%s\", which this driver does not know\n",
++		 lcm);
++	return NULL;
++}
++
++static int gemini_panel_get_modes(struct drm_panel *panel,
++			     struct drm_connector *connector)
++{
++	struct gemini_panel *priv = panel_to_gemini_panel(panel);
++	struct drm_display_mode *mode;
++
++	mode = drm_mode_duplicate(connector->dev, priv->variant->mode);
++	if (!mode)
++		return -ENOMEM;
++
++	drm_mode_set_name(mode);
++	mode->type = DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED;
++	drm_mode_probed_add(connector, mode);
++
++	connector->display_info.width_mm = priv->variant->mode->width_mm;
++	connector->display_info.height_mm = priv->variant->mode->height_mm;
++
++	return 1;
++}
++
++static const struct drm_panel_funcs gemini_panel_funcs = {
++	.prepare	= gemini_panel_prepare,
++	.enable		= gemini_panel_enable,
++	.disable	= gemini_panel_disable,
++	.unprepare	= gemini_panel_unprepare,
++	.get_modes	= gemini_panel_get_modes,
++};
++
++/*
++ * ASK THE PANEL, not the SoC.
++ *
++ * Every other check available to the panel gate reads state the SoC was
++ * programmed with — which proves we sent the right thing, not that the panel
++ * accepted it. RDDPM (DCS 0x0A, Get Power Mode) is the panel controller's own
++ * account of itself, and the vendor's ESD table declares 0x9C for a correctly
++ * initialised panel: booster on, sleep out, display on. The difference matters:
++ * during the 2026-07-11 investigation the init "succeeded" and every host-side
++ * register looked right while RDDPM read 0x1C, because the manufacturer
++ * registers were being sent as DCS instead of generic packets and the panel
++ * was silently ignoring them.
++ *
++ * There is no userspace path for a DCS read, so the gate had to skip this
++ * check entirely. This exposes one.
++ *
++ * Reads are only attempted while the panel is prepared; the DSI host switches
++ * to command mode for the transfer and back afterwards, and that transfer is
++ * bounded by mtk_dsi (2 s), so a dead panel cannot wedge a reader here.
++ */
++static int gemini_panel_rddpm_show(struct seq_file *s, void *unused)
++{
++	struct gemini_panel *priv = s->private;
++	u8 val = 0;
++	int ret;
++
++	if (!priv->prepared) {
++		seq_puts(s, "unavailable: panel not prepared\n");
++		return 0;
++	}
++
++	ret = mipi_dsi_dcs_read(priv->dsi, MIPI_DCS_GET_POWER_MODE, &val, 1);
++	if (ret < 0) {
++		seq_printf(s, "error: %d\n", ret);
++		return 0;
++	}
++	if (ret != 1) {
++		seq_printf(s, "error: short read (%d bytes)\n", ret);
++		return 0;
++	}
++
++	seq_printf(s, "0x%02x\n", val);
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(gemini_panel_rddpm);
++
++static int gemini_panel_probe(struct mipi_dsi_device *dsi)
++{
++	struct device *dev = &dsi->dev;
++	struct gemini_panel *priv;
++	const char *lcm;
++	int ret;
++
++	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
++	if (!priv)
++		return -ENOMEM;
++
++	priv->dsi = dsi;
++	mipi_dsi_set_drvdata(dsi, priv);
++
++	/*
++	 * Which panel is fitted, from the bootloader rather than from the
++	 * device tree — the two variants are wired identically, so the DT
++	 * cannot tell them apart and this file used to just assume.
++	 *
++	 * When LK says nothing we recognise, fall back to the NT36672 and say
++	 * so loudly, rather than refusing to probe: a machine that boots with
++	 * a display that might be wrong is recoverable over the network, and
++	 * one that boots with no display at all, on a device whose only other
++	 * way in is a USB cable, is a lot less so. The message is what makes
++	 * the difference diagnosable.
++	 */
++	priv->variant = gemini_panel_detect(dev, &lcm);
++	if (!priv->variant) {
++		priv->variant = &gemini_panel_variants[0];
++		dev_warn(dev,
++			 "no usable panel identity from the bootloader (%s); assuming %s. If the display is dark or scrambled, this is why.\n",
++			 lcm ? lcm : "/chosen/atag,videolfb absent or malformed",
++			 priv->variant->name);
++	} else {
++		dev_info(dev, "bootloader reports %s (\"%s\")\n",
++			 priv->variant->name, lcm);
++	}
++
++	priv->avdd = devm_regulator_get(dev, "avdd");
++	if (IS_ERR(priv->avdd))
++		return dev_err_probe(dev, PTR_ERR(priv->avdd), "avdd regulator\n");
++
++	priv->avee = devm_regulator_get(dev, "avee");
++	if (IS_ERR(priv->avee))
++		return dev_err_probe(dev, PTR_ERR(priv->avee), "avee regulator\n");
++
++	priv->reset_gpio = devm_gpiod_get(dev, "reset", GPIOD_OUT_HIGH);
++	if (IS_ERR(priv->reset_gpio))
++		return dev_err_probe(dev, PTR_ERR(priv->reset_gpio), "reset gpio\n");
++
++	priv->backlight = devm_of_find_backlight(dev);
++	if (IS_ERR(priv->backlight))
++		return dev_err_probe(dev, PTR_ERR(priv->backlight), "backlight\n");
++
++	drm_panel_init(&priv->panel, dev, &gemini_panel_funcs,
++		       DRM_MODE_CONNECTOR_DSI);
++
++	drm_panel_add(&priv->panel);
++
++	dsi->lanes = 4;
++	dsi->format = MIPI_DSI_FMT_RGB888;
++	/*
++	 * LK's working TXRX_CTRL is 0x0001003c: EOT packets enabled (bit 6
++	 * DIS_EOT clear) and HS clock allowed into LP between transmissions
++	 * (bit 16 HSTX_CKLP_EN set).  mtk_dsi's DIS_EOT handling is inverted
++	 * relative to the flag name: it sets DIS_EOT unless the panel asks
++	 * for MIPI_DSI_MODE_NO_EOT_PACKET — so NO_EOT_PACKET here *enables*
++	 * EOT on the wire, and CLOCK_NON_CONTINUOUS sets HSTX_CKLP_EN,
++	 * making the register bit-identical to LK's.
++	 */
++	dsi->mode_flags = priv->variant->mode_flags;
++
++	ret = mipi_dsi_attach(dsi);
++	if (ret < 0) {
++		dev_err(dev, "failed to attach DSI: %d\n", ret);
++		drm_panel_remove(&priv->panel);
++		return ret;
++	}
++
++	/*
++	 * Diagnostics live under a fixed, driver-owned path rather than under
++	 * the DRM device's directory, so the gate can find them without
++	 * knowing which card number the panel landed on.
++	 */
++	priv->debugfs = debugfs_create_dir("gemini-panel", NULL);
++	debugfs_create_file("rddpm", 0444, priv->debugfs, priv,
++			    &gemini_panel_rddpm_fops);
++
++	dev_info(dev, "%s FHD DSI panel registered\n", priv->variant->name);
++	return 0;
++}
++
++static void gemini_panel_remove(struct mipi_dsi_device *dsi)
++{
++	struct gemini_panel *priv = mipi_dsi_get_drvdata(dsi);
++
++	debugfs_remove_recursive(priv->debugfs);
++	mipi_dsi_detach(dsi);
++	drm_panel_remove(&priv->panel);
++}
++
++static const struct of_device_id gemini_panel_of_match[] = {
++	{ .compatible = "planet,gemini-panel" },
++	/*
++	 * Kept: every DTB flashed before 2026-08-21 says solomon,ssd2092, and
++	 * some of them are in boot slots that exist precisely to be fallen
++	 * back to. Dropping it would make this driver refuse to bind on a
++	 * rescue boot. It is a name, not a claim about the hardware — which
++	 * panel is fitted is decided by gemini_panel_detect() either way.
++	 */
++	{ .compatible = "solomon,ssd2092" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, gemini_panel_of_match);
++
++static struct mipi_dsi_driver gemini_panel_driver = {
++	.probe  = gemini_panel_probe,
++	.remove = gemini_panel_remove,
++	.driver = {
++		.name = "panel-gemini-fhd",
++		.of_match_table = gemini_panel_of_match,
++	},
++};
++module_mipi_dsi_driver(gemini_panel_driver);
++
++MODULE_AUTHOR("Ben Hamilton <ben@wakatipu.co>");
++MODULE_DESCRIPTION("Planet Computers Gemini PDA FHD DSI panel (NT36672 / SSD2092)");
++MODULE_LICENSE("GPL");
+--- a/drivers/gpu/drm/panel/Kconfig
++++ b/drivers/gpu/drm/panel/Kconfig
+@@ -835,14 +835,18 @@
+ 	  Say Y here if you want to enable support for the Xinpeng
+ 	  XPP055C272 controller for 720x1280 LCD panels with MIPI/RGB/SPI
+ 	  system interfaces.
+-config DRM_PANEL_SOLOMON_SSD2092
+-	tristate "Solomon SSD2092 FHD DSI panel (Gemini PDA)"
++config DRM_PANEL_GEMINI_FHD
++	tristate "Planet Computers Gemini PDA FHD DSI panel"
+ 	depends on OF
+ 	depends on DRM_MIPI_DSI
+ 	depends on BACKLIGHT_CLASS_DEVICE
+ 	help
+-	  Say Y or M for the Solomon SSD2092 1080x2160 MIPI DSI video mode
+-	  panel used in the Planet Computers Gemini PDA. Requires a dual
+-	  +/-5V bias supply (TPS65132-class) and a GPIO reset line.
++	  Say Y or M for the 1080x2160 MIPI DSI video mode panel used in the
++	  Planet Computers Gemini PDA. The Gemini shipped with two different
++	  panels — a Novatek NT36672 and a Solomon SSD2092 — on identical
++	  wiring; this driver reads which one the bootloader found and picks
++	  the matching timings and init sequence, so one build serves both.
++	  Requires a dual +/-5V bias supply (TPS65132-class) and a GPIO reset
++	  line.
+ 
+ endmenu
+--- a/drivers/gpu/drm/panel/Makefile
++++ b/drivers/gpu/drm/panel/Makefile
+@@ -68,7 +68,7 @@
+ obj-$(CONFIG_DRM_PANEL_SHARP_LS037V7DW01) += panel-sharp-ls037v7dw01.o
+ obj-$(CONFIG_DRM_PANEL_SHARP_LS043T1LE01) += panel-sharp-ls043t1le01.o
+ obj-$(CONFIG_DRM_PANEL_SHARP_LS060T1SX01) += panel-sharp-ls060t1sx01.o
+-obj-$(CONFIG_DRM_PANEL_SOLOMON_SSD2092) += panel-solomon-ssd2092.o
++obj-$(CONFIG_DRM_PANEL_GEMINI_FHD) += panel-gemini-fhd.o
+ obj-$(CONFIG_DRM_PANEL_SITRONIX_ST7701) += panel-sitronix-st7701.o
+ obj-$(CONFIG_DRM_PANEL_SITRONIX_ST7703) += panel-sitronix-st7703.o
+ obj-$(CONFIG_DRM_PANEL_SITRONIX_ST7789V) += panel-sitronix-st7789v.o

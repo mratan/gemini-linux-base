@@ -1,0 +1,30 @@
+arm64: dts: mediatek: gemini: name the panel after the machine, not a guess
+
+Two panel variants ship on identical wiring, so the compatible cannot
+honestly name a controller. Use "planet,gemini-panel"; the driver decides
+which panel is fitted from the identity LK publishes.
+
+Signed-off-by: mratan <mattdratan@gmail.com>
+
+--- a/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
++++ b/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
+@@ -880,11 +880,15 @@
+ 	#size-cells = <0>;
+ 
+ 	/*
+-	 * Solomon SSD2092 FHD panel on DSI0 (LK: aeon_ssd2092_fhd_dsi_solomon,
+-	 * panel ID 0x01572098 — probed by the stock bootloader at every boot).
++	 * The Gemini's FHD 1080x2160 DSI panel. Deliberately NOT named after a
++	 * controller: two variants shipped on identical wiring (Novatek
++	 * NT36672 and Solomon SSD2092) and the board cannot tell you which is
++	 * fitted. The driver asks LK, which probes it at every boot and
++	 * publishes the LCM name in /chosen/atag,videolfb — on this unit,
++	 * "aeon_nt36672_fhd_dsi_vdo_x600_xinli".
+ 	 */
+-	panel@0 {
+-		compatible = "solomon,ssd2092";
++	gemini_panel: panel@0 {
++		compatible = "planet,gemini-panel";
+ 		reg = <0>;
+ 		avdd-supply = <&lcd_avdd>;
+ 		avee-supply = <&lcd_avee>;

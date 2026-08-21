@@ -34,9 +34,31 @@ was unavailable. The cheap first check is an I2C scan of the touch bus, which
 should show 0x62 present and 0x53 absent — the mirror image of what bsg100
 found on their Solomon unit.
 
+REGENERATED 2026-08-21. This patch used to create only the driver's FIRST
+version, and it never added the Kconfig or Makefile entries at all — so a
+kernel built by applying this series had no CONFIG_TOUCHSCREEN_GEMINI_NT36XXX
+symbol and never compiled the file it had just created. Every subsequent
+change to the driver (the ready-line gate, the paged-read fix that resolved
+B-31, the drm_panel_follower work) was tracked as a loose copy of the source
+at patches/v6.6/input/gemini-nt36xxx.c, which nothing applies. The result was
+a patch series that could not rebuild the running kernel.
+
+So this now creates the driver as it actually is, and wires it into the build.
+The loose copy is deleted; this patch is the source of truth, and the
+incremental history lives in git where it belongs.
+
+Later additions folded in here, each with its own reasoning kept in the code:
+  - report reads gated on the CTP_INT data-ready line (an ungated poll returns
+    a fixed pattern that never changes with touch)
+  - the controller is PAGED: select the xdata page before reading the event
+    buffer, with the address a runtime module parameter rather than one of
+    four plausible constants baked in
+  - drm_panel_follower: stop polling while the panel (and therefore this
+    chip's power domain) is down, and re-initialise on the way back
+
 --- /dev/null
 +++ b/drivers/input/touchscreen/gemini-nt36xxx.c
-@@ -0,0 +1,293 @@
+@@ -0,0 +1,488 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Novatek NT36xxx capacitive touch controller — Planet Computers Gemini PDA
@@ -76,9 +98,22 @@ found on their Solomon unit.
 + * None of that is needed to move a cursor. This implements the report path
 + * only, which is the part that makes the hardware useful.
 + *
++ * WHY IT POLLS
++ *
++ * The controller has an interrupt line (CTP_INT, GPIO85) and the vendor driver
++ * uses it. We cannot: mainline's MT6797 pinctrl registers no mtk_eint_hw data
++ * at all, so no GPIO on this SoC can deliver an interrupt (blockers.md B-11).
++ * `&pio` is not an interrupt controller, so `interrupts = <85 ...>` silently
++ * resolves to nothing and the client's irq is 0. The first version of this
++ * driver required an interrupt and failed probe with -EINVAL for exactly that
++ * reason. Polling is not a preference here, it is the only option until B-11
++ * is fixed — and it is what the sibling Solomon driver does for the same
++ * reason.
++ *
 + * Protocol, from aeon_nt36xxx/nt36xxx.c:
 + *   read 65 bytes from address 0x01 starting at register 0x00; then for each
-+ *   finger i, at offset 1 + 6*i:
++ *   finger i, at payload offset 6*i (the vendor writes 1 + 6*i because its
++ *   buffer also holds the register byte at [0]):
 + *     [0] bits 7:3 = touch id (1-based), bits 2:0 = state (1 = down, 2 = move)
 + *     [1] x high 8       [2] y high 8
 + *     [3] x low 4 (7:4), y low 4 (3:0)
@@ -90,10 +125,10 @@ found on their Solomon unit.
 +#include <linux/i2c.h>
 +#include <linux/input.h>
 +#include <linux/input/mt.h>
-+#include <linux/interrupt.h>
 +#include <linux/mod_devicetable.h>
 +#include <linux/module.h>
 +#include <linux/property.h>
++#include <drm/drm_panel.h>
 +
 +#define NVT_FW_ADDR		0x01	/* reports and firmware info live here */
 +
@@ -106,14 +141,48 @@ found on their Solomon unit.
 +#define NVT_DEFAULT_MAX_X	1080
 +#define NVT_DEFAULT_MAX_Y	1920
 +
++/*
++ * The controller is PAGED. Reads at register 0x00 return whatever xdata page
++ * is currently selected, so a driver that just reads 0x00 gets a fixed pattern
++ * that never changes with touch — which is exactly what this driver did before
++ * the page select was added, and it looked convincingly like "the chip is not
++ * reporting". The vendor selects the page by writing 0xFF followed by the top
++ * two bytes of EVENT_BUF_ADDR.
++ *
++ * That address is chip-specific. The vendor carries four memory maps
++ * (NT36772 0x11E00, NT36525 0x11A00, NT36870 0x25000, NT36676F 0x11A00) and
++ * picks by chip ID. This panel is an NT36672, closest to the NT36772 map, but
++ * rather than assume, the value is writable at runtime:
++ *
++ *     echo 0x11E00 > /sys/module/gemini_nt36xxx/parameters/event_buf_addr
++ *
++ * so all four can be tried in a single boot instead of four reflashes.
++ */
++static unsigned int event_buf_addr = 0x11E00;
++module_param(event_buf_addr, uint, 0644);
++MODULE_PARM_DESC(event_buf_addr, "xdata page holding the touch event buffer");
++
++static bool raw_debug;
++module_param(raw_debug, bool, 0644);
++MODULE_PARM_DESC(raw_debug, "log the raw point buffer whenever it is non-zero");
++
 +struct nvt_ts {
 +	struct i2c_client	*client;
 +	struct input_dev	*input;
 +	struct gpio_desc	*reset_gpio;
++	struct gpio_desc	*rdy_gpio;
 +	u32			max_x;
 +	u32			max_y;
 +	bool			swap_xy;
 +	bool			invert_y;
++	struct drm_panel_follower panel_follower;
++	/*
++	 * True between the panel being told to power down and coming back.
++	 * This is a TDDI part: the touch controller is on the panel's silicon
++	 * and its power domain, so while the panel is off the chip is not
++	 * merely idle, it is unpowered, and every I2C transfer NAKs.
++	 */
++	bool			panel_off;
 +};
 +
 +/*
@@ -142,6 +211,19 @@ found on their Solomon unit.
 +	}
 +
 +	return ret < 0 ? ret : -EIO;
++}
++
++/* Write 0xFF <addr[23:16]> <addr[15:8]> to move the xdata window. */
++static int nvt_set_page(struct nvt_ts *ts, u32 addr)
++{
++	u8 buf[3] = { 0xff, (addr >> 16) & 0xff, (addr >> 8) & 0xff };
++	struct i2c_msg msg = {
++		.addr = NVT_FW_ADDR, .flags = 0, .len = sizeof(buf), .buf = buf,
++	};
++	int ret;
++
++	ret = i2c_transfer(ts->client->adapter, &msg, 1);
++	return ret == 1 ? 0 : (ret < 0 ? ret : -EIO);
 +}
 +
 +static void nvt_reset(struct nvt_ts *ts)
@@ -184,21 +266,89 @@ found on their Solomon unit.
 +		 ts->max_x, ts->max_y);
 +}
 +
-+static irqreturn_t nvt_ts_irq(int irq, void *dev_id)
++static void nvt_ts_poll(struct input_dev *input)
 +{
-+	struct nvt_ts *ts = dev_id;
++	struct nvt_ts *ts = input_get_drvdata(input);
 +	u8 point_data[NVT_POINT_DATA_LEN] = {};
 +	unsigned int i;
 +	int ret;
 +
++	/*
++	 * Only read when the controller says it has something.
++	 *
++	 * The vendor's thread blocks on the CTP_INT interrupt and reads exactly
++	 * once per assertion. Reading whenever we feel like it returns junk:
++	 * measured here, an ungated poll alternates between all-0xff and a
++	 * fixed pattern that never changes with touch. The buffer is only valid
++	 * in the window after the controller raises its data-ready line.
++	 *
++	 * We cannot take an interrupt from that line (B-11: mainline MT6797
++	 * pinctrl has no EINT support), but we can READ it as an ordinary GPIO,
++	 * which works fine. So poll the line and do the transfer only when it
++	 * is asserted — the vendor's semantics, minus the interrupt.
++	 */
++	/*
++	 * Nothing to talk to while the panel is down. Without this the poll
++	 * keeps running at 60 Hz against an unpowered chip and logs "page
++	 * select failed: -6" about fifty times a second for as long as the
++	 * screen is off — measured: 240 suppressed callbacks per 5 s, and a
++	 * log with nothing else visible in it.
++	 */
++	if (READ_ONCE(ts->panel_off))
++		return;
++
++	if (ts->rdy_gpio && !gpiod_get_value_cansleep(ts->rdy_gpio))
++		return;
++
++	/* Select the page the event buffer lives on before reading it. */
++	ret = nvt_set_page(ts, event_buf_addr);
++	if (ret) {
++		dev_err_ratelimited(&ts->client->dev, "page select failed: %d\n", ret);
++		return;
++	}
++
 +	ret = nvt_read(ts, 0x00, point_data, sizeof(point_data));
 +	if (ret) {
 +		dev_err_ratelimited(&ts->client->dev, "point read failed: %d\n", ret);
-+		return IRQ_HANDLED;
++		return;
++	}
++
++	/*
++	 * Raw-buffer instrumentation. Decoding silently produced nothing, and a
++	 * clean poll loop that reports no contacts looks identical whether the
++	 * chip is sending nothing or we are decoding it wrongly. Dump the head
++	 * of the buffer whenever it is not all zeros: that distinguishes the
++	 * two in one touch, instead of another guess-and-reflash cycle.
++	 *
++	 * Enable with gemini_nt36xxx.raw_debug=1.
++	 */
++	if (raw_debug) {
++		bool any = false;
++
++		for (i = 0; i < 16; i++)
++			if (point_data[i]) { any = true; break; }
++
++		if (any)
++			dev_info_ratelimited(&ts->client->dev,
++				"raw %*ph\n", 16, point_data);
 +	}
 +
 +	for (i = 0; i < NVT_MAX_FINGERS; i++) {
-+		unsigned int pos = 1 + 6 * i;
++		/*
++		 * OFF-BY-ONE WARNING, and it cost a test cycle.
++		 *
++		 * The vendor decodes at `1 + 6 * i` because ITS buffer holds the
++		 * register byte at [0] — CTP_I2C_READ writes buf[0] as the
++		 * register and reads the payload into buf[1..]. Our nvt_read()
++		 * reads the payload into buf[0..], so the same fields live six
++		 * bytes earlier per finger and one byte earlier overall.
++		 *
++		 * Copying the vendor's index verbatim made every field wrong:
++		 * the state nibble almost never matched 0x01/0x02, so contacts
++		 * were silently discarded and the driver polled cleanly while
++		 * reporting nothing — the most misleading possible failure.
++		 */
++		unsigned int pos = 6 * i;
 +		unsigned int id = point_data[pos] >> 3;
 +		unsigned int state = point_data[pos] & 0x07;
 +		unsigned int x, y, w, p;
@@ -241,20 +391,64 @@ found on their Solomon unit.
 +
 +	input_mt_sync_frame(ts->input);
 +	input_sync(ts->input);
-+
-+	return IRQ_HANDLED;
 +}
++
++/*
++ * Panel-follower callbacks.
++ *
++ * The NT36672 is a TDDI part: display and touch share one die and one power
++ * domain, so the panel's prepare/unprepare IS this controller's power
++ * sequence. Nothing else was telling the touch driver about it, which had two
++ * consequences — a 60 Hz I2C error loop for as long as the screen was off, and
++ * a controller that came back from cold with no one to re-initialise it.
++ *
++ * drm_panel_prepare()/unprepare() call these with the panel's follower_lock
++ * held, so they may sleep but must not touch DRM.
++ */
++static int nvt_ts_panel_prepared(struct drm_panel_follower *follower)
++{
++	struct nvt_ts *ts = container_of(follower, struct nvt_ts, panel_follower);
++
++	/*
++	 * The chip has just come up from cold and LK is not around to release
++	 * it this time, so drive the same reset probe does, and re-read the
++	 * firmware info — the resolution it reports is what the input device's
++	 * axis limits were built from.
++	 */
++	nvt_reset(ts);
++	nvt_read_fw_info(ts);
++	WRITE_ONCE(ts->panel_off, false);
++	return 0;
++}
++
++static int nvt_ts_panel_unpreparing(struct drm_panel_follower *follower)
++{
++	struct nvt_ts *ts = container_of(follower, struct nvt_ts, panel_follower);
++
++	WRITE_ONCE(ts->panel_off, true);
++
++	/*
++	 * Drop any contact still down. A finger held as the screen blanks would
++	 * otherwise stay reported until the next successful poll, which is
++	 * after the panel comes back — a stuck press across a whole blank.
++	 */
++	if (ts->input) {
++		input_mt_sync_frame(ts->input);
++		input_sync(ts->input);
++	}
++	return 0;
++}
++
++static const struct drm_panel_follower_funcs nvt_ts_panel_follower_funcs = {
++	.panel_prepared   = nvt_ts_panel_prepared,
++	.panel_unpreparing = nvt_ts_panel_unpreparing,
++};
 +
 +static int nvt_ts_probe(struct i2c_client *client)
 +{
 +	struct device *dev = &client->dev;
 +	struct nvt_ts *ts;
 +	int ret;
-+
-+	if (!client->irq) {
-+		dev_err(dev, "no interrupt; this driver is interrupt-driven\n");
-+		return -EINVAL;
-+	}
 +
 +	ts = devm_kzalloc(dev, sizeof(*ts), GFP_KERNEL);
 +	if (!ts)
@@ -268,6 +462,13 @@ found on their Solomon unit.
 +		return dev_err_probe(dev, PTR_ERR(ts->reset_gpio),
 +				     "failed to get the reset GPIO\n");
 +
++	ts->rdy_gpio = devm_gpiod_get_optional(dev, "irq", GPIOD_IN);
++	if (IS_ERR(ts->rdy_gpio))
++		return dev_err_probe(dev, PTR_ERR(ts->rdy_gpio),
++				     "failed to get the data-ready GPIO\n");
++	if (!ts->rdy_gpio)
++		dev_warn(dev, "no irq-gpios: polling ungated, which returns junk on this part\n");
++
 +	ts->swap_xy = device_property_read_bool(dev, "touchscreen-swapped-x-y");
 +	ts->invert_y = device_property_read_bool(dev, "touchscreen-inverted-y");
 +
@@ -280,6 +481,7 @@ found on their Solomon unit.
 +
 +	ts->input->name = "Novatek NT36xxx Touchscreen";
 +	ts->input->id.bustype = BUS_I2C;
++	input_set_drvdata(ts->input, ts);
 +
 +	/*
 +	 * After a swap the reported X spans what was the Y range. Set the axis
@@ -298,17 +500,32 @@ found on their Solomon unit.
 +	if (ret)
 +		return dev_err_probe(dev, ret, "failed to init MT slots\n");
 +
-+	ret = devm_request_threaded_irq(dev, client->irq, NULL, nvt_ts_irq,
-+					IRQF_ONESHOT, "gemini-nt36xxx", ts);
++	/* 60 Hz: comfortably above what a cursor needs, and cheap — one 65-byte
++	 * I2C read per tick on a bus doing nothing else. */
++	ret = input_setup_polling(ts->input, nvt_ts_poll);
 +	if (ret)
-+		return dev_err_probe(dev, ret, "failed to request IRQ %d\n",
-+				     client->irq);
++		return dev_err_probe(dev, ret, "failed to set up polling\n");
++	input_set_poll_interval(ts->input, 16);
 +
 +	ret = input_register_device(ts->input);
 +	if (ret)
 +		return dev_err_probe(dev, ret, "failed to register input device\n");
 +
-+	dev_info(dev, "Novatek NT36xxx touchscreen ready (client 0x%02x, reports via 0x%02x)\n",
++	/*
++	 * Follow the panel's power state, if the DT says which panel. Optional
++	 * on purpose: a device tree without the phandle keeps the old
++	 * always-polling behaviour rather than failing to probe, which is the
++	 * right trade for a driver whose job is an input device.
++	 */
++	ts->panel_follower.funcs = &nvt_ts_panel_follower_funcs;
++	ret = devm_drm_panel_add_follower(dev, &ts->panel_follower);
++	if (ret == -EPROBE_DEFER)
++		return ret;
++	if (ret)
++		dev_warn(dev, "not following a panel (%d): polling will continue while the screen is off\n",
++			 ret);
++
++	dev_info(dev, "Novatek NT36xxx touchscreen ready (client 0x%02x, reports via 0x%02x, polled - B-11)\n",
 +		 client->addr, NVT_FW_ADDR);
 +	return 0;
 +}
@@ -330,3 +547,35 @@ found on their Solomon unit.
 +
 +MODULE_DESCRIPTION("Novatek NT36xxx touchscreen (Gemini PDA)");
 +MODULE_LICENSE("GPL");
+--- a/drivers/input/touchscreen/Kconfig
++++ b/drivers/input/touchscreen/Kconfig
+@@ -654,6 +654,19 @@
+ 	  To compile this driver as a module, choose M here: the
+ 	  module will be called mtouch.
+ 
++config TOUCHSCREEN_GEMINI_NT36XXX
++	tristate "Novatek NT36xxx touchscreen (Gemini PDA)"
++	depends on I2C
++	help
++	  Report-path driver for the Novatek NT36xxx capacitive touch
++	  controller fitted to the NT36672-panel variant of the Planet
++	  Computers Gemini PDA. The other variant carries a Solomon
++	  SSD2092 instead; both nodes exist in the vendor device tree and
++	  probe decides which one answers.
++
++	  To compile this driver as a module, choose M here: the module
++	  will be called gemini-nt36xxx.
++
+ config TOUCHSCREEN_NOVATEK_NVT_TS
+ 	tristate "Novatek NT11205 touchscreen support"
+ 	depends on I2C
+--- a/drivers/input/touchscreen/Makefile
++++ b/drivers/input/touchscreen/Makefile
+@@ -67,6 +67,7 @@
+ obj-$(CONFIG_TOUCHSCREEN_MSG2638)	+= msg2638.o
+ obj-$(CONFIG_TOUCHSCREEN_MTOUCH)	+= mtouch.o
+ obj-$(CONFIG_TOUCHSCREEN_MK712)		+= mk712.o
++obj-$(CONFIG_TOUCHSCREEN_GEMINI_NT36XXX)	+= gemini-nt36xxx.o
+ obj-$(CONFIG_TOUCHSCREEN_NOVATEK_NVT_TS)	+= novatek-nvt-ts.o
+ obj-$(CONFIG_TOUCHSCREEN_HP600)		+= hp680_ts_input.o
+ obj-$(CONFIG_TOUCHSCREEN_HP7XX)		+= jornada720_ts.o

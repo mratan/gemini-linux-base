@@ -1,0 +1,78 @@
+arm64: dts: mediatek: gemini: add the Novatek touchscreen node
+
+The node the whole touchscreen depends on was never in this series. It was
+added by hand to the build tree when the driver landed and tracked nowhere,
+so applying the patch series produced a kernel with the driver compiled in
+and nothing for it to bind to. Found 2026-08-21 by applying the series to a
+pristine tree and diffing against the tree that actually builds.
+
+The vendor DTB carries BOTH touch controllers on this bus — cap_touch@62
+(Novatek) and solomon_touch@53 — because the Gemini shipped in two panel
+variants with a different touch IC each, and the vendor kernel builds a
+driver for both and lets probe decide. Keep both enabled for the same
+reason: one image, either unit. On this device 0x53 answers with -ENXIO and
+0x62 answers; on bsg100's it is the other way round.
+
+Two things in here are not obvious and are commented in place: the chip is
+addressed at 0x62 but its reports are read from 0x01, and CTP_INT is an
+ordinary GPIO rather than an interrupt because mainline's MT6797 pinctrl
+registers no EINT data at all (B-11).
+
+`panel = <&gemini_panel>` makes the driver a drm_panel_follower: this is a
+TDDI part, so the panel's prepare/unprepare IS this controller's power
+sequence.
+
+Signed-off-by: mratan <mattdratan@gmail.com>
+
+--- a/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
++++ b/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
+@@ -577,6 +577,49 @@
+ 	clock-frequency = <400000>;
+ 	status = "okay";
+ 
++	/*
++	 * VARIANT (2026-08-20): this unit is the Novatek one. The vendor DTB
++	 * carries BOTH touch controllers on this bus — cap_touch@62 (Novatek)
++	 * and solomon_touch@53 — because the Gemini shipped with two panel
++	 * variants, each with its own touch IC, and the vendor kernel builds a
++	 * driver for each and lets probe decide.
++	 *
++	 * bsg100's device is the Solomon one: their scan found 0x53 ACKing and
++	 * 0x62 absent. On this device it is the other way round — the panel is
++	 * an NT36672 and `ssd2092 3-0053` fails with -ENXIO, i.e. nothing is at
++	 * 0x53. Leaving both nodes enabled means one image serves both units,
++	 * which is what the vendor does.
++	 *
++	 * The chip is addressed at 0x62 but reports are read from 0x01; the
++	 * driver handles that. See gemini-nt36xxx.c.
++	 */
++	cap_touch: touchscreen@62 {
++		compatible = "novatek,nt36xxx-ts";
++		reg = <0x62>;	/* vendor DTB cap_touch@62 */
++		reset-gpios = <&pio 68 GPIO_ACTIVE_LOW>;	/* CTP_RST, shared with the Solomon node */
++		/*
++		 * CTP_INT as a plain GPIO, not an interrupt: mainline MT6797
++		 * pinctrl registers no EINT data (B-11), so `interrupts` here
++		 * resolves to nothing. The driver reads this line to know when
++		 * the point buffer is valid — without that gate the reads
++		 * return junk.
++		 */
++		irq-gpios = <&pio 85 GPIO_ACTIVE_LOW>;		/* CTP_INT, data-ready */
++		/* Clamshell used in landscape; the panel is natively portrait. */
++		touchscreen-swapped-x-y;
++		touchscreen-inverted-y;
++		/*
++		 * This is a TDDI part: the touch controller shares the panel's
++		 * die and its power domain, so the panel's prepare/unprepare is
++		 * this chip's power sequence. Naming the panel here makes the
++		 * driver a drm_panel_follower, which is how it learns to stop
++		 * polling an unpowered chip and to re-initialise one that has
++		 * just come back from cold.
++		 */
++		panel = <&gemini_panel>;
++		status = "okay";
++	};
++
+ 	touchscreen@53 {
+ 		compatible = "solomon,ssd2092-touch";
+ 		reg = <0x53>;	/* vendor DTB solomon_touch@53 */
