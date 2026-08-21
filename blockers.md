@@ -2055,11 +2055,21 @@ panfrost 13040000.gpu: GPU Fault 0x00ff0388 (GPU_SHAREABILITY_FAULT) at 0x000000
    `readback lo=09564007 hi=00000001`. **The hardware keeps the high half.** A
    `mem=3G` kernel did not help either.
 
+4. **MFG_ASYNC starved of its main clock.** `pmdomain/0005` *replaced*
+   `CLK_MFG` with `CLK_MFG52M` on MFG_ASYNC and MFG, on the reasoning that the
+   vendor's PGATE pre_clk is `mfg_52m_sel` — true, but a pre_clk is what the
+   vendor turns on *around* an mtcmos transition, not instead of the domain's
+   ordinary feed, and `MAX_CLKS` is 3 so there was never a reason to choose.
+   Gave both domains `{CLK_MFG52M, CLK_MFG}` (kernel #29): no change, 598 fault
+   lines in 40 s. Reverted.
+
 **Next places to look:** the EMI MPU's master-domain permissions for the GPU's
-AXI ID; the MFG_ASYNC bridge's own clock (`pmdomain/0005` *replaced* `CLK_MFG`
-with `CLK_MFG52M` on MFG_ASYNC rather than adding it, and `MAX_CLKS` is 3 so
-both would fit); a register-level comparison against the vendor stack actually
-running a job.
+AXI ID — MediaTek's preloader programs DRAM region permissions per master, and
+getting one master wrong denies exactly that master, which is the shape of this
+failure. Testing it needs vendor EMI register knowledge and guessing at DRAM
+protection registers on a working machine is a bad trade. The other route is a
+register-level comparison against the vendor stack actually running a GPU job,
+which is what the Reference slot exists for.
 
 **Side finding:** `rmmod panfrost` while a reset is queued oopses in
 `drm_sched_start` -> `kthread_unpark(NULL)` from `panfrost_reset_work`. Upstream
