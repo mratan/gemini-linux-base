@@ -2012,6 +2012,32 @@ against 209 on a Raspberry Pi 4 (Cortex-A72 @1.8 GHz), consistent with roughly
 1.2-1.4 GHz but not pinning it. **If LK has left the clusters at a low OPP,
 DVFS is worth more than the A72s.**
 
+**The read-only measurement to take FIRST, before booting anything.** The SPM
+exposes CPU power state directly, and the vendor register map for it is in
+`drivers/misc/mediatek/base/power/include/spm_v2/mt_spm_reg_mt6797.h`
+(SPM_BASE = `0x10006000`):
+
+| register | address | what it tells us |
+|---|---|---|
+| `CPU_PWR_STATUS` | `0x10006188` | which CPU cores/clusters are powered |
+| `CPU_PWR_STATUS_2ND` | `0x1000618C` | the second-source copy |
+| `MP0_CPUSYS_PWR_CON` | `0x10006210` | cluster 0 — known good, the reference |
+| `MP2_CPUSYS_PWR_CON` | `0x10006218` | **cluster 2 (A72)** |
+| `MP2_CPU0_PWR_CON` | `0x10006240` | A72 core 0 |
+| `MP2_CPU1_PWR_CON` | `0x10006244` | A72 core 1 |
+
+Reading those against the MP0 equivalents says whether cluster 2 is unpowered
+or powered-but-not-released, with no reboot and no risk. Do it before the
+Android trip, not after.
+
+**Where the power sequence is NOT.** `MP2_CPUTOP_PWR_CON` and friends are
+defined in the vendor SPM header, but **no `.c` file in the vendor Linux tree
+writes them** — `spm_mtcmos_ctrl_cpu1..cpu7` covers only the two A53 clusters'
+cores. So cluster 2's bring-up is very likely in ATF/firmware behind PSCI,
+which would mean the A72s are not reachable by a kernel-side change alone. That
+is a hypothesis from absence of evidence, and the register reads above are what
+would turn it into a fact.
+
 **The instrument nobody has used: boot1.** The device carries stock rooted
 Android on p22, which is software-selectable, and it drives all three clusters
 with the vendor stack every day. Reading `/sys/devices/system/cpu/{present,online}`
