@@ -51,7 +51,8 @@
  *
  * Protocol, from aeon_nt36xxx/nt36xxx.c:
  *   read 65 bytes from address 0x01 starting at register 0x00; then for each
- *   finger i, at offset 1 + 6*i:
+ *   finger i, at payload offset 6*i (the vendor writes 1 + 6*i because its
+ *   buffer also holds the register byte at [0]):
  *     [0] bits 7:3 = touch id (1-based), bits 2:0 = state (1 = down, 2 = move)
  *     [1] x high 8       [2] y high 8
  *     [3] x low 4 (7:4), y low 4 (3:0)
@@ -78,10 +79,15 @@
 #define NVT_DEFAULT_MAX_X	1080
 #define NVT_DEFAULT_MAX_Y	1920
 
+static bool raw_debug;
+module_param(raw_debug, bool, 0644);
+MODULE_PARM_DESC(raw_debug, "log the raw point buffer whenever it is non-zero");
+
 struct nvt_ts {
 	struct i2c_client	*client;
 	struct input_dev	*input;
 	struct gpio_desc	*reset_gpio;
+	struct gpio_desc	*rdy_gpio;
 	u32			max_x;
 	u32			max_y;
 	bool			swap_xy;
@@ -163,14 +169,65 @@ static void nvt_ts_poll(struct input_dev *input)
 	unsigned int i;
 	int ret;
 
+	/*
+	 * Only read when the controller says it has something.
+	 *
+	 * The vendor's thread blocks on the CTP_INT interrupt and reads exactly
+	 * once per assertion. Reading whenever we feel like it returns junk:
+	 * measured here, an ungated poll alternates between all-0xff and a
+	 * fixed pattern that never changes with touch. The buffer is only valid
+	 * in the window after the controller raises its data-ready line.
+	 *
+	 * We cannot take an interrupt from that line (B-11: mainline MT6797
+	 * pinctrl has no EINT support), but we can READ it as an ordinary GPIO,
+	 * which works fine. So poll the line and do the transfer only when it
+	 * is asserted — the vendor's semantics, minus the interrupt.
+	 */
+	if (ts->rdy_gpio && !gpiod_get_value_cansleep(ts->rdy_gpio))
+		return;
+
 	ret = nvt_read(ts, 0x00, point_data, sizeof(point_data));
 	if (ret) {
 		dev_err_ratelimited(&ts->client->dev, "point read failed: %d\n", ret);
 		return;
 	}
 
+	/*
+	 * Raw-buffer instrumentation. Decoding silently produced nothing, and a
+	 * clean poll loop that reports no contacts looks identical whether the
+	 * chip is sending nothing or we are decoding it wrongly. Dump the head
+	 * of the buffer whenever it is not all zeros: that distinguishes the
+	 * two in one touch, instead of another guess-and-reflash cycle.
+	 *
+	 * Enable with gemini_nt36xxx.raw_debug=1.
+	 */
+	if (raw_debug) {
+		bool any = false;
+
+		for (i = 0; i < 16; i++)
+			if (point_data[i]) { any = true; break; }
+
+		if (any)
+			dev_info_ratelimited(&ts->client->dev,
+				"raw %*ph\n", 16, point_data);
+	}
+
 	for (i = 0; i < NVT_MAX_FINGERS; i++) {
-		unsigned int pos = 1 + 6 * i;
+		/*
+		 * OFF-BY-ONE WARNING, and it cost a test cycle.
+		 *
+		 * The vendor decodes at `1 + 6 * i` because ITS buffer holds the
+		 * register byte at [0] — CTP_I2C_READ writes buf[0] as the
+		 * register and reads the payload into buf[1..]. Our nvt_read()
+		 * reads the payload into buf[0..], so the same fields live six
+		 * bytes earlier per finger and one byte earlier overall.
+		 *
+		 * Copying the vendor's index verbatim made every field wrong:
+		 * the state nibble almost never matched 0x01/0x02, so contacts
+		 * were silently discarded and the driver polled cleanly while
+		 * reporting nothing — the most misleading possible failure.
+		 */
+		unsigned int pos = 6 * i;
 		unsigned int id = point_data[pos] >> 3;
 		unsigned int state = point_data[pos] & 0x07;
 		unsigned int x, y, w, p;
@@ -232,6 +289,13 @@ static int nvt_ts_probe(struct i2c_client *client)
 	if (IS_ERR(ts->reset_gpio))
 		return dev_err_probe(dev, PTR_ERR(ts->reset_gpio),
 				     "failed to get the reset GPIO\n");
+
+	ts->rdy_gpio = devm_gpiod_get_optional(dev, "irq", GPIOD_IN);
+	if (IS_ERR(ts->rdy_gpio))
+		return dev_err_probe(dev, PTR_ERR(ts->rdy_gpio),
+				     "failed to get the data-ready GPIO\n");
+	if (!ts->rdy_gpio)
+		dev_warn(dev, "no irq-gpios: polling ungated, which returns junk on this part\n");
 
 	ts->swap_xy = device_property_read_bool(dev, "touchscreen-swapped-x-y");
 	ts->invert_y = device_property_read_bool(dev, "touchscreen-inverted-y");
