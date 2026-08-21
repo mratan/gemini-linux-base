@@ -1382,7 +1382,49 @@ before relying on the device being back to a good state.
 ---
 
 
-## 🔴 B-31 — Novatek touch firmware never reaches NORMAL_RUN: it re-inits every ~43 ms
+## 🟢 B-31 — Novatek touch firmware never reaches NORMAL_RUN (RESOLVED 2026-08-20)
+
+**RESOLVED the same evening it was opened.** The cause was the DSI's horizontal
+blanking, not anything on the input side.
+
+This is a Novatek NT36672 **TDDI** part: the touch controller shares the
+panel's silicon and power domain, and its sensor scan and calibration run
+during horizontal blanking. `mtk_dsi_config_vdo_timing()` reserves
+`data_phy_cycles * lanes` — 200 bytes here — out of the porches for LP→HS
+transitions; LK reserves nothing. Both light the panel, which is why the
+difference was written off (in the #45 gate work, hours earlier, by me) as
+"not a defect". It is not a defect for the display. It starves the touch side
+of its quiet window.
+
+| | HSA_WC | HBP_WC | HFP_WC | result |
+|---|---|---|---|---|
+| mainline | 0x14 | 0x27 | 0x22 | 0xA0/0xA1 cycling, fw_ver valid 69/120 |
+| LK | 0x1C | 0x94 | 0x74 | **0xA3 NORMAL_RUN**, stable, 120/120, contacts decode |
+
+Isolating one at a time: **HFP_WC is necessary in every passing combination**
+and needs margin from one of the other two. The front porch is the quiet window
+immediately after active video — where a TDDI part scans.
+
+Fix: `patches/v6.6/drm/0019-drm-mediatek-dsi-mt6797-lk-horizontal-word-counts.patch`,
+same idiom as the PHY_TIMCON override in `drm/0015`. Verified on hardware
+(`boot-touchfix2`, `873e79a5`, `6.6.0-dirty #16`): `reset_complete = 0xA3` at
+boot with no userspace poke, panel gate PASS 13/13, touch drives the cursor.
+
+Second bug found on top of it: the cursor moved but landed wrong, because the
+kernel driver already reports landscape `0..2160 x 0..1080` and the libinput
+`TransformationMatrix` rotated it a second time. It must be identity.
+
+**The one thing that still stands from the investigation below:** touch shares
+the panel's power domain and vanishes from the bus when the display blanks, so
+suspend/resume has to re-init the controller (issue #39), and any measurement
+taken with the display asleep is measuring a powered-down block.
+
+The diagnostic history is kept below, including the eight hypotheses that were
+ruled out — several of them mine, and the one I argued away.
+
+---
+
+## (history) B-31 — the investigation, before the cause was found
 
 **Opened 2026-08-20 late.** This supersedes B-9 ("touchscreen chip identity
 unknown") — the identity question is closed, and what is left is a different
