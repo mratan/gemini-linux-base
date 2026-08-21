@@ -2151,6 +2151,32 @@ touched it. **So this is not a hardware limit. We simply never power it.**
    `PWR_RST_B`. It then needs invoking before PSCI `CPU_ON`, which is what
    currently hangs.
 
+*Determined device-free 2026-08-21: **VPROC2 is BUCKB**, and BUCKA is the
+other CPU rail.* Two independent sources agree. The vendor defines
+`#define DA9214_VPROC2 0xD9` (`mt_cpufreq.c`), and mainline's register map has
+`DA9211_REG_VBUCKB_A = 0xD9` (`da9211-regulator.h`). So the A72 supply is the
+DA9214's **BUCKB**; **BUCKA is a separate CPU core rail and may well be the one
+the running A53 clusters depend on.** Do not declare BUCKA without knowing.
+
+*Which makes the ordering a safety property, not tidiness.* The regulator core
+disables regulators nothing has claimed, in a sweep at late_initcall. A
+built-in da9211 with a DA9214 node would make the first boot that has the node
+also the first boot that could switch off the CPUs' own supply — taking the
+panel with it, on a machine whose only display that is. Hence
+`CONFIG_REGULATOR_DA9211=m` (`configs/gemini-cpu-regulator.config`): as a
+module nothing binds until `modprobe da9211`, after the sweep has already run,
+so identifying the two bucks is a deliberate observed step rather than
+something that happens during boot while nobody is watching.
+
+*Unresolved, and the reason the probe still comes first:* the board has **two**
+candidate VPROC providers. `mt6797-gemini-pda.dts` carries an RT5735 at
+i2c7:0x1c also named `vproc` (currently `status = "disabled"`), while the
+live `vproc` consumers see a `regulator-fixed` called `vproc_fixed` asserting a
+flat 1.000 V — a device-tree fiction with no control behind it, which is part of
+why there is no DVFS. Whether the A53s actually run off the RT5735 or off the
+DA9214's BUCKA is not established, and reading BUCKA's enable bit and voltage
+settles it in one step.
+
 *A trap that would have cost a day.* **`drivers/misc/mediatek/base/power/mt6797/mt_spm_cpu.h`
 is stale — it was copied from an earlier SoC and never updated**, and
 `spm_mtcmos_ctrl_cpusys1()` operates on its addresses. Proven by reading the
