@@ -1957,14 +1957,105 @@ required booting boot1 Android and restoring `boot-gpustack4.img`
 other known-good.** Android on boot1 remains the deep fallback and was
 untouched throughout.
 
-## 🔴 B-44 — the display behind the M4U: one real bug fixed, one still there
+## 🟢 B-44 — the display runs behind the M4U (RESOLVED 2026-08-21)
 
-**Opened 2026-08-21.** Wiring `iommus` into the display (dts/0042) took two
-flashes and produced one solid fix and one unsolved failure. **Currently rolled
-back: p1 holds `#34` (M4U present, display NOT behind it), marked good, desktop
-verified on the glass.**
+**Opened and closed 2026-08-21.** Three bugs, all of the same kind: a register
+address, a register-block configuration and a register bit-field, each inherited
+from a different MediaTek SoC by a "modelled on" assumption, each contradicted by
+the vendor register map for mt6797.
 
-### Fixed, and worth having regardless: mt6797's SMI_LARB_MMU_EN is at 0xfc0
+**Resolved on `#40`**: `iommus` on OVL0 / OVL0-2L / RDMA0, `MMU_EN = 0x7`,
+`CTRL_REG = 0x20`, zero `flip_done` timeouts, OVL0 fetching from a mapped IOVA,
+vblank IRQ running, and the LXQt desktop photographed correct on the glass.
+
+### The one that took three kernels: MMU_CTRL_REG's bit-fields
+
+`mtk_iommu_hw_init()` picks between two REG_MMU_CTRL_REG constants. mt6797_data
+carried `TF_PORT_TO_ADDR_MT8173`, so it got MT8173's:
+
+```
+F_MMU_TF_PROT_TO_PROGRAM_ADDR_MT8173	(2 << 5)
+F_MMU_PREFETCH_RT_REPLACE_MOD		BIT(4)
+```
+
+`drivers/misc/mediatek/m4u/mt6797/m4u_reg.h` says this chip is not laid out that
+way:
+
+```
+#define F_MMU_CTRL_INT_HANG_EN(en)      F_BIT_VAL(en, 6)
+#define F_MMU_CTRL_TF_PROTECT_SEL(en)   F_VAL(en, 5, 4)
+```
+
+So MT8173's constant sets **INT_HANG_EN** and leaves TF_PROTECT_SEL at 0, and
+the prefetch bit lands in the bottom of the selector. Read back on `#37` and
+`#38`: `0x10205110 = 0x50` — TF_PROTECT_SEL = 1, INT_HANG_EN = 1. The vendor's
+`m4u_reg_init()` asks for TF_PROTECT_SEL = **2**, INT_HANG_EN = **0**.
+
+That field decides what happens to a transaction that faults: redirected to the
+protect address so the master completes, or stopped. Ours stopped it.
+
+**The failure, measured with three prints in one boot (`#38`):**
+
+```
+[1.001] disp-ovl0: GEMDBG dma=0xfe000000 domain=dma phys=0x103200000
+[1.006] 14020000.larb: SMIDBG MMU_EN <- 0x7
+[1.006] mtk-iommu: fault type=0x5 iova=0x7e1e9000 pa=0x0 (larb=0 port=0) read
+        ...ten of them, and then nothing, ever again
+```
+
+LK leaves DISP_OVL0 scanning out **its own** framebuffer at physical
+`0x7dfb0000` — still sitting in `OVL_ADDR` at that moment, because
+`mtk_ovl_layer_config()` had not run even once (zero `OVLDBG` lines). The
+instant the larb starts translating, that scanout's in-flight reads become
+unmapped IOVAs. Note the faulting address **changes every boot** and is not the
+buffer DRM allocated: it is wherever inside LK's framebuffer the OVL happened to
+be reading. The kernel's own buffer was fine all along — `0xfe000000`, domain
+`dma`, mapped to `0x103200000`.
+
+With the fault handling misconfigured the OVL's internal RDMA never got its data
+back. `OVL_STA` kept `RUN = 1` with an `RDMA_IDLE` bit clear for the rest of the
+boot, `INTSTA` showed `ABNORMAL_SOF` (bit 13, per the vendor's
+`ddp_reg_ovl.h`), and no frame-done interrupt was ever raised. mt6797 has no
+CMDQ and `shadow_register = false`, so `mtk_crtc_ddp_config()` — the only writer
+of the plane registers — runs *solely* from that interrupt. Hence `OVL_SRC_CON`
+frozen at 0, no layers, and `flip_done timed out` every ten seconds forever.
+
+**So "zero IOMMU faults" in the first draft of this entry was wrong and is
+retracted.** There were faults on `#36` too; nothing printed them because the
+larb's MMU_EN was still going to the wrong register then (below), so nothing
+reached the IOMMU. Two different bugs produced the same reassuring log, one after
+the other.
+
+Fixed in `iommu/0002` by dropping the flag — its only other job, the fault-ID
+decode, already falls through to the layout mt6797 uses — and by masking the
+field before setting it rather than OR-ing into it.
+
+### Also fixed: mt6797's SMI common is not mt6795's
+
+`memory/0001` pointed the mt6797 smi-common compatible at
+`mtk_smi_common_mt6795`. Both fields it carries are wrong for this SoC, and both
+only ever reach hardware when the display goes behind the M4U — because that is
+the first time this device runtime-resumes smi-common at all. Verified on `#34`
+with the desktop up: `0x14022100..0x1402211c`, `0x220`, `0x230`, `0x234`,
+`0x238` and `0x300` **all read 0x00000000**.
+
+- `bus_sel`. `smi_configuration.c` (built `-DSMI_EV` for `CONFIG_ARCH_MT6797`)
+  writes `0x220 = 0x1554` — larb0 to MMU0, larbs 1..6 to MMU1. mt6795 asks for
+  `F_MMU1_LARB(0) = 0x1`, the opposite for larb0. With only larb0 instantiated,
+  `0x1554` and the mainline default `0` are the same thing here; `0x1` is the
+  one value that is not.
+- The init table's offsets. mt6795 writes `SMI_L1_ARB` at `0x200`; on mt6797
+  `smi_reg.h` puts `SMI_L1LEN` at `0x100` and `L1ARB0..6` at `0x104..0x11c`, and
+  `0x200` is absent from the SoC's smi-common map entirely.
+
+`memory/0004` gives mt6797 its own plat data with neither. The vendor's twelve
+real values are transcribed in the comment and deliberately **not** applied:
+they are arbitration and FIFO tuning, the display works without them, and
+landing twelve unmeasured writes in the kernel that first makes the display
+translate would make the result uninterpretable. Start there if bandwidth or
+underruns show up.
+
+### And, from the first round: mt6797's SMI_LARB_MMU_EN is at 0xfc0
 
 `memory/0001` added the mt6797 larb by pointing its compatible at
 `mtk_smi_larb_mt8173`, "modelled on mt6795". The one field that structure
@@ -1995,27 +2086,27 @@ addresses. The owner saw a garbled panel; the kernel logged a clean bind, zero
 IOMMU faults and zero contiguity errors. **A clean dmesg was not evidence of a
 working IOMMU — it was evidence that nothing ever reached the IOMMU.**
 
-### Not fixed: with the ports actually translating, the display stalls
+### What was written here as "not fixed", and what it actually was
 
-On `#36`, with `MMU_EN = 0x7`, the panel goes black and:
+The `#36` symptom — `flip_done timed out`, `OVL_SRC_CON = 0x00000000`, CRTC
+`enable=1 active=1`, backlight on — was recorded here as possibly "the same
+shape as B-17/#20", i.e. an atomic-KMS race that the IOMMU merely widened. It
+was not. It was MMU_CTRL_REG, described above, and #20 is untouched by this.
+The entry also said "still zero IOMMU faults, so this is not a translation
+failure". Both halves were wrong: there were faults, they simply could not be
+seen, and it *was* a translation failure — of LK's leftover scanout, not of
+anything the kernel allocated.
 
-```
-[drm] *ERROR* flip_done timed out
-[drm] *ERROR* [CRTC:51:crtc-0] commit wait timed out
-[drm] *ERROR* [CONNECTOR:32:DSI-1] commit wait timed out
-[drm] *ERROR* [PLANE:33:plane-0] commit wait timed out
-[drm:mtk_drm_crtc_atomic_begin] *ERROR* new event while there is still a pending event
-```
+### Still open, and worth doing: the kernel inherits a live scanout
 
-`OVL_SRC_CON` reads **0x00000000** — no layers enabled at all — while the CRTC
-reads `enable=1 active=1` and the backlight is on. So the commits never land and
-nothing is composited. Still **zero IOMMU faults**, so this is not a translation
-failure; the pipeline stops producing the vblank the commit waits on.
-
-This is the same shape as B-17/#20 (`flip_done`/vblank timeout), now reachable
-by putting the OVL behind the M4U. Whether translation genuinely changes the
-frame-done behaviour, or the IOMMU merely widens an existing race, is **not
-established** and should not be assumed either way.
+The handful of faults that remain at boot (3 on `#39`, 10 on `#40` — it depends
+on how far into a frame the OVL had got) are LK's scanout being cut off
+mid-fetch when MMU_EN goes to 0x7. They are now harmless — the M4U redirects
+them and the OVL carries on — but they should not happen. Nothing in the bring-up
+stops the bootloader's scanout before the display's ports start translating;
+`drm/0012` quiesces the OVL's *interrupt* at probe and leaves its layers running.
+Filed as its own follow-up rather than fixed here, because fixing it in the same
+kernel as MMU_CTRL_REG would have hidden which one mattered.
 
 ### Process failures, both mine
 

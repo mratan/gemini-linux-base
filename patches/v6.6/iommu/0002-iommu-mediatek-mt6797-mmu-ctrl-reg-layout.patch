@@ -1,0 +1,120 @@
+iommu/mediatek: mt6797 does not share MT8173's MMU_CTRL layout
+
+iommu/0001 gave mt6797_data the TF_PORT_TO_ADDR_MT8173 flag, following
+mt6795_data. The flag has exactly one effect: it chooses which constant
+mtk_iommu_hw_init() writes to REG_MMU_CTRL_REG. MT8173's is
+
+	F_MMU_TF_PROT_TO_PROGRAM_ADDR_MT8173	(2 << 5)
+
+i.e. a two-bit translation-fault protect selector at bits [6:5]. The
+vendor register map for THIS SoC,
+drivers/misc/mediatek/m4u/mt6797/m4u_reg.h, puts it somewhere else:
+
+	#define F_MMU_CTRL_INT_HANG_EN(en)	F_BIT_VAL(en, 6)
+	#define F_MMU_CTRL_TF_PROTECT_SEL(en)	F_VAL(en, 5, 4)
+
+So on mt6797 the MT8173 constant sets INT_HANG_EN and leaves
+TF_PROTECT_SEL at 0, and F_MMU_PREFETCH_RT_REPLACE_MOD (BIT(4)), written
+alongside it, lands in the bottom of the selector. Read back on kernels
+#37 and #38: REG_MMU_CTRL_REG = 0x50, which decodes on this chip as
+TF_PROTECT_SEL = 1 and INT_HANG_EN = 1. The vendor's own m4u_reg_init()
+asks for TF_PROTECT_SEL = 2 and INT_HANG_EN = 0.
+
+That is not a cosmetic difference. It decides what the M4U does to a
+transaction that faults: redirect it to the protect address so the master
+completes and carries on, or stop it. Measured consequence, which is
+B-44's unexplained stall:
+
+  [1.001] disp-ovl0: GEMDBG dma=0xfe000000 domain=dma phys=0x103200000
+  [1.006] 14020000.larb: SMIDBG MMU_EN <- 0x7
+  [1.006] mtk-iommu: fault type=0x5 iova=0x7e1e9000 pa=0x0 (larb=0 port=0) read
+          ... ten of them, then nothing, ever again
+
+LK leaves DISP_OVL0 scanning out its own framebuffer at physical
+0x7dfb0000 (still in OVL_ADDR at that point -- mtk_ovl_layer_config had
+not run once). The instant the larb starts translating, that scanout's
+in-flight reads become unmapped IOVAs. With the fault handling
+misconfigured the OVL's internal RDMA never gets its data back: OVL_STA
+shows RUN=1 with an RDMA_IDLE bit clear for the rest of the boot, no
+frame-done interrupt is ever raised, and since mt6797 has no CMDQ and
+shadow_register = false, mtk_crtc_ddp_config() -- the only writer of the
+plane registers -- runs solely from that interrupt. Hence OVL_SRC_CON
+stuck at 0, no layers, and "flip_done timed out" every ten seconds.
+
+Dropping the flag makes hw_init take the generic branch, which writes
+F_MMU_TF_PROT_TO_PROGRAM_ADDR (2 << 4) -- the right field, the right
+value, and the value the vendor uses. The field is masked before it is
+set rather than OR-ed into, because a two-bit field cannot be reached by
+OR alone, and INT_HANG_EN is explicitly cleared for the same reason: the
+reset state of a register the bootloader has touched is not something to
+assume.
+
+TF_PORT_TO_ADDR_MT8173 has no other user -- the fault-ID decode in
+mtk_iommu_isr() keys off HAS_SUB_COMM_*/INT_ID_PORT_WIDTH_6 and falls
+through to the layout mt6797 uses -- so nothing else changes.
+--- a/drivers/iommu/mtk_iommu.c
++++ b/drivers/iommu/mtk_iommu.c
+@@ -62,6 +62,19 @@
+ #define F_MMU_TF_PROT_TO_PROGRAM_ADDR		(2 << 4)
+ #define F_MMU_PREFETCH_RT_REPLACE_MOD		BIT(4)
+ #define F_MMU_TF_PROT_TO_PROGRAM_ADDR_MT8173	(2 << 5)
++/*
++ * MT6797 lays REG_MMU_CTRL_REG out differently again. From the vendor register
++ * map for this exact SoC, drivers/misc/mediatek/m4u/mt6797/m4u_reg.h:
++ *
++ *	#define F_MMU_CTRL_INT_HANG_EN(en)	F_BIT_VAL(en, 6)
++ *	#define F_MMU_CTRL_TF_PROTECT_SEL(en)	F_VAL(en, 5, 4)
++ *
++ * so the translation-fault protect selector is at bits [5:4] -- the position
++ * F_MMU_TF_PROT_TO_PROGRAM_ADDR already uses -- and bit 6, which MT8173 uses
++ * as the top of its own selector, is INT_HANG_EN on this chip.
++ */
++#define F_MMU_TF_PROT_SEL_MT6797		GENMASK(5, 4)
++#define F_MMU_INT_HANG_EN_MT6797		BIT(6)
+ 
+ #define REG_MMU_IVRP_PADDR			0x114
+ 
+@@ -1031,6 +1044,18 @@
+ 			 F_MMU_TF_PROT_TO_PROGRAM_ADDR_MT8173;
+ 	} else {
+ 		regval = readl_relaxed(bank0->base + REG_MMU_CTRL_REG);
++		if (data->plat_data->m4u_plat == M4U_MT6797) {
++			/*
++			 * Set the field, do not OR into it: a two-bit selector
++			 * cannot be reached by OR alone, and on this SoC the
++			 * bit above it is INT_HANG_EN, which must stay clear.
++			 * The vendor's own init (m4u_reg_init() in
++			 * drivers/misc/mediatek/m4u/mt6797/m4u_hw.c) asks for
++			 * exactly TF_PROTECT_SEL=2 with INT_HANG_EN=0.
++			 */
++			regval &= ~(F_MMU_TF_PROT_SEL_MT6797 |
++				    F_MMU_INT_HANG_EN_MT6797);
++		}
+ 		regval |= F_MMU_TF_PROT_TO_PROGRAM_ADDR;
+ 	}
+ 	writel_relaxed(regval, bank0->base + REG_MMU_CTRL_REG);
+@@ -1551,8 +1576,23 @@
+  */
+ static const struct mtk_iommu_plat_data mt6797_data = {
+ 	.m4u_plat     = M4U_MT6797,
++	/*
++	 * NOT TF_PORT_TO_ADDR_MT8173. That flag has exactly one effect --
++	 * it picks MT8173's REG_MMU_CTRL_REG layout in mtk_iommu_hw_init()
++	 * -- and MT6797 does not share it. MT8173's selector constant
++	 * (2 << 5) lands on this SoC's INT_HANG_EN bit while leaving its
++	 * TF_PROTECT_SEL at 0, which is the configuration in which a
++	 * translation fault stops the offending master dead instead of
++	 * redirecting it to the protect address. Measured: CTRL_REG read
++	 * back 0x50 on kernels #37 and #38, and the display's first fault
++	 * left DISP_OVL0 with a never-completing read (OVL_STA RDMA_IDLE
++	 * clear, no frame-done for the rest of the boot). Without the flag
++	 * the generic branch writes F_MMU_TF_PROT_TO_PROGRAM_ADDR at
++	 * bits [5:4], which is where this SoC's selector actually lives and
++	 * is the value the vendor driver asks for.
++	 */
+ 	.flags	      = HAS_4GB_MODE | RESET_AXI | HAS_LEGACY_IVRP_PADDR |
+-			MTK_IOMMU_TYPE_MM | TF_PORT_TO_ADDR_MT8173,
++			MTK_IOMMU_TYPE_MM,
+ 	.inv_sel_reg  = REG_MMU_INV_SEL_GEN1,
+ 	.banks_num    = 1,
+ 	.banks_enable = {true},

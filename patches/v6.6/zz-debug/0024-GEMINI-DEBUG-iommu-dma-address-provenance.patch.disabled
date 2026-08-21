@@ -1,0 +1,79 @@
+GEMINI DEBUG (B-44): where does the display's DMA address come from
+
+Three prints, one boot: what dma_alloc_attrs() hands the display and
+whether the IOMMU can translate it; when the larb's ports start
+translating; and what address each OVL layer is actually programmed
+with, plus the OVL's own RUN/IDLE and interrupt status at that moment.
+Temporary. Remove before anything is marked good.
+
+--- a/drivers/gpu/drm/mediatek/mtk_drm_gem.c
++++ b/drivers/gpu/drm/mediatek/mtk_drm_gem.c
+@@ -4,6 +4,7 @@
+  */
+ 
+ #include <linux/dma-buf.h>
++#include <linux/iommu.h>
+ 
+ #include <drm/drm.h>
+ #include <drm/drm_device.h>
+@@ -89,6 +90,26 @@
+ 			 mtk_gem->cookie, &mtk_gem->dma_addr,
+ 			 size);
+ 
++	/*
++	 * GEMINI DEBUG (B-44): is the address we just handed the display
++	 * actually translatable? Everything about the stall hinges on whether
++	 * dma_alloc_attrs() went through iommu-dma (so the IOVA is mapped) or
++	 * through dma-direct (so the display gets a physical address it will
++	 * then present to the M4U as an IOVA nothing has mapped).
++	 */
++	{
++		struct iommu_domain *d = iommu_get_domain_for_dev(priv->dma_dev);
++		phys_addr_t pa = d ? iommu_iova_to_phys(d, mtk_gem->dma_addr) : 0;
++
++		dev_info(priv->dma_dev,
++			 "GEMDBG size=%zu dma=%pad domain=%s phys=%pa\n",
++			 size, &mtk_gem->dma_addr,
++			 d ? (d->type == IOMMU_DOMAIN_DMA ? "dma" :
++			      d->type == IOMMU_DOMAIN_IDENTITY ? "identity" :
++			      "other") : "NONE",
++			 &pa);
++	}
++
+ 	return mtk_gem;
+ 
+ err_gem_free:
+--- a/drivers/memory/mtk-smi.c
++++ b/drivers/memory/mtk-smi.c
+@@ -226,6 +226,8 @@
+ 	struct mtk_smi_larb *larb = dev_get_drvdata(dev);
+ 
+ 	writel(*larb->mmu, larb->base + MT8167_SMI_LARB_MMU_EN);
++	/* GEMINI DEBUG (B-44): when do the ports start translating? */
++	dev_info(dev, "SMIDBG MMU_EN <- 0x%x\n", *larb->mmu);
+ 	return 0;
+ }
+ 
+--- a/drivers/gpu/drm/mediatek/mtk_disp_ovl.c
++++ b/drivers/gpu/drm/mediatek/mtk_disp_ovl.c
+@@ -23,6 +23,7 @@
+ 
+ #define DISP_REG_OVL_INTEN			0x0004
+ #define OVL_FME_CPL_INT					BIT(1)
++#define DISP_REG_OVL_STA			0x0000	/* GEMINI DEBUG (B-44) */
+ #define DISP_REG_OVL_INTSTA			0x0008
+ #define DISP_REG_OVL_EN				0x000c
+ #define DISP_REG_OVL_RST			0x0014
+@@ -453,6 +454,12 @@
+ 	mtk_ddp_write_relaxed(cmdq_pkt, addr, &ovl->cmdq_reg, ovl->regs,
+ 			      DISP_REG_OVL_ADDR(ovl, idx));
+ 
++	/* GEMINI DEBUG (B-44): what address is layer idx actually fetching? */
++	dev_info(dev, "OVLDBG L%u addr=0x%08x pitch=%u size=%ux%u sta=0x%08x intsta=0x%08x\n",
++		 idx, addr, pitch, pending->width, pending->height,
++		 readl(ovl->regs + DISP_REG_OVL_STA),
++		 readl(ovl->regs + DISP_REG_OVL_INTSTA));
++
+ 	if (is_afbc) {
+ 		mtk_ddp_write_relaxed(cmdq_pkt, hdr_addr, &ovl->cmdq_reg, ovl->regs,
+ 				      DISP_REG_OVL_HDR_ADDR(ovl, idx));

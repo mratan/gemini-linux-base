@@ -1,0 +1,117 @@
+memory: mtk-smi: give mt6797 its own smi-common data, not mt6795's
+
+memory/0001 pointed the mt6797 smi-common compatible at
+mtk_smi_common_mt6795, on the same "modelled on mt6795" assumption that
+memory/0003 has already had to undo once for the larb's SMI_LARB_MMU_EN
+offset. The assumption is wrong here too, and in two ways that matter
+exactly when the display is first put behind the M4U -- which is the
+first time this device ever runtime-resumes smi-common, and therefore
+the first time any of mt6795's values are written to hardware at all.
+
+The vendor SMI driver for this exact SoC (CONFIG_ARCH_MT6797 builds
+drivers/misc/mediatek/smi with -DSMI_EV) contradicts mt6795 on both
+fields it carries:
+
+1. SMI_BUS_SEL. smi_configuration.c's smi_profile_setting_common_init
+   writes 0x220 = 0x1554, i.e. F_MMU1_LARB(1..6): larb0 to MMU0 and
+   every other larb to MMU1. mt6795 asks for F_MMU1_LARB(0) = 0x1,
+   which is the opposite for larb0 specifically. larb0 is the display
+   and the only larb this tree instantiates, so for us 0x1554 and the
+   mainline default of 0 are the same thing and 0x1 is the one value
+   that is not.
+
+2. The init table's offsets. mt6795 uses the layout this file calls
+   SMI_L1_ARB (0x200). mt6797 does not have it: smi_reg.h puts
+   SMI_L1LEN at 0x100 and L1ARB0..L1ARB6 at 0x104..0x11c, and 0x200 is
+   not in the SoC's smi-common register map at all -- it is absent from
+   the vendor's own smi_common_debug_offset dump list. So the inherited
+   table writes 0x1b to something that is not L1_ARB on this chip while
+   leaving all seven real L1ARB registers at reset.
+
+The vendor's full mt6797 values are transcribed in a comment and
+deliberately not applied. Verified with devmem on kernel #34, with the
+desktop up and the panel lit: 0x14022100..0x1402211c, 0x220, 0x230,
+0x234, 0x238 and 0x300 all read 0x00000000. They have never been
+written on this machine and the display works. They are arbitration and
+FIFO tuning rather than correctness, and landing twelve unmeasured
+register writes in the same kernel that first makes the display
+translate would make the result uninterpretable either way. If
+bandwidth or underruns show up behind the M4U, that comment is where to
+start.
+
+Relevant to B-44: on #36 the display stalled with flip_done timeouts,
+OVL_SRC_CON = 0 and zero IOMMU faults. Three things changed at once in
+that kernel -- the ports began translating, larb0 was runtime-resumed
+for the first time, and smi-common was configured for the first time,
+with these values. This patch removes the third from the list.
+--- a/drivers/memory/mtk-smi.c
++++ b/drivers/memory/mtk-smi.c
+@@ -699,6 +699,59 @@
+ 	.init     = mtk_smi_common_mt6795_init,
+ };
+ 
++/*
++ * MT6797 (Helio X20). It was pointed at mtk_smi_common_mt6795 on the same
++ * "modelled on mt6795" assumption that put the larb's MMU-enable bits at the
++ * wrong address for months, and it is wrong here too. The vendor SMI driver
++ * for this exact SoC (CONFIG_ARCH_MT6797 builds drivers/misc/mediatek/smi with
++ * -DSMI_EV) disagrees with mt6795 on both fields:
++ *
++ * 1. bus_sel. smi_configuration.c's smi_profile_setting_common_init writes
++ *    SMI_BUS_SEL (0x220) = 0x1554 = F_MMU1_LARB(1..6) -- larb0 goes to MMU0
++ *    and everything else to MMU1. MT6795 asks for the exact opposite for
++ *    larb0 (F_MMU1_LARB(0) = 0x1). larb0 is the display, and it is the only
++ *    larb this tree instantiates, so 0 and 0x1554 are behaviourally identical
++ *    for us; 0x1 is the one value that is not. Leaving bus_sel at the default
++ *    0 is therefore both the mainline default and what the vendor asks for
++ *    where it can be observed.
++ *
++ * 2. The init table offsets. MT6795 uses the register layout this file calls
++ *    SMI_L1_ARB (0x200). MT6797 does not have that layout: smi_reg.h puts
++ *    SMI_L1LEN at 0x100 and L1ARB0..L1ARB6 at 0x104..0x11c (the non-SMI_R
++ *    branch), and 0x200 does not appear in the SoC's SMI common register map
++ *    at all. So mtk_smi_common_mt6795_init writes 0x1b into a register that
++ *    is not L1_ARB on this chip, and leaves every real L1ARB at reset.
++ *
++ * The vendor's own values, for whoever needs them (all offsets from
++ * drivers/misc/mediatek/smi/smi_reg.h, values from smi_configuration.c):
++ *
++ *      0x100 SMI_L1LEN        0xb
++ *      0x104 SMI_L1ARB0       0x18fc     0x108 L1ARB1  0x1000
++ *      0x10c SMI_L1ARB2       0x1000     0x110 L1ARB3  0x1000
++ *      0x114 SMI_L1ARB4       0x1000     0x118 L1ARB5  0x126a
++ *      0x11c SMI_L1ARB6       0x1000
++ *      0x220 SMI_BUS_SEL      0x1554
++ *      0x230 SMI_READ_FIFO_TH 0x747f
++ *      0x234 SMI_M4U_TH       0xf7e19085
++ *      0x238 SMI_FIFO_TH1     0x43214e8
++ *      0x300 SMI_DCM          0x403
++ *
++ * They are deliberately NOT applied here. Until the display was put behind
++ * the M4U this device never runtime-resumed smi-common at all, so every one
++ * of those registers is still at its reset value on a running desktop
++ * (verified with devmem on kernel #34: 0x14022100..0x1402211c, 0x220, 0x230,
++ * 0x234, 0x238 and 0x300 all read 0x00000000) -- and the panel works. They
++ * are arbitration and FIFO tuning, not correctness, and applying twelve
++ * unmeasured register writes in the same change that first makes the display
++ * translate is how you end up unable to say which one mattered. If bandwidth
++ * or underruns become a problem behind the IOMMU, start here.
++ */
++static const struct mtk_smi_common_plat mtk_smi_common_mt6797 = {
++	.type	  = MTK_SMI_GEN2,
++	/* bus_sel 0 (all larbs to MMU0) -- see above; NOT F_MMU1_LARB(0). */
++	/* .init unset -- mt6795's table addresses registers this SoC lacks. */
++};
++
+ static const struct mtk_smi_common_plat mtk_smi_common_mt8183 = {
+ 	.type     = MTK_SMI_GEN2,
+ 	.has_gals = true,
+@@ -761,7 +814,7 @@
+ 	{.compatible = "mediatek,mt2712-smi-common", .data = &mtk_smi_common_gen2},
+ 	{.compatible = "mediatek,mt6779-smi-common", .data = &mtk_smi_common_mt6779},
+ 	{.compatible = "mediatek,mt6795-smi-common", .data = &mtk_smi_common_mt6795},
+-	{.compatible = "mediatek,mt6797-smi-common", .data = &mtk_smi_common_mt6795},
++	{.compatible = "mediatek,mt6797-smi-common", .data = &mtk_smi_common_mt6797},
+ 	{.compatible = "mediatek,mt8167-smi-common", .data = &mtk_smi_common_gen2},
+ 	{.compatible = "mediatek,mt8173-smi-common", .data = &mtk_smi_common_gen2},
+ 	{.compatible = "mediatek,mt8183-smi-common", .data = &mtk_smi_common_mt8183},
