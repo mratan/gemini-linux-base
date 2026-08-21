@@ -1034,6 +1034,42 @@ void stp_tx_event_cb(void)
 /*
   Direct delivery of bluez not changed hands through the stp buffer
 */
+/* churn/quirk: this controller's Read Local Supported Commands bitmap
+ * advertises post-BT4.1 commands it cannot actually execute (e.g. LE Read
+ * Buffer Size v2, 0x202f, failed -56 right after the event-mask fix), so
+ * the 6.6 core keeps aborting LE init on the next bogus command. Clear
+ * bitmap octets >= 35 (the 4.2+ command range) in the Command Complete
+ * response so the core simply never issues them. Single choke point for
+ * all rx delivery.
+ */
+static inline void hci_stp_recv(struct hci_dev *hd, struct sk_buff *skb)
+{
+    unsigned char *d = skb->data;
+
+    if (bt_cb(skb)->pkt_type == HCI_EVENT_PKT && skb->len >= 6 + 64 &&
+        d[0] == 0x0e /* Command Complete */ &&
+        d[3] == 0x02 && d[4] == 0x10 /* Read Local Supported Commands */) {
+        memset(&d[6 + 35], 0, 64 - 35);
+        /* ...and Get MWS Transport Layer Configuration (octet 30 bit 3,
+         * 4.0-CSA3-era) is advertised but fails too (0x140c, -107). */
+        d[6 + 30] &= ~0x08;
+    }
+
+    /* Same disease, third source: the LE features response claims
+     * post-4.1 LL features (Data Length Extension etc.) whose commands
+     * return Unknown HCI Command (LE Read Maximum Data Length, btmon
+     * capture #4). Clamp LE features to the 4.0/4.1 bits.
+     */
+    if (bt_cb(skb)->pkt_type == HCI_EVENT_PKT && skb->len >= 6 + 8 &&
+        d[0] == 0x0e /* Command Complete */ &&
+        d[3] == 0x03 && d[4] == 0x20 /* LE Read Local Supported Features */) {
+        d[6] &= 0x1F;
+        memset(&d[7], 0, 7);
+    }
+
+    hci_recv_frame(hd, skb);
+}
+
 void stp_rx_event_cb_directly(const PUINT8 data, INT32 count) /* churn: match MTK_WCN_STP_IF_RX */
 {
     register const UINT8 *ptr;
@@ -1107,7 +1143,7 @@ void stp_rx_event_cb_directly(const PUINT8 data, INT32 count) /* churn: match MT
             switch (rx_state) {
             case H4_W4_DATA:
                 BT_LOUD_FUNC("Complete data\n");
-                hci_recv_frame(hdev,rx_skb);
+                hci_stp_recv(hdev,rx_skb);
                 rx_state = H4_W4_PACKET_TYPE;
                 rx_skb = NULL;
                 continue;
@@ -1121,7 +1157,7 @@ void stp_rx_event_cb_directly(const PUINT8 data, INT32 count) /* churn: match MT
                     eh->evt, eh->plen, room);
 
                 if (!eh->plen) {
-                    hci_recv_frame(hdev, rx_skb);
+                    hci_stp_recv(hdev, rx_skb);
                     rx_state = H4_W4_PACKET_TYPE;
                     rx_skb   = NULL;
                     rx_count = 0; /* redundant? here rx_count is 0 already */
@@ -1148,7 +1184,7 @@ void stp_rx_event_cb_directly(const PUINT8 data, INT32 count) /* churn: match MT
                 room = skb_tailroom(rx_skb);
                 BT_LOUD_FUNC("ACL header:dlen(%d)room(%d)\n", dlen, room);
                 if (!dlen) {
-                    hci_recv_frame(hdev, rx_skb);
+                    hci_stp_recv(hdev, rx_skb);
                     rx_state = H4_W4_PACKET_TYPE;
                     rx_skb = NULL;
                     rx_count = 0;
@@ -1174,7 +1210,7 @@ void stp_rx_event_cb_directly(const PUINT8 data, INT32 count) /* churn: match MT
                 BT_LOUD_FUNC("SCO header:dlen(%d)room(%d)\n", sh->dlen, room);
 
                 if (!sh->dlen) {
-                    hci_recv_frame(hdev, rx_skb);
+                    hci_stp_recv(hdev, rx_skb);
                     rx_state = H4_W4_PACKET_TYPE;
                     rx_skb = NULL;
                     rx_count = 0;
@@ -1446,6 +1482,21 @@ static int hci_stp_send_frame(struct hci_dev *hdev, struct sk_buff *skb)
              __FUNCTION__, now.tv_sec, now.tv_usec);
     }
 #endif
+
+    /* churn/quirk: this CONSYS 4.x-era controller REJECTS an LE Set
+     * Event Mask containing post-4.0 event bits with status 0x20
+     * (Unsupported LL Parameter Value) instead of ignoring them — which
+     * aborts the 6.6 core's LE init and leaves hci0 outside the mgmt
+     * index list (btmon capture, 2026-08-20). Clamp the mask to the
+     * BT 4.0 bits; the dropped events (Data Length Change, P-256/DHKey
+     * complete, Direct Advertising Report) belong to features this
+     * controller cannot deliver anyway.
+     */
+    if (bt_cb(skb)->pkt_type == HCI_COMMAND_PKT && skb->len >= 11 &&
+        skb->data[0] == 0x01 && skb->data[1] == 0x20) {
+        skb->data[3] &= 0x1F;
+        memset(&skb->data[4], 0, 7);
+    }
 
     /* Prepend skb with frame type. Is it safe to do skb_push? */
     memcpy(skb_push(skb, 1), &bt_cb(skb)->pkt_type, 1);

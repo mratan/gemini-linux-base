@@ -1,0 +1,48 @@
+#!/bin/sh
+# gemini-bcb-disarm — make reaching userspace disarm the boot-slot trap.
+#
+# p1 is the only slot selectable in software (via the BCB in `para`), which is
+# what makes unattended iteration possible at all. The catch: this LK does NOT
+# clear the flag after honouring it, so once set, EVERY subsequent boot goes to
+# p1. A kernel in p1 that never reaches userspace therefore loops forever, and
+# the only way out is a power button and a chord.
+#
+# That is not hypothetical. It cost three device losses in one session, each
+# time by flashing something unproven into p1 while the flag was set — despite
+# the rule being written down beforehand. A rule that gets violated three times
+# is not a rule, it is a wish; so this makes it mechanical instead.
+#
+# Reaching userspace is the proof that the kernel in p1 is not a trap. So at
+# that moment, clear the flag: the next boot goes to Android by default, and
+# anything wanting p1 again must ask for it explicitly. A kernel that hangs
+# before userspace never runs this, and still loops — that failure mode is
+# unavoidable without a second selectable slot, but it now requires a kernel
+# that is broken *before* userspace rather than merely broken.
+#
+# Soak runs want the opposite: the loop should return to the slot under test on
+# every reset. Create /etc/gemini-bcb-sticky for that, deliberately.
+set -u
+STICKY=/etc/gemini-bcb-sticky
+
+if [ -e "$STICKY" ]; then
+    echo "gemini-bcb-disarm: $STICKY present — leaving the BCB set (soak mode)"
+    exit 0
+fi
+
+# The eMMC's block-device name differs by running system: Android calls it
+# mmcblk0, this kernel calls it mmcblk1. Resolve by shape, never by name.
+DISK=""
+for d in /dev/mmcblk1 /dev/mmcblk0 /dev/block/mmcblk1 /dev/block/mmcblk0; do
+    if [ -b "${d}p2" ] && [ -b "${d}p22" ] && [ -b "${d}p31" ]; then DISK=$d; break; fi
+done
+[ -n "$DISK" ] || { echo "gemini-bcb-disarm: could not find the eMMC; leaving the BCB alone" >&2; exit 1; }
+
+before=$(dd if="${DISK}p2" bs=32 count=1 2>/dev/null | tr -d '\0')
+if [ -z "$before" ]; then
+    echo "gemini-bcb-disarm: BCB already clear"
+    exit 0
+fi
+
+dd if=/dev/zero of="${DISK}p2" bs=2048 count=1 2>/dev/null
+sync
+echo "gemini-bcb-disarm: cleared BCB (was '$before') — the next boot is the normal one"

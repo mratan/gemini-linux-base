@@ -1,0 +1,15 @@
+[Unit]
+Description=Clear the boot-slot flag now that userspace has been reached
+Documentation=file:///usr/local/sbin/gemini-bcb-disarm
+DefaultDependencies=no
+After=systemd-remount-fs.service local-fs.target
+Before=sysinit.target shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/gemini-bcb-disarm
+
+[Install]
+WantedBy=sysinit.target
