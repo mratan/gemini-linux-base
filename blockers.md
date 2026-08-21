@@ -1493,10 +1493,33 @@ itself.
 `patches/v6.6/misc/0001-watchdog-mtk-wdt-clear-bootloader-irq-dual-mode.patch`,
 clearing the bits at probe. Flashed to p1 as `boot-wdtfix.img` (`e314debe`).
 
-**Prediction to test:** once that kernel has been booted ONCE (which needs a
-cold power cycle, since the current halt cannot be escaped from software), a
-software reboot issued *from it* should work — and a deliberate hang should
-self-recover. If both hold, the hands-free loop closes.
+**PREDICTION TESTED 2026-08-20, AND IT FAILED.** The fix does what it claims —
+`mtk-wdt 10007000.watchdog: cleared bootloader IRQ/DUAL mode: expiry is now a
+reset` at 0.706 s, and `WDT_MODE` reads 0x15 with IRQ_EN/DUAL_EN clear — but a
+software reboot issued from that kernel **still did not come back**, and the
+panel was dark again (no LK splash). So the interrupt-mode bits were a real
+defect, and they were not the reason `reboot` fails.
+
+**Next candidate: `WDT_MODE_EXRST_EN` (bit 2), still set (0x15 = EN | EXRST_EN |
+AUTO_START).** That bit routes the watchdog's reset to an *external* pin — the
+PMIC — instead of resetting internally. If that path is not wired or not
+honoured on this board, the reset request goes nowhere, which matches the
+symptom exactly: the SoC simply stops. The driver already supports clearing it
+via the `mediatek,disable-extrst` DT property, which this DT does not set, so
+LK's choice survives.
+
+**Cheap decisive test, no rebuild needed** — from a booted system:
+```
+busybox devmem 0x10007000 32 0x22000011   # EN | AUTO_START, EXRST_EN cleared
+busybox devmem 0x10007014 32 0x1209       # WDT_SWRST: reset now
+```
+If the device comes back, `mediatek,disable-extrst` in the DT is the fix. If it
+does not, the next candidate is `WDT_MODE_CNT_SEL` (bit 8, reset-by-TOPRGU),
+which this compatible does not set.
+
+**Cross-check available for free:** stock Android reboots reliably on this
+hardware, so whatever it leaves in `WDT_MODE` is a known-good configuration.
+Reading 0x10007000 from Android answers this outright.
 
 ## 🔴 B-30 (original notes) — the tally that led here
 
