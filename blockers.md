@@ -1959,6 +1959,52 @@ untouched throughout.
 
 ## 🟡 B-37 — the hardware cursor plane is drawn once and never moves
 
+**Update 2026-08-21 (later): `Atomic "on"` does NOT fix it. The hypothesis
+below is refuted, and the experiment could not have worked.** With
+`Option "Atomic" "on"` and `SWcursor` removed, the pointer was warped to two
+corners and the panel photographed each time: the arrow is in the *identical*
+place in both photographs. `scratchpad/b37-atomic-A.jpg`, `-B.jpg`.
+
+The reason the experiment was not a real A/B: with `Atomic "on"`, Xorg still
+issues **`DRM_IOCTL_MODE_CURSOR`**. Confirmed by turning on `drm.debug` and
+capturing one warp — the ioctl is the legacy cursor path either way, so both
+DDX settings land in the same kernel code. The DDX option was never the
+variable it was assumed to be.
+
+**What is actually broken — two separate defects in mediatek-drm, measured:**
+
+1. **The latch is gated on a vblank interrupt that is off whenever nothing is
+   page-flipping.** mt6797 has `shadow_register = false` and no CMDQ channel,
+   so `mtk_crtc_ddp_config()` — the only thing that writes plane registers —
+   runs *only* from `mtk_crtc_ddp_irq()`. Measured: `1400b000.disp-ovl0` in
+   `/proc/interrupts` does not advance by a single count in 5 s of idle
+   desktop, and does not advance across 20 `xsetroot` repaints either
+   (modesetting with `AccelMethod "none"` memcpys into the scanout buffer, so
+   the panel updates with no DRM traffic at all). Start a client that keeps
+   vblank alive — `glxgears` — and the IRQ runs at ~9/s.
+2. **Even with vblanks flowing, the position written to hardware stops
+   changing.** With `glxgears` running the cursor moved exactly **once**, to
+   the position that was pending, and then froze there. Read directly from the
+   OVL: `DISP_REG_OVL_OFFSET(3)` at `0x1400b09c` holds `0x0707031F`
+   (y 1799, x 799) across every subsequent warp, while
+   `/sys/kernel/debug/dri/0/state` tracks the pointer perfectly
+   (`crtc-pos=64x64+899+1899`, `+199+99`, …). So the commit reaches DRM
+   software state and never reaches the register.
+
+   The panel-coordinate mapping, confirmed against several warps under
+   `Rotate left`: `panel_x = y - 1`, `panel_y = 2160 - x - 61`.
+
+   Suspected but **not measured**: `mtk_plane_atomic_async_check()` calls
+   `drm_atomic_helper_check_plane_state(plane->state, …)` — the *current*
+   state, not the new one — so `new_state->dst` is never recomputed, and
+   `mtk_plane_update_new_state()` reads `pending.x/y` straight out of
+   `new_state->dst`. That would write a stale position forever. Saying this is
+   the cause would be a guess; the evidence above is not.
+
+**So `SWcursor` stays**, and the CPU cost stays with it, until one of those two
+is fixed in the kernel. This is #20's, not a DDX tuning problem, and the fix
+cannot live in userspace.
+
 **Opened 2026-08-21.** The pointer on the glass had not moved since login, and
 every layer underneath was working: the mouse delivers `REL_X`/`REL_Y`,
 libinput passes them, X's pointer position tracks exactly, clicks land where
@@ -2063,7 +2109,74 @@ IDENTICAL.
 gives a baseline that is neither pristine nor patched; half the series then
 applies with fuzz and the comparison means nothing.
 
-## 🔴 B-34 — panfrost: the GPU's first read of DRAM comes back as noise
+## 🟢 B-34 — RESOLVED 2026-08-21: the GPU's SRAM LDO was never enabled
+
+**Read this before the history below. The GPU renders.** `/root/gputest`
+returns `RESULT: pixels CORRECT, renderer Panfrost (hardware)`, exit 0, with
+**zero** GPU faults, repeatedly, on kernel `#31`.
+
+**The cause is a power supply mainline does not know exists.** Beyond the
+mtcmos domains and the external VGPU buck, mt6797 has an on-die LDO in
+infracfg_ao that feeds the Mali's *internal SRAM*, and its reset value is off.
+The vendor calls it **VGPU_SRAM** and enables it from its Mali platform
+callback — `infracfg_ao + 0xFBC = 0x1FF` as the very first action of
+`mtk_pm_callback_power_on()`, `0` as the very last of
+`mtk_pm_callback_power_off()`
+(ubports 3.18.60, `.../mali-r20p0/drivers/platform/mt6797/mtk_config_platform.c`;
+`mt_gpufreq.c` names it in a comment, `/* enable: // VGPU_SRAM */`).
+
+That explains every symptom precisely, including the ones that made this look
+unexplainable. The register file is powered by something else, so the GPU looks
+completely healthy — every control register reads back, `GPU_ID` and the
+feature registers are right, the mtcmos ACKs land, `SHADER_READY` is `0xF`, and
+Mesa brings up a GLES 3.1 context. The memories the MMU and the bus interface
+keep their state in are *not* powered, so the first memory transaction comes
+back as noise — which is exactly what "fault addresses full of `F`s and `D`s,
+different every time" was telling us, and why chasing coherency, PTE
+shareability, >4 GB page tables and MFG_ASYNC clocking found nothing. Those
+four eliminations below are still correct; none of them was ever the cause.
+
+**Measured, A/B/A/B, on one running kernel with `devmem`, before any rebuild:**
+
+| `INFRACFG_AO + 0xFBC` | `gputest` | GPU faults |
+|---|---|---|
+| `0x1FF` | pixels CORRECT, Panfrost | 0 |
+| `0x000` | nothing rendered | **197** |
+| `0x1FF` | pixels CORRECT, Panfrost | 0 |
+| `0xFF` | pixels CORRECT, Panfrost | 0 |
+| `0x1` | pixels CORRECT, Panfrost | 0 |
+
+**Bit 0 alone is sufficient.** The neighbouring trim registers the vendor also
+writes (`0xFC0`/`0xFC4` = `0x0F0F0F0F`) are **not** required — restoring them to
+their reset `0x09090909` changed nothing. We write the vendor's full `0x1FF`
+anyway, because that is what ships.
+
+**Landed as `pmdomain/0007`**, on the **MFG** domain rather than MFG_ASYNC: MFG
+is `KEEP_DEFAULT_OFF` and so follows panfrost's runtime PM, while MFG_ASYNC is
+powered at probe and would leave the LDO on forever. Verified on `#31` that the
+LDO tracks the domain — `0x1FF` when `runtime_status` is `active`, `0x0` when
+`suspended` — and that rendering survives suspend/resume. Panel gate PASS 13/13
+on the same kernel.
+
+**How it was found, because the method is the transferable part:** not by more
+measurement on the device, but by reading the vendor's own GPU power-on
+sequence in `07-kernel/ubports-3.18`, which has been sitting in this tree the
+whole time, and asking what it does that we do not. It does four things:
+this LDO; `MFG_write32(0x1c, ... | 0xa)` marked `/* timing */`; a TOPRGU MFG
+software reset at init; and an MFG PMU enable. The first one was the answer.
+"A register-level comparison against the vendor stack" was recorded as the next
+step and assumed to need the Reference slot and a running GPU job. It did not.
+The source was enough.
+
+**Left over, deliberately unlanded:** `MFGCFG + 0x1c` reads `0x00000000` on our
+kernel and the vendor ORs in `0xa` (or `0x5` below 780 MHz) on every power-on.
+Rendering is correct without it and adding an unproven write to a working
+machine is not a trade worth making — but it is frequency-dependent, so if GPU
+DVFS is ever raised above the current OPP, look here first. (`MFGCFG + 0x20`
+already reads `0x0000000A`, which may mean the field moved between the 3.18
+register map and what LK programs; unresolved, and it does not matter today.)
+
+## (history) B-34 — panfrost: the GPU's first read of DRAM comes back as noise
 
 **Opened 2026-08-21.** With the MFG shader-core power domains fixed
 (`pmdomain/0006`, `dts/0037`, `gpu/0004`) the GPU powers up completely —

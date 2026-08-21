@@ -1,0 +1,181 @@
+pmdomain: mediatek: mt6797: enable VGPU_SRAM, the GPU's SRAM LDO
+
+The Mali T880 on mt6797 powers up completely — every control register
+reads back correctly, GPU_ID and the feature registers are right, all
+four shader cores ACK (PWR_STATUS 0x2B003F5E, SHADER_READY 0xF,
+SHADER_PWRTRANS 0x0), and Mesa brings up a Mali-T880 (Panfrost) GLES 3.1
+context — and then every job faults on the GPU's first memory
+transaction with GPU_SHAREABILITY_FAULT, at an address that is different
+every fault and full of Fs and Ds (0xfff7fddb00, 0xd7fdadd2c0,
+0xffffbdd2c0). Four hypotheses about coherency, PTE shareability, >4 GB
+page tables and MFG_ASYNC clocking were each eliminated by measurement
+(blockers.md B-34); none of them was it.
+
+The cause is a supply that mainline does not know exists. Beyond the
+mtcmos domains and the external VGPU buck, mt6797 has an on-die LDO in
+infracfg_ao that feeds the GPU's internal SRAM, and its reset value is
+off. The register file is powered by something else, which is why the
+GPU looks healthy; the memories the MMU and the bus interface keep their
+state in are not, which is why the first transaction comes back as
+noise.
+
+Measured on hardware 2026-08-21, A/B/A/B on one running kernel with
+devmem: INFRACFG_AO 0xFBC = 0 gives 197 GPU faults and no rendering;
+any non-zero value (0x1, 0xFF and 0x1FF all tried) gives correct pixels
+and zero faults, three runs in a row, surviving runtime suspend/resume.
+Bit 0 alone is sufficient. We write the vendor's 0x1FF because that is
+what ships.
+
+The vendor does this from its Mali platform callback rather than from
+its power domain code: mtk_pm_callback_power_on() writes
+infracfg_ao+0xFBC = 0x1FF as its first action and
+mtk_pm_callback_power_off() writes 0 as its last (ubports 3.18.60,
+drivers/misc/mediatek/gpu/gpu_mali/mali_midgard/mali-r20p0/drivers/
+platform/mt6797/mtk_config_platform.c); mt_gpufreq.c names it
+"enable: // VGPU_SRAM". panfrost has no such hook and should not grow
+one, so it lives on the domain whose power state it has to track. It is
+attached to MFG and not MFG_ASYNC because MFG is KEEP_DEFAULT_OFF and
+so follows panfrost's runtime PM, while MFG_ASYNC is powered at probe
+and would leave the LDO on forever.
+
+diff --git a/drivers/pmdomain/mediatek/mtk-scpsys.c b/drivers/pmdomain/mediatek/mtk-scpsys.c
+--- a/drivers/pmdomain/mediatek/mtk-scpsys.c
++++ b/drivers/pmdomain/mediatek/mtk-scpsys.c
+@@ -10,6 +10,7 @@
+ #include <linux/of.h>
+ #include <linux/platform_device.h>
+ #include <linux/pm_domain.h>
++#include <linux/regmap.h>
+ #include <linux/regulator/consumer.h>
+ #include <linux/soc/mediatek/infracfg.h>
+ 
+@@ -129,6 +130,12 @@
+  *		for the poll.
+  * @sram_pdn_ack_bits: The mask for sram power control acked bits.
+  * @bus_prot_mask: The mask for single step bus protection.
++ * @infra_ldo_offs: Optional infracfg_ao register holding an on-die LDO enable
++ *		that must be raised before this domain is powered and dropped
++ *		after it is unpowered (e.g. mt6797 VGPU_SRAM, the Mali GPU's
++ *		SRAM supply, at INFRACFG_AO 0xFBC). Zero means the domain has
++ *		no such LDO.
++ * @infra_ldo_mask: The bits to set in @infra_ldo_offs.
+  * @clk_id: The basic clocks required by this power domain.
+  * @caps: The flag for active wake-up action.
+  */
+@@ -141,6 +148,8 @@
+ 	u32 ext_sram_ctl_offs;
+ 	u32 ext_sram_ack_offs;
+ 	u32 bus_prot_mask;
++	u32 infra_ldo_offs;
++	u32 infra_ldo_mask;
+ 	enum clk_id clk_id[MAX_CLKS];
+ 	u8 caps;
+ };
+@@ -322,6 +331,48 @@
+ 	return scpsys_sram_pdn_addr(scp, scpd, ctl_addr);
+ }
+ 
++/*
++ * VGPU_SRAM: an on-die LDO in infracfg_ao, outside the mtcmos sequence
++ * entirely, that supplies the Mali GPU's internal SRAM.
++ *
++ * Nothing in mainline knows it exists, and its reset value is off. A GPU with
++ * this LDO off comes up looking completely healthy — every control register
++ * reads back correctly, GPU_ID and the feature registers are right, the
++ * mtcmos ACKs land, PWR_STATUS shows all four shader cores on and
++ * SHADER_READY reads 0xF — and then faults on its very first memory
++ * transaction with GPU_SHAREABILITY_FAULT at an address that is different
++ * every time and full of Fs and Ds. That is unpowered SRAM being read back as
++ * noise: the register file is fine, the memories the MMU and the bus
++ * interface keep their state in are not.
++ *
++ * Measured on hardware 2026-08-21, A/B/A/B on one running kernel: with
++ * INFRACFG_AO 0xFBC = 0, /root/gputest produced 197 GPU faults and rendered
++ * nothing; with any non-zero value (0x1, 0xFF and 0x1FF were all tried) it
++ * rendered correct pixels with zero faults, three runs in a row, and survived
++ * runtime suspend/resume. Bit 0 alone is sufficient; we write the vendor's
++ * full 0x1FF because that is what ships.
++ *
++ * The vendor does this from its Mali platform callback, not from its power
++ * domain code: mtk_pm_callback_power_on() writes infracfg_ao+0xFBC = 0x1FF as
++ * its first action and mtk_pm_callback_power_off() writes 0 as its last
++ * (ubports 3.18.60,
++ * drivers/misc/mediatek/gpu/gpu_mali/mali_midgard/mali-r20p0/drivers/platform/
++ * mt6797/mtk_config_platform.c). mt_gpufreq.c names it: "enable: // VGPU_SRAM".
++ * panfrost has no such hook and should not grow one, so it lives here, on the
++ * domain whose power state it has to track.
++ */
++static int scpsys_infra_ldo_set(struct scp_domain *scpd, bool on)
++{
++	struct scp *scp = scpd->scp;
++
++	if (!scpd->data->infra_ldo_offs)
++		return 0;
++
++	return regmap_update_bits(scp->infracfg, scpd->data->infra_ldo_offs,
++				  scpd->data->infra_ldo_mask,
++				  on ? scpd->data->infra_ldo_mask : 0);
++}
++
+ static int scpsys_bus_protect_enable(struct scp_domain *scpd)
+ {
+ 	struct scp *scp = scpd->scp;
+@@ -354,10 +405,18 @@
+ 	u32 val;
+ 	int ret, tmp;
+ 
+-	ret = scpsys_regulator_enable(scpd);
++	/* The GPU's SRAM supply comes up before anything else, as it does in
++	 * the vendor stack — nothing below this line is safe to run against
++	 * unpowered on-die memory.
++	 */
++	ret = scpsys_infra_ldo_set(scpd, true);
+ 	if (ret < 0)
+ 		return ret;
+ 
++	ret = scpsys_regulator_enable(scpd);
++	if (ret < 0)
++		goto err_ldo;
++
+ 	ret = scpsys_clk_enable(scpd->clk, MAX_CLKS);
+ 	if (ret)
+ 		goto err_clk;
+@@ -400,6 +459,8 @@
+ 	scpsys_clk_disable(scpd->clk, MAX_CLKS);
+ err_clk:
+ 	scpsys_regulator_disable(scpd);
++err_ldo:
++	scpsys_infra_ldo_set(scpd, false);
+ 
+ 	dev_err(scp->dev, "Failed to power on domain %s\n", genpd->name);
+ 
+@@ -453,6 +514,13 @@
+ 	if (ret < 0)
+ 		goto out;
+ 
++	/* Last, mirroring the vendor order: the LDO goes away only once
++	 * nothing is left that could touch the memory it supplies.
++	 */
++	ret = scpsys_infra_ldo_set(scpd, false);
++	if (ret < 0)
++		goto out;
++
+ 	return 0;
+ 
+ out:
+@@ -941,6 +1009,15 @@
+ 		.sram_pdn_bits = GENMASK(1, 0),
+ 		.sram_pdn_ack_bits = GENMASK(17, 16),
+ 		.ext_sram_ctl_offs = 0x33C,
++		/*
++		 * VGPU_SRAM, the GPU's on-die SRAM supply — see
++		 * scpsys_infra_ldo_set(). It hangs off MFG rather than
++		 * MFG_ASYNC so that it follows panfrost's runtime PM: MFG is
++		 * KEEP_DEFAULT_OFF, MFG_ASYNC is powered at probe and would
++		 * leave the LDO on forever.
++		 */
++		.infra_ldo_offs = 0xFBC,
++		.infra_ldo_mask = GENMASK(8, 0),
+ 		.clk_id = {CLK_MFG52M},
+ 		.caps = MTK_SCPD_KEEP_DEFAULT_OFF,
+ 	},
