@@ -1957,6 +1957,59 @@ required booting boot1 Android and restoring `boot-gpustack4.img`
 other known-good.** Android on boot1 remains the deep fallback and was
 untouched throughout.
 
+## 🟡 B-41 — touch is rotated twice: the DT rotates it AND X rotates it again
+
+**Opened 2026-08-21**, reported by the owner as "touch is not in the right place
+when I use my finger" and pinned in one question: **touching the visible
+top-left corner puts the pointer in the top-right.** That is one extra
+90-degree rotation, and only one thing produces exactly that.
+
+**Both layers rotate.**
+
+- `mt6797-gemini-pda.dts` gives the touchscreen node **`touchscreen-swapped-x-y`
+  and `touchscreen-inverted-y`**, and `gemini-nt36xxx.c` honours both
+  (`swap_xy`/`invert_y`, read via `device_property_read_bool`). So the driver
+  already emits landscape coordinates matching the rotated X screen.
+- `/etc/X11/xorg.conf.d/30-touchscreen.conf` then applied
+  `TransformationMatrix "0 -1 1 1 0 0 0 0 1"` on top.
+
+The matrix maps normalised `(x, y)` to `(1-y, x)`. A finger on the visible
+top-left makes the driver correctly report `(0, 0)`; the matrix turns that into
+`(1, 0)`, i.e. screen x=2160, y=0. Top-right. Exactly the reported symptom.
+
+**The comment was the giveaway.** That file said "the touchscreen reports in the
+panel's native portrait coordinates" — a statement the device tree had made
+false. Nobody re-read it against the DT because the sentence sounded like a
+fact about the hardware.
+
+**Why it survived so long: nothing checks WHERE a touch lands.** "Touch drives
+the cursor" was true throughout, and that is the identical shape of mistake as
+the Bluetooth mouse that delivered every event perfectly while the drawn arrow
+never moved (B-37). The layer everyone looked at was working.
+
+**Fixed for now in userspace**: `30-touchscreen.conf` is identity, and
+`scripts/gemini-desktop-setup.sh` carries it plus the coupling warning.
+
+**The real defect is the coupling, and it is not fixed.** The rotation is
+expressible in two places and neither knows about the other. Whoever changes
+one must change the other in the same commit:
+
+| owner | device tree | Xorg |
+|---|---|---|
+| kernel (today) | `swapped-x-y` + `inverted-y` | identity |
+| X (better end state) | neither property | `0 -1 1 1 0 0 0 0 1` |
+
+**X owning it is the better end state, and this matters beyond tidiness.** A
+Wayland compositor applies its own output transform to touch input, so
+`output DSI-1 transform 90` under sway will double-rotate against a
+kernel that has already rotated — the same bug, in a stack where there is no
+xorg.conf to correct it. Moving the rotation out of the DT needs a kernel
+rebuild and flash, so it is a follow-up rather than something a userspace
+script may do.
+
+**Prediction worth testing when sway is next run:** touch under sway is
+currently wrong in exactly this way, and nobody has looked.
+
 ## 🟡 B-40 — the two Cortex-A72 cores never come up, and there is no cpufreq at all
 
 **Opened 2026-08-21.** MT6797 is a **tri-cluster** Helio X20 and we are using
