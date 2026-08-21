@@ -1984,6 +1984,47 @@ writable):
 much longer at 500 mA and losing ground. The charger was always able to deliver
 it; the kernel simply never asked.
 
+**CORRECTION 2026-08-21 (later): the "naive fix" was right and my clever one
+was dangerous. Two things below were wrong and both were mine.**
+
+*Wrong thing 1: the sign of `current_now`.* The bq25890 driver **negates** it
+(`val->intval = ret * -50000;`), so a **negative reading means current flowing
+INTO the battery**. `-440000` is charging at 440 mA. Reading it the other way
+made a healthy charging device look like it was dying, and produced a confident
+claim that it "never gains charge while running" — which the next measurement
+immediately contradicted.
+
+*What the corrected reading actually shows,* at a 1.5 A ceiling:
+
+| load | charge current into the cell |
+|---|---|
+| desktop up, backlight 200 | **440 mA** |
+| backlight dimmed to 10 | 590 mA |
+| desktop stopped | 660 mA |
+| backlight off, no desktop | 670 mA |
+
+So the system draws roughly 0.8-1.1 A, and the machine charges fine once the
+input limit exceeds that. Voltage rose 3.784 -> 3.864 V during the test.
+
+*Wrong thing 2: backing the input limit off is unsafe here, and I did it twice.*
+The first guard ramped up and stepped back down whenever the cell stopped
+gaining, reasoning that asking a weak supply for more than it can give is
+dangerous. **It is not** — the bq25890 handles that in hardware: VINDPM and the
+input current optimiser reduce the charger's own input current when VBUS sags,
+so asking a 500 mA port for 1.5 A yields 500 mA and a slightly droopy rail.
+
+Asking for too **little** is the dangerous direction, because the deficit comes
+out of the battery. Stepping the limit down to 500 mA as part of an
+internal-resistance measurement **browned the machine out on the spot**, on a
+nearly-empty cell — the exact failure this blocker was opened about, walked into
+by the person who wrote it down.
+
+*Consequences, now implemented:* the guard sets the ceiling once and leaves it;
+there is no ramp, no backoff, and **no measurement is permitted to reduce the
+input current**. Which also rules out the obvious way to measure internal
+resistance on this device — the load step that would reveal it is the load step
+that kills it.
+
 **Why the naive fix is wrong.** Writing 1.5 A unconditionally at boot would be
 actively harmful on the lab hub, whose port is a 500 mA source — the owner
 plugged the device into USB with a nearly flat battery and it **browned out
