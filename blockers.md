@@ -2112,6 +2112,55 @@ against 209 on a Raspberry Pi 4 (Cortex-A72 @1.8 GHz), consistent with roughly
 1.2-1.4 GHz but not pinning it. **If LK has left the clusters at a low OPP,
 DVFS is worth more than the A72s.**
 
+**UPDATE 2026-08-21 (later): measured, and there is now a concrete path. Every
+piece is mainline-supported; nothing here needs firmware.**
+
+*What the hardware says.* Read-only, on the running machine:
+
+```
+MP0_CPUSYS_PWR_CON (0x10006210)  0x0009004D   A53 cluster, running
+MP1_CPUSYS_PWR_CON (0x10006214)  0x0009004D   A53 cluster, running
+MP2_CPUSYS_PWR_CON (0x10006218)  0x00010132   A72 cluster
+MP2_CPU0_PWR_CON   (0x10006240)  0x00010332
+MP2_CPU1_PWR_CON   (0x10006244)  0x00010332
+```
+
+MP2 decodes as `PWR_ON=0`, `PWR_ISO=1`, `PWR_RST_B=0`, `PWR_CLK_DIS=1`,
+`SRAM_PDN=1` — its **reset value**. The A72 cluster is unpowered, isolated,
+held in reset with its SRAM down, and nothing (kernel or firmware) has ever
+touched it. **So this is not a hardware limit. We simply never power it.**
+
+*The three things that are missing, in dependency order.*
+
+1. **VPROC2, the cluster's core supply, does not exist in our tree.** The board
+   has exactly one modelled `vproc` (1.000 V). The vendor `mt_cpufreq.c` shows
+   the big cluster runs off a separate **VPROC2** rail with its own 0.80-1.18 V
+   table, driven by a **Dialog DA9214** dual-buck: `DA9214_SLAVE_ADDR_WRITE
+   0xD0` (7-bit **0x68**) on `da9214_BUSNUM` **6**
+   (`drivers/misc/mediatek/power/mt6797/da9214.c`).
+   **Mainline already supports this part** — `CONFIG_REGULATOR_DA9211` names
+   DA9214 explicitly — and it is simply `not set` in our config.
+2. **The I2C bus it lives on is switched off.** `i2c6: i2c@1100e000` is present
+   in `mt6797.dtsi` with `status = "disabled"`, and the board DTS never enables
+   it. We currently expose i2c-0..i2c-5 only. This is a one-line change plus a
+   node.
+3. **The MP2 MTCMOS power sequence has no implementation.** The shape is the
+   standard MediaTek one (from `spm_mtcmos_ctrl_cpusys1`): `PWR_ON` ->
+   `PWR_ON_2ND` -> poll status -> clear `PWR_ISO` -> release L2 -> settle ->
+   `SRAM_ISOINT_B` -> clear `SRAM_CKISO` -> clear `PWR_CLK_DIS` -> set
+   `PWR_RST_B`. It then needs invoking before PSCI `CPU_ON`, which is what
+   currently hangs.
+
+*A trap that would have cost a day.* **`drivers/misc/mediatek/base/power/mt6797/mt_spm_cpu.h`
+is stale — it was copied from an earlier SoC and never updated**, and
+`spm_mtcmos_ctrl_cpusys1()` operates on its addresses. Proven by reading the
+hardware: that header puts `PWR_STATUS` at SPM+0x60c and `CA15_CPUTOP_PWR_CON`
+at SPM+0x2b0, and on this machine SPM+0x60c reads **0x00000000** (a status
+register that reads zero is not a status register) while SPM+0x2b8 and
+SPM+0x208 are zero too. The live registers are the ones in
+`mt_spm_reg_mt6797.h`. **Implement against those addresses only, and do not
+trust the vendor cpusys1 code's register names.**
+
 **The read-only measurement to take FIRST, before booting anything.** The SPM
 exposes CPU power state directly, and the vendor register map for it is in
 `drivers/misc/mediatek/base/power/include/spm_v2/mt_spm_reg_mt6797.h`
