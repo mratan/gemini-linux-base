@@ -1455,13 +1455,41 @@ controller does not merely stop reporting, it **vanishes from the bus** —
 
 ### Where to look next
 
-The cycling requires the DSI to be up, this panel is a Novatek DDIC, and the
-trim ID is its touch companion — very likely one TDDI part, in which case our
-183-command DSI init table (B-24's table, ours rather than the vendor's) is a
-plausible cause of a touch side that will not finish calibrating. The decisive
-experiment is to read `RESET_COMPLETE` on the vendor kernel on this same unit,
-where touch works: 0xA3 there and cycling here makes this a display problem,
-not an input one.
+**Our DSI init table is NOT the problem — checked, and it came out clean.** The
+vendor `init_setting[]` in `aeon_nt36672_fhd_dsi_vdo_x600_xinli.c` is guarded
+by `#if 1 / #else / #endif`; the live branch has **exactly 183 rows**, which is
+exactly what our panel driver pushes (`init sequence complete: 183 commands in
+156 ms`). The table is faithful to the row. That was the leading suspect and it
+is out.
+
+**The better hypothesis, and it links two measurements that were made for
+unrelated reasons.** This is a Novatek TDDI part, so the touch scan and its
+calibration happen *during display blanking*. And our horizontal blanking is
+much shorter than LK's, because mainline reserves `data_phy_cycles * lanes` —
+200 bytes on this panel — out of the porches:
+
+| | HSA_WC | HBP_WC | HFP_WC |
+|---|---|---|---|
+| ours (mainline's derivation) | 0x14 | 0x27 | 0x22 |
+| LK | 0x1C | 0x94 | 0x74 |
+
+A touch side that never gets its quiet window is exactly a calibration that
+never completes — which is precisely the observed `RESET_STATE_REK` that never
+becomes `REK_FINISH`. Note this also explains why the cycling needs the DSI up
+and is unaffected by CTP_RST, the backlight, the handshake, or the page.
+
+**Testable without a rebuild:** write LK's word counts into the live DSI block
+with `busybox devmem` at `0x1401C050/54/58` and re-measure the touch duty
+cycle. These are the values LK itself programs and the panel demonstrably runs
+on them, so it is not an arbitrary poke, and the watchdog now recovers the
+device if the display wedges.
+
+Second candidate, if that comes out negative: supply. The vendor DTB powers
+touch from MT6351 VLDO28; `/sys/class/regulator` on our kernel has no touch
+consumer at all, so whatever LK left is what it gets.
+
+Third: read `RESET_COMPLETE` on the vendor kernel on this same unit, where
+touch works. 0xA3 there and cycling here would confirm the whole class.
 
 Second candidate: supply. The vendor DTB powers touch from MT6351 VLDO28;
 `/sys/class/regulator` on our kernel has no touch consumer at all, so whatever
