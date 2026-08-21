@@ -37,6 +37,18 @@
  * None of that is needed to move a cursor. This implements the report path
  * only, which is the part that makes the hardware useful.
  *
+ * WHY IT POLLS
+ *
+ * The controller has an interrupt line (CTP_INT, GPIO85) and the vendor driver
+ * uses it. We cannot: mainline's MT6797 pinctrl registers no mtk_eint_hw data
+ * at all, so no GPIO on this SoC can deliver an interrupt (blockers.md B-11).
+ * `&pio` is not an interrupt controller, so `interrupts = <85 ...>` silently
+ * resolves to nothing and the client's irq is 0. The first version of this
+ * driver required an interrupt and failed probe with -EINVAL for exactly that
+ * reason. Polling is not a preference here, it is the only option until B-11
+ * is fixed — and it is what the sibling Solomon driver does for the same
+ * reason.
+ *
  * Protocol, from aeon_nt36xxx/nt36xxx.c:
  *   read 65 bytes from address 0x01 starting at register 0x00; then for each
  *   finger i, at offset 1 + 6*i:
@@ -51,7 +63,6 @@
 #include <linux/i2c.h>
 #include <linux/input.h>
 #include <linux/input/mt.h>
-#include <linux/interrupt.h>
 #include <linux/mod_devicetable.h>
 #include <linux/module.h>
 #include <linux/property.h>
@@ -145,9 +156,9 @@ static void nvt_read_fw_info(struct nvt_ts *ts)
 		 ts->max_x, ts->max_y);
 }
 
-static irqreturn_t nvt_ts_irq(int irq, void *dev_id)
+static void nvt_ts_poll(struct input_dev *input)
 {
-	struct nvt_ts *ts = dev_id;
+	struct nvt_ts *ts = input_get_drvdata(input);
 	u8 point_data[NVT_POINT_DATA_LEN] = {};
 	unsigned int i;
 	int ret;
@@ -155,7 +166,7 @@ static irqreturn_t nvt_ts_irq(int irq, void *dev_id)
 	ret = nvt_read(ts, 0x00, point_data, sizeof(point_data));
 	if (ret) {
 		dev_err_ratelimited(&ts->client->dev, "point read failed: %d\n", ret);
-		return IRQ_HANDLED;
+		return;
 	}
 
 	for (i = 0; i < NVT_MAX_FINGERS; i++) {
@@ -202,8 +213,6 @@ static irqreturn_t nvt_ts_irq(int irq, void *dev_id)
 
 	input_mt_sync_frame(ts->input);
 	input_sync(ts->input);
-
-	return IRQ_HANDLED;
 }
 
 static int nvt_ts_probe(struct i2c_client *client)
@@ -211,11 +220,6 @@ static int nvt_ts_probe(struct i2c_client *client)
 	struct device *dev = &client->dev;
 	struct nvt_ts *ts;
 	int ret;
-
-	if (!client->irq) {
-		dev_err(dev, "no interrupt; this driver is interrupt-driven\n");
-		return -EINVAL;
-	}
 
 	ts = devm_kzalloc(dev, sizeof(*ts), GFP_KERNEL);
 	if (!ts)
@@ -241,6 +245,7 @@ static int nvt_ts_probe(struct i2c_client *client)
 
 	ts->input->name = "Novatek NT36xxx Touchscreen";
 	ts->input->id.bustype = BUS_I2C;
+	input_set_drvdata(ts->input, ts);
 
 	/*
 	 * After a swap the reported X spans what was the Y range. Set the axis
@@ -259,17 +264,18 @@ static int nvt_ts_probe(struct i2c_client *client)
 	if (ret)
 		return dev_err_probe(dev, ret, "failed to init MT slots\n");
 
-	ret = devm_request_threaded_irq(dev, client->irq, NULL, nvt_ts_irq,
-					IRQF_ONESHOT, "gemini-nt36xxx", ts);
+	/* 60 Hz: comfortably above what a cursor needs, and cheap — one 65-byte
+	 * I2C read per tick on a bus doing nothing else. */
+	ret = input_setup_polling(ts->input, nvt_ts_poll);
 	if (ret)
-		return dev_err_probe(dev, ret, "failed to request IRQ %d\n",
-				     client->irq);
+		return dev_err_probe(dev, ret, "failed to set up polling\n");
+	input_set_poll_interval(ts->input, 16);
 
 	ret = input_register_device(ts->input);
 	if (ret)
 		return dev_err_probe(dev, ret, "failed to register input device\n");
 
-	dev_info(dev, "Novatek NT36xxx touchscreen ready (client 0x%02x, reports via 0x%02x)\n",
+	dev_info(dev, "Novatek NT36xxx touchscreen ready (client 0x%02x, reports via 0x%02x, polled - B-11)\n",
 		 client->addr, NVT_FW_ADDR);
 	return 0;
 }
