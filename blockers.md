@@ -2161,6 +2161,27 @@ M4U at all. **That patch now has to become conditional** -- otherwise adding
 without it. Wiring the display without fixing the deferral would look like the
 IOMMU "not helping".
 
+### ~~There is no DA9214~~ — RETRACTED 2026-08-21 (evening). There is one.
+
+**This section is wrong and is superseded by B-40's update.** Stock Android on
+boot1 has `/sys/bus/i2c/devices/6-0068` named `vproc_buck`, bound to
+`bus/i2c/drivers/da9214`, with `mediatek,vproc_buck` as its DT compatible. The
+part is on i2c6 at 0x68 exactly as the original claim said.
+
+What the `Unsupported device id = 0x0` below actually showed is that mainline's
+`da9211` driver could not read DEVICE_ID through its paged regmap on the first
+traffic our kernel had ever put on that bus — i2c6 was enabled for the first
+time in `#34`. That is a fact about the access, not about the silicon.
+
+**The lesson here is the reverse of the one this file drew from it.** "Vendor
+code for an SoC is not evidence about a particular board built from it" is
+true, and it was applied to a case where the vendor code happened to be right —
+a negative probe result was allowed to overturn two independent sources without
+anyone asking why the probe might be lying. A measurement that disagrees with
+the documentation still has to be a *correct* measurement.
+
+The original text follows.
+
 ### There is no DA9214, and the A72 regulator plan built on one is void
 
 `echo da9214 0x68 > .../i2c-2/new_device` with the driver loaded:
@@ -2349,6 +2370,102 @@ script may do.
 currently wrong in exactly this way, and nobody has looked.
 
 ## 🟡 B-40 — the two Cortex-A72 cores never come up, and there is no cpufreq at all
+
+### UPDATE 2026-08-21 (evening): the boot1 trip happened, and it answers most of this
+
+Stock Android on p22, booted with `gemini-bootsel.py normal --reboot` and left
+with `gemini-bootsel.py recovery --via adb` + `adb reboot`. Read-only
+throughout. Full captures in `04-docs/captures/android-boot1-2026-08-21/`.
+
+**1. The A72s work, and so does everything else about this SoC.** All ten CPUs
+online; cpu8/9 report `CPU part 0xd08` (Cortex-A72). Live DVFS tables:
+
+| cluster | cores | range | at rest | Vproc | Vsram |
+|---|---|---|---|---|---|
+| LL (0-3) | A53 | 221 – **1547** MHz | 1118-1222 | 1160 mV | 1200 mV |
+| L (4-7) | A53 | 325 – **2002** MHz | 325-2002 | 1130 mV | 1200 mV |
+| B (8-9) | **A72** | 338 – **2522** MHz (`cpufreq_oppidx` lists 2587) | 845 | 890 mV | 1100 mV |
+| CCI | — | 169 – 988 MHz | 845 | 1010 mV | 1125 mV |
+
+Note there is a **VSRAM rail as well as VPROC**, at a different voltage. Any
+OPP port needs both (`proc-supply` *and* `sram-supply`).
+
+**2. What our own A53s are actually running at — measured, not estimated.**
+`ARMCAXPLL0/1_CON1` at `0x1001a204` / `0x1001a214` (MCUMIXED 0x1001a000,
+offsets and the PCW/posdiv/ckdiv arithmetic from the vendor `mt_cpufreq.c`
+`_cpu_freq_calc()`), read on kernel `#41`:
+
+```
+0x1001a204 = 0xC1114000   posdiv=1 pcw=0x114000  ->  897 MHz   cpu0-3 (LL)
+0x1001a214 = 0x400C4000   posdiv=0 pcw=0x0c4000  -> 1274 MHz   cpu4-7 (L)
+0x1001a274 (CKDIV1) = 0                             no further division
+```
+
+897000 is exactly an entry in Android's LL OPP table, which is the cross-check.
+Confirmed independently with a fixed integer loop: **173-179 Miter/s on cpu0-1,
+254 Miter/s on cpu4-7** — a ratio of 1.47 against the 1.42 the registers
+predict.
+
+**So the machine runs its A53s at 58% and 64% of their rated maximum**, and
+`173 Miter/s` — the number B-40 originally recorded and read as "roughly
+1.2-1.4 GHz" — is cpu0 at **897 MHz**. That estimate was too high and is
+corrected here.
+
+**DVFS is therefore worth more than the A72s, as suspected.** 1.72x on the
+little cluster and 1.57x on the big-little cluster, from a port with no new
+silicon to power up, against 2 extra cores that need a firmware path we do not
+have.
+
+**3. Cluster 2's power sequence is CPUHVFS, and that is why it was never
+found.** B-40 asked where MP2's MTCMOS sequence lives, given that
+`spm_mtcmos_ctrl_cpu1..cpu7` covers only the A53 clusters. Android's log
+answers it:
+
+```
+[Power/dcm] dcm_mcusys_mp2_sync_dcm(1)
+[Power/cpufreq] MT_CPU_DVFS_B freq = 845000
+[CPUHVFS] (0) [0018f295] cluster2 on,  pause = 0x0, swctrl = 0x25f0 (0x7b922)
+[CPUHVFS] (0) [00192a5a] cluster2 off, pause = 0x0, swctrl = 0x55f0 (0x7b955)
+```
+
+driven by `hps_main`, with `/proc/cpufreq/enable_cpuhvfs = 1`,
+`idvfs_mode = 1`, and a firmware blob at `/sys/kernel/debug/cpuhvfs/dvfsp_fw`.
+**The A72 cluster is powered by a DVFS co-processor running MediaTek firmware,
+not by a register sequence the kernel writes.** That is a materially harder
+dependency than "transcribe the MTCMOS steps", and it should be established
+before any more effort goes into an MTCMOS port. cluster2 is also cycled on and
+off several times a second at idle, so it is a hotplug target, not a
+"bring it up once" target.
+
+**4. THE DA9214 EXISTS. B-43's retraction is itself retracted.** Android:
+
+```
+/sys/bus/i2c/devices/6-0068/name    = vproc_buck
+/sys/bus/i2c/devices/6-0068/driver -> ../../bus/i2c/drivers/da9214
+/proc/device-tree/soc/i2c@1100e000/vproc_buck@68/compatible = mediatek,vproc_buck
+```
+
+A DA9214 is on i2c6 at 0x68 on this board and the vendor driver is bound to it
+right now. So the original claim was right, B-43's "measured absent" was wrong,
+and the `Unsupported device id = 0x0` that produced it is a fact about how
+mainline's `da9211` reaches the part — it uses a paged regmap — not about
+whether the part is there. Note also that i2c6 had only just been enabled in
+`#34`, so that probe was the first traffic ever put on that bus by our kernel.
+**Do not re-retract either way without reading the chip through the vendor's
+own access sequence.**
+
+**5. The GPU rail is not settled either.** i2c7 carries **two** regulators, not
+one: `rt5735@1c` (`rt,rt5735-regulator`, with an `mtk_gpuregulator_intf`
+attribute) and `vgpu_buck@60` (`mediatek,vgpu_buck`). B-43 concluded from
+i2c7:0x1c alone that it "is VGPU". There is a separate node actually named
+vgpu_buck at 0x60. Which supplies what is open.
+
+**6. The vendor DTB's CPU nodes carry no `clock-frequency` at all** — the
+1391/1950/2288 MHz figures in the table below came from `mt6797.dts` in the
+ubports tree, which is not this board's shipped DTB. Treat them as
+reference-platform numbers.
+
+---
 
 **Opened 2026-08-21.** MT6797 is a **tri-cluster** Helio X20 and we are using
 two thirds of it, at an unknown fixed clock.
