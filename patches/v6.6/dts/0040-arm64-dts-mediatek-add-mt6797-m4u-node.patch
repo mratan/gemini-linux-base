@@ -1,0 +1,57 @@
+arm64: dts: mediatek: add the mt6797 M4U node
+
+Address 0x10205000 and IRQ 156 taken from the vendor 3.18 device tree
+(arch/arm64/boot/dts/mt6797.dts, node m4u@10205000).
+
+Only larb0 is listed in mediatek,larbs: it is the only larb this tree
+instantiates and the whole display pipeline sits behind it. larb0 and
+smi_common are already enabled by the board DTS.
+
+Deliberately no clocks/clock-names: mt6797 has no infracfg M4U gate,
+which is why mt6797_data omits HAS_BCLK.
+
+This node alone changes nothing about how the display reaches memory.
+The larb keeps every port in MMU bypass until a master actually attaches
+to the IOMMU, so with no "iommus" property on any display component this
+is inert by construction — which is the point. It lands first, on its
+own, so that "the M4U probes cleanly and the panel is unaffected" is a
+result rather than an assumption. Wiring the display's iommus properties
+is a separate change.
+--- a/arch/arm64/boot/dts/mediatek/mt6797.dtsi
++++ b/arch/arm64/boot/dts/mediatek/mt6797.dtsi
+@@ -497,6 +497,35 @@
+ 		status = "disabled";
+ 	};
+ 	/*
++	 * M4U (MediaTek Multimedia Memory Management Unit) — the IOMMU in
++	 * front of the multimedia masters. Address 0x10205000 and IRQ 156
++	 * from the vendor 3.18 DT (arch/arm64/boot/dts/mt6797.dts,
++	 * node m4u@10205000); the address is the same one MT8173 uses, which
++	 * is consistent with them being the same generation.
++	 *
++	 * Why this matters beyond "the IOMMU is missing": without it
++	 * mediatek-drm can only scan out physically contiguous memory
++	 * (mtk_gem_prime_import_sg_table rejects any scattered sg_table), so
++	 * a panfrost-rendered buffer can never be handed to the display and
++	 * every GPU-composited pixel goes through a CPU copy. See B-39.
++	 *
++	 * Only larb0 is listed: it is the only larb this tree instantiates
++	 * and the whole display pipeline is behind it. Adding larb1..6 needs
++	 * their nodes first.
++	 *
++	 * Deliberately NO clocks/clock-names: mt6797 has no infracfg M4U
++	 * gate (mt6797_data omits HAS_BCLK for the same reason).
++	 */
++	m4u: iommu@10205000 {
++		compatible = "mediatek,mt6797-m4u";
++		reg = <0 0x10205000 0 0x1000>;
++		interrupts = <GIC_SPI 156 IRQ_TYPE_LEVEL_LOW>;
++		mediatek,infracfg = <&infrasys>;
++		mediatek,larbs = <&larb0>;
++		#iommu-cells = <1>;
++	};
++
++	/*
+ 	 * SMI common (Streaming Memory Interface shared bus arbiter).
+ 	 * Address 0x14022000 confirmed from vendor kernel DTB embedded in
+ 	 * planet/kali_boot.img (node smi_common@14022000).

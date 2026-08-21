@@ -1,0 +1,205 @@
+iommu/mediatek: add MT6797 support
+
+MT6797 (Helio X20) has an M4U at 0x10205000 — the same address MT8173
+uses, which is consistent with them being the same generation — and
+mainline has never had a compatible for it. The consequence is not
+subtle: with no IOMMU instance on the platform bus, the SMI larbs run in
+MMU-bypass mode, mediatek-drm can only scan out physically contiguous
+memory (mtk_gem_prime_import_sg_table rejects any scattered sg_table),
+and a panfrost-rendered buffer can therefore never be handed to the
+display. Every GPU-composited pixel goes through a CPU copy. See B-39.
+
+Modelled on mt6795_data: MT6795/Helio X10 is the closest already
+supported relative. The one deliberate difference is that HAS_BCLK is
+NOT set. MT8173 and MT6795 take an infracfg CLK_INFRA_M4U as "bclk";
+MT6797 has no such clock — it is absent from mt6797-clk.h, and the
+vendor DT's m4u node lists only the MM/larb clocks and the mtcmos
+domains, never a dedicated M4U gate. Claiming HAS_BCLK would fail the
+probe looking for a clock the SoC does not have.
+
+Only larb0 is remapped. The hardware has seven (vendor gM4uPort[] spans
+larb0..larb6) but larb0 is the only one this tree instantiates, and the
+whole display pipeline is behind it.
+
+The larb/port bindings header is transcribed mechanically from the
+vendor 3.18 table drivers/misc/mediatek/m4u/mt6797/m4u_platform.h,
+which carries the larb id and larb-local port number for all 71 masters.
+Transcribing all of them rather than only the display ports means an
+incomplete header cannot become a trap later. It also records a defect
+found while doing so: larb5 is the second display path (DISP_OVL1 /
+DISP_RDMA1), while mt6797.dtsi currently points those nodes at larb0.
+That is wrong and is only harmless because they are status="disabled".
+
+--- a/drivers/iommu/mtk_iommu.c
++++ b/drivers/iommu/mtk_iommu.c
+@@ -166,6 +166,7 @@
+ 	M4U_MT2712,
+ 	M4U_MT6779,
+ 	M4U_MT6795,
++	M4U_MT6797,
+ 	M4U_MT8167,
+ 	M4U_MT8173,
+ 	M4U_MT8183,
+@@ -1532,6 +1533,34 @@
+ 	.larbid_remap = {{0}, {1}, {2}, {3}, {4}}, /* Linear mapping. */
+ };
+ 
++/*
++ * MT6797 (Helio X20). The M4U sits at the same address as MT8173's
++ * (0x10205000) and is the same generation; MT6795/Helio X10 is the closest
++ * relative already supported, so this is modelled on mt6795_data.
++ *
++ * The one deliberate difference is that HAS_BCLK is NOT set. MT8173 and
++ * MT6795 take an infracfg CLK_INFRA_M4U as "bclk"; MT6797 has no such clock
++ * — it does not exist in mt6797-clk.h, and the vendor DT's m4u node lists
++ * only the MM/larb clocks and the mtcmos domains, never a dedicated M4U
++ * gate. Claiming HAS_BCLK here would fail the probe looking for a clock the
++ * SoC does not have.
++ *
++ * Only larb0 is listed. The hardware has seven (vendor gM4uPort[] spans
++ * larb0..larb6), but larb0 is the only one this tree instantiates, and the
++ * display pipeline is entirely behind it.
++ */
++static const struct mtk_iommu_plat_data mt6797_data = {
++	.m4u_plat     = M4U_MT6797,
++	.flags	      = HAS_4GB_MODE | RESET_AXI | HAS_LEGACY_IVRP_PADDR |
++			MTK_IOMMU_TYPE_MM | TF_PORT_TO_ADDR_MT8173,
++	.inv_sel_reg  = REG_MMU_INV_SEL_GEN1,
++	.banks_num    = 1,
++	.banks_enable = {true},
++	.iova_region  = single_domain,
++	.iova_region_nr = ARRAY_SIZE(single_domain),
++	.larbid_remap = {{0}}, /* Linear mapping; larb0 only. */
++};
++
+ static const struct mtk_iommu_plat_data mt8167_data = {
+ 	.m4u_plat     = M4U_MT8167,
+ 	.flags        = RESET_AXI | HAS_LEGACY_IVRP_PADDR | MTK_IOMMU_TYPE_MM,
+@@ -1759,6 +1788,7 @@
+ 	{ .compatible = "mediatek,mt2712-m4u", .data = &mt2712_data},
+ 	{ .compatible = "mediatek,mt6779-m4u", .data = &mt6779_data},
+ 	{ .compatible = "mediatek,mt6795-m4u", .data = &mt6795_data},
++	{ .compatible = "mediatek,mt6797-m4u", .data = &mt6797_data},
+ 	{ .compatible = "mediatek,mt8167-m4u", .data = &mt8167_data},
+ 	{ .compatible = "mediatek,mt8173-m4u", .data = &mt8173_data},
+ 	{ .compatible = "mediatek,mt8183-m4u", .data = &mt8183_data},
+diff --git a/include/dt-bindings/memory/mt6797-larb-port.h b/include/dt-bindings/memory/mt6797-larb-port.h
+new file mode 100644
+--- /dev/null
++++ b/include/dt-bindings/memory/mt6797-larb-port.h
+@@ -0,0 +1,115 @@
++/* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
++/*
++ * MT6797 (Helio X20) M4U larb/port IDs.
++ *
++ * Transcribed mechanically from the vendor 3.18 kernel table
++ * drivers/misc/mediatek/m4u/mt6797/m4u_platform.h (gM4uPort[]), which
++ * carries the larb id and larb-local port number for every master.
++ * Only larb0 (display/MDP) has a consumer in this tree today; the rest
++ * are transcribed so that an incomplete header cannot become a trap
++ * later.
++ *
++ * Note larb5 is the SECOND display path (DISP_OVL1/RDMA1), not larb0 --
++ * mt6797.dtsi currently points those nodes at larb0, which is wrong and
++ * only harmless because they are status="disabled".
++ */
++
++#ifndef _DT_BINDINGS_MEMORY_MT6797_LARB_PORT_H_
++#define _DT_BINDINGS_MEMORY_MT6797_LARB_PORT_H_
++
++#include <dt-bindings/memory/mtk-memory-port.h>
++
++#define M4U_LARB0_ID			0
++#define M4U_LARB1_ID			1
++#define M4U_LARB2_ID			2
++#define M4U_LARB3_ID			3
++#define M4U_LARB4_ID			4
++#define M4U_LARB5_ID			5
++#define M4U_LARB6_ID			6
++
++/* larb0: display + MDP */
++#define M4U_PORT_DISP_OVL0		MTK_M4U_ID(M4U_LARB0_ID, 0)
++#define M4U_PORT_DISP_2L_OVL0_LARB0	MTK_M4U_ID(M4U_LARB0_ID, 1)
++#define M4U_PORT_DISP_RDMA0		MTK_M4U_ID(M4U_LARB0_ID, 2)
++#define M4U_PORT_DISP_WDMA0		MTK_M4U_ID(M4U_LARB0_ID, 3)
++#define M4U_PORT_MDP_RDMA0		MTK_M4U_ID(M4U_LARB0_ID, 4)
++#define M4U_PORT_MDP_WDMA0		MTK_M4U_ID(M4U_LARB0_ID, 5)
++#define M4U_PORT_MDP_WROT0		MTK_M4U_ID(M4U_LARB0_ID, 6)
++#define M4U_PORT_DISP_FAKE_LARB0		MTK_M4U_ID(M4U_LARB0_ID, 7)
++
++/* larb1: video decode */
++#define M4U_PORT_VDEC_MC			MTK_M4U_ID(M4U_LARB1_ID, 0)
++#define M4U_PORT_VDEC_PP			MTK_M4U_ID(M4U_LARB1_ID, 1)
++#define M4U_PORT_VDEC_UFO		MTK_M4U_ID(M4U_LARB1_ID, 2)
++#define M4U_PORT_VDEC_VLD		MTK_M4U_ID(M4U_LARB1_ID, 3)
++#define M4U_PORT_VDEC_VLD2		MTK_M4U_ID(M4U_LARB1_ID, 4)
++#define M4U_PORT_VDEC_AVC_MV		MTK_M4U_ID(M4U_LARB1_ID, 5)
++#define M4U_PORT_VDEC_PRED_RD		MTK_M4U_ID(M4U_LARB1_ID, 6)
++#define M4U_PORT_VDEC_PRED_WR		MTK_M4U_ID(M4U_LARB1_ID, 7)
++#define M4U_PORT_VDEC_PPWRAP		MTK_M4U_ID(M4U_LARB1_ID, 8)
++#define M4U_PORT_VDEC_TILE		MTK_M4U_ID(M4U_LARB1_ID, 9)
++
++/* larb2: camera */
++#define M4U_PORT_CAM_IMGO		MTK_M4U_ID(M4U_LARB2_ID, 0)
++#define M4U_PORT_CAM_RRZO		MTK_M4U_ID(M4U_LARB2_ID, 1)
++#define M4U_PORT_CAM_AAO			MTK_M4U_ID(M4U_LARB2_ID, 2)
++#define M4U_PORT_CAM_AFO			MTK_M4U_ID(M4U_LARB2_ID, 3)
++#define M4U_PORT_CAM_LSCI_0		MTK_M4U_ID(M4U_LARB2_ID, 4)
++#define M4U_PORT_CAM_LSCI_1		MTK_M4U_ID(M4U_LARB2_ID, 5)
++#define M4U_PORT_CAM_SV0			MTK_M4U_ID(M4U_LARB2_ID, 6)
++#define M4U_PORT_CAM_SV1			MTK_M4U_ID(M4U_LARB2_ID, 7)
++#define M4U_PORT_CAM_SV2			MTK_M4U_ID(M4U_LARB2_ID, 8)
++#define M4U_PORT_CAM_LCSO		MTK_M4U_ID(M4U_LARB2_ID, 9)
++#define M4U_PORT_CAM_UFEO		MTK_M4U_ID(M4U_LARB2_ID, 10)
++#define M4U_PORT_CAM_BPCI		MTK_M4U_ID(M4U_LARB2_ID, 11)
++#define M4U_PORT_CAM_PDO			MTK_M4U_ID(M4U_LARB2_ID, 12)
++#define M4U_PORT_CAM_RAWI		MTK_M4U_ID(M4U_LARB2_ID, 13)
++
++/* larb3: video encode / JPEG */
++#define M4U_PORT_VENC_RCPU		MTK_M4U_ID(M4U_LARB3_ID, 0)
++#define M4U_PORT_VENC_REC		MTK_M4U_ID(M4U_LARB3_ID, 1)
++#define M4U_PORT_VENC_BSDMA		MTK_M4U_ID(M4U_LARB3_ID, 2)
++#define M4U_PORT_VENC_SV_COMV		MTK_M4U_ID(M4U_LARB3_ID, 3)
++#define M4U_PORT_VENC_RD_COMV		MTK_M4U_ID(M4U_LARB3_ID, 4)
++#define M4U_PORT_JPGENC_RDMA		MTK_M4U_ID(M4U_LARB3_ID, 5)
++#define M4U_PORT_JPGENC_BSDMA		MTK_M4U_ID(M4U_LARB3_ID, 6)
++#define M4U_PORT_JPGDEC_WDMA		MTK_M4U_ID(M4U_LARB3_ID, 7)
++#define M4U_PORT_JPGDEC_BSDMA		MTK_M4U_ID(M4U_LARB3_ID, 8)
++#define M4U_PORT_VENC_CUR_LUMA		MTK_M4U_ID(M4U_LARB3_ID, 9)
++#define M4U_PORT_VENC_CUR_CHROMA		MTK_M4U_ID(M4U_LARB3_ID, 10)
++#define M4U_PORT_VENC_REF_LUMA		MTK_M4U_ID(M4U_LARB3_ID, 11)
++#define M4U_PORT_VENC_REF_CHROMA		MTK_M4U_ID(M4U_LARB3_ID, 12)
++#define M4U_PORT_VENC_NBM_RDMA		MTK_M4U_ID(M4U_LARB3_ID, 13)
++#define M4U_PORT_VENC_NBM_WDMA		MTK_M4U_ID(M4U_LARB3_ID, 14)
++
++/* larb4: MJC */
++#define M4U_PORT_MJC_MV_RD		MTK_M4U_ID(M4U_LARB4_ID, 0)
++#define M4U_PORT_MJC_MV_WR		MTK_M4U_ID(M4U_LARB4_ID, 1)
++#define M4U_PORT_MJC_DMA_RD		MTK_M4U_ID(M4U_LARB4_ID, 2)
++#define M4U_PORT_MJC_DMA_WR		MTK_M4U_ID(M4U_LARB4_ID, 3)
++
++/* larb5: second display path */
++#define M4U_PORT_DISP_OVL1		MTK_M4U_ID(M4U_LARB5_ID, 0)
++#define M4U_PORT_DISP_2L_OVL1		MTK_M4U_ID(M4U_LARB5_ID, 1)
++#define M4U_PORT_DISP_RDMA1		MTK_M4U_ID(M4U_LARB5_ID, 2)
++#define M4U_PORT_DISP_WDMA1		MTK_M4U_ID(M4U_LARB5_ID, 3)
++#define M4U_PORT_DISP_OD_R		MTK_M4U_ID(M4U_LARB5_ID, 4)
++#define M4U_PORT_DISP_OD_W		MTK_M4U_ID(M4U_LARB5_ID, 5)
++#define M4U_PORT_DISP_2L_OVL0_LARB5	MTK_M4U_ID(M4U_LARB5_ID, 6)
++#define M4U_PORT_MDP_RDMA1		MTK_M4U_ID(M4U_LARB5_ID, 7)
++#define M4U_PORT_MDP_WROT1		MTK_M4U_ID(M4U_LARB5_ID, 8)
++#define M4U_PORT_DISP_FAKE_LARB5		MTK_M4U_ID(M4U_LARB5_ID, 9)
++
++/* larb6: camera / image */
++#define M4U_PORT_CAM_IMGI		MTK_M4U_ID(M4U_LARB6_ID, 0)
++#define M4U_PORT_CAM_IMG2O		MTK_M4U_ID(M4U_LARB6_ID, 1)
++#define M4U_PORT_CAM_IMG3O		MTK_M4U_ID(M4U_LARB6_ID, 2)
++#define M4U_PORT_CAM_VIPI		MTK_M4U_ID(M4U_LARB6_ID, 3)
++#define M4U_PORT_CAM_ICEI		MTK_M4U_ID(M4U_LARB6_ID, 4)
++#define M4U_PORT_CAM_RP			MTK_M4U_ID(M4U_LARB6_ID, 5)
++#define M4U_PORT_CAM_WR			MTK_M4U_ID(M4U_LARB6_ID, 6)
++#define M4U_PORT_CAM_RB			MTK_M4U_ID(M4U_LARB6_ID, 7)
++#define M4U_PORT_CAM_DPE_RDMA		MTK_M4U_ID(M4U_LARB6_ID, 8)
++#define M4U_PORT_CAM_DPE_WDMA		MTK_M4U_ID(M4U_LARB6_ID, 9)
++
++#endif
