@@ -106,7 +106,16 @@ if ! ip link show wlan0 >/dev/null 2>&1; then
     for m in rfkill cfg80211 wlan_gen3; do
         insmod "$K/$m.ko" 2>&1 | sed "s/^/   $m: /"
     done
+    # reset-failed first: a transient unit left over from an earlier attempt
+    # makes systemd-run refuse ("already loaded or has a fragment file"), the
+    # launcher never starts, and func-on then fails with a bare I/O error that
+    # says nothing about why. Cost an hour to spot.
+    systemctl reset-failed gemini-wmt-launcher 2>/dev/null
+    systemctl unmask gemini-wmt-launcher 2>/dev/null
     systemd-run -q --unit=gemini-wmt-launcher /usr/sbin/wmt_launcher -p /lib/firmware
+    if ! pgrep -f wmt_launcher >/dev/null 2>&1; then
+        echo "   WARNING wmt_launcher is not running; func-on will fail"
+    fi
     sleep 4
     echo 1 > /dev/wmtWifi; echo "   func-on rc=$?"
     # wlan0 does not appear instantly after func-on.
