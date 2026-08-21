@@ -2,31 +2,37 @@
 # gemini-net-up — bring internal Wi-Fi up after boot and join the stored
 # network, so SSH does not depend on the USB cable.
 #
-# Why this is a boot service and not a manual step: every iteration of the
-# panel and GPU work costs a flash and a boot, and when the USB gadget dies —
-# which it does on most kexec boots — the session stops until someone is
-# physically at the device. A second way in makes that survivable.
+# Why a second channel matters: the USB gadget dies on many boots, and when it
+# does the session is over until someone is physically at the device. That is
+# the thing this whole lab exists to avoid.
 #
-# TIMING IS LOAD-BEARING. A CONSYS func-on fired at ~14 s uptime WEDGES the
-# cold subsystem: regulators, clocks and pwrap are not ready that early, and no
-# software retry recovers it (confirmed over two cold boots, 2026-08-18). The
-# one reliable success was a manual run at 1-2 minutes. So this waits for a
-# settle floor before touching CONSYS at all. Do not lower it casually.
+# WHY THIS IS DANGEROUS, AND WHAT MAKES IT SAFE
 #
-# DO NOT ENABLE THIS AS A BOOT SERVICE. Measured 2026-08-20: run automatically
-# at boot it took the whole system down at ~177 s uptime — the gadget vanished,
-# the panel went dark, nothing came back — on two separate boots. Disabling it
-# and re-running the identical kernel gave a system stable well past 275 s.
+# Measured 2026-08-20: run unguarded at boot, this script took the entire
+# system down at ~177 s uptime on two separate boots — gadget gone, panel dark,
+# nothing back, physical power cycle required. The identical kernel with this
+# script disabled ran indefinitely. The cause is the CONSYS func-on itself, not
+# the logic here: a func-on on a non-cold CONSYS can wedge the MCU, and when it
+# wedges it takes the AXI bus and the machine with it. An unattended lab does
+# warm reboots constantly, so it almost never sees a cold CONSYS.
 #
-# The cause is the CONSYS func-on itself, not this script's logic. The vendor
-# notes are explicit that a func-on on a non-cold CONSYS can wedge the MCU with
-# no software recovery, and warm reboots (which is what an unattended lab does
-# constantly) never present a cold CONSYS. When it wedges, the AXI bus goes
-# with it and the system is gone.
+# Two things together make it survivable rather than fatal:
 #
-# So Wi-Fi is now OPT-IN: run this by hand when a second channel is worth the
-# risk, on a system you can afford to lose. It is not worth trading the whole
-# machine for a spare route into it.
+#   1. A real hardware watchdog reset (gemini-wdt-hardreset, B-29). A wedge
+#      then costs a reboot instead of the device.
+#   2. The attempt counter below. Without it, a wedge-reset would re-run the
+#      same bring-up and wedge again forever — recovery that loops is not
+#      recovery. The counter is incremented and SYNCED *before* the risky call,
+#      so a wedge leaves evidence it happened; it is cleared only on success.
+#      After MAXFAIL consecutive incomplete attempts the script stands down and
+#      lets the system boot without Wi-Fi.
+#
+# Wi-Fi is worth having. It is not worth more than the machine, and this is what
+# keeps that trade the right way round.
+#
+# TIMING IS ALSO LOAD-BEARING. A func-on at ~14 s uptime wedges a cold CONSYS
+# outright: regulators, clocks and pwrap are not ready that early, and no
+# retry recovers it. So this waits for a settle floor measured from boot.
 #
 # It deliberately does NOT touch the watchdog — see gemini-watchdog.
 set -u
@@ -35,6 +41,9 @@ SETTLE=${GEMINI_SETTLE:-120}
 LOG=/var/log/gemini-net-up.log
 WPA=/root/wpa.conf
 K=/lib/modules/$(uname -r)/updates
+STATE=/var/lib/gemini
+STAMP=$STATE/consys-attempts
+MAXFAIL=${GEMINI_MAXFAIL:-2}
 
 exec >>"$LOG" 2>&1
 echo "=== gemini-net-up $(date -Is) uptime=$(cut -d. -f1 /proc/uptime)s ==="
@@ -51,6 +60,42 @@ echo "settled at uptime ${up}s"
 if [ ! -r "$WPA" ]; then
     echo "no $WPA — nothing to join; leaving Wi-Fi down"; exit 0
 fi
+
+mkdir -p "$STATE"
+
+# Exactly one instance, ever. Two concurrent bring-ups race each other into
+# "no hif info" and leave the WMT core half-initialised — observed 2026-08-20
+# when a manual run overlapped the boot service. Worse, there is no way back:
+# mtk_stp_wmt_soc CANNOT be unloaded (wmt_lib_deinit deadlocks in
+# kthread_stop), so once the stack is half-up the only retry is a reboot.
+if ! mkdir "$STATE/net-up.lock" 2>/dev/null; then
+    echo "another gemini-net-up is running; refusing to race it"
+    exit 0
+fi
+trap 'rmdir "$STATE/net-up.lock" 2>/dev/null' EXIT
+
+# For the same reason the retry budget is PER BOOT, not per attempt: retrying
+# within one boot cannot work, because the modules from the failed attempt are
+# still loaded and unremovable. A second try only makes sense after a reboot.
+if [ -e /run/gemini-net-up.attempted ]; then
+    echo "already attempted this boot; a retry needs a reboot (modules are unremovable)"
+    exit 0
+fi
+: > /run/gemini-net-up.attempted   # /run is tmpfs: cleared every boot
+
+fails=$(cat "$STAMP" 2>/dev/null || echo 0)
+case "$fails" in ''|*[!0-9]*) fails=0 ;; esac
+if [ "$fails" -ge "$MAXFAIL" ]; then
+    echo "STANDING DOWN: $fails consecutive attempts did not complete."
+    echo "A CONSYS wedge takes the whole system with it, so this does not retry"
+    echo "indefinitely. Clear $STAMP by hand to try again."
+    exit 0
+fi
+# Increment and SYNC before touching CONSYS: if the func-on wedges the machine,
+# this file is the only record that the attempt ever happened.
+echo $((fails + 1)) > "$STAMP"
+sync
+echo "attempt $((fails + 1)) of $MAXFAIL"
 
 if ! ip link show wlan0 >/dev/null 2>&1; then
     echo "-- bringing up the CONSYS stack"
@@ -98,4 +143,7 @@ addr=$(ip -4 -br addr show wlan0)
 echo "wlan0: $addr"
 # Publish the address where the host can find it without guessing.
 ip -4 -o addr show wlan0 | awk '{print $4}' | cut -d/ -f1 > /run/gemini-wifi-ip
+# Survived the dangerous part: reset the counter so the next boot starts fresh.
+echo 0 > "$STAMP"
+sync
 echo "GEMINI-NET-UP-OK $(cat /run/gemini-wifi-ip 2>/dev/null)"

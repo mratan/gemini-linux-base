@@ -1,0 +1,71 @@
+watchdog: mtk_wdt: clear the bootloader's IRQ/DUAL mode when adopting a running WDT (B-29)
+
+mtk_wdt_init() adopts a watchdog the bootloader left running: it sets
+WDOG_HW_RUNNING and programs the timeout. What it does not do is touch
+WDT_MODE's IRQ_EN/DUAL_EN bits, so the bootloader's choice survives — and LK on
+the Gemini arms the RGU with both set, meaning expiry raises an interrupt first
+and only resets afterwards.
+
+A hung kernel services no interrupts, so that first stage goes nowhere and the
+reset never arrives. Measured on hardware 2026-08-20: a deliberate panic
+(panic_timeout=0) with the watchdog armed and systemd petting it at 30 s left
+the device dead for 490 s and needing a physical power cycle. An armed watchdog
+that interrupts a dead kernel is decoration.
+
+It cannot be corrected anywhere later. Setting WDOG_HW_RUNNING means the
+watchdog core never calls ->start, so mtk_wdt_start()'s own clearing of these
+bits never executes — not even when userspace opens /dev/watchdog. A userspace
+workaround was tried and is useless for the case that matters most: a boot that
+never reaches userspace never runs it.
+
+So clear them at probe, roughly a second into boot, while nothing else is
+running. From that point expiry is a straight hardware reset, which is the only
+kind that helps once the CPU has stopped executing our code. Anything that
+genuinely wants a pretimeout interrupt still sets the bits back through
+mtk_wdt_set_pretimeout().
+
+--- a/drivers/watchdog/mtk_wdt.c
++++ b/drivers/watchdog/mtk_wdt.c
+@@ -243,8 +243,42 @@
+ 	wdt_base = mtk_wdt->wdt_base;
+ 
+ 	if (readl(wdt_base + WDT_MODE) & WDT_MODE_EN) {
++		u32 reg;
++
+ 		set_bit(WDOG_HW_RUNNING, &wdt_dev->status);
+ 		mtk_wdt_set_timeout(wdt_dev, wdt_dev->timeout);
++
++		/*
++		 * GEMINI (B-29): adopting a watchdog the bootloader left running
++		 * inherits the bootloader's WDT_MODE, and LK on this device arms
++		 * it with IRQ_EN | DUAL_EN — expiry raises an interrupt first and
++		 * only resets afterwards.
++		 *
++		 * A hung kernel services no interrupts, so that first stage goes
++		 * nowhere and the reset never arrives. Measured 2026-08-20: a
++		 * deliberate panic with the watchdog armed and being petted left
++		 * the device dead for 490 s. An armed watchdog that interrupts a
++		 * dead kernel is decoration.
++		 *
++		 * It cannot be fixed later either. Because WDOG_HW_RUNNING is set
++		 * here, the watchdog core never calls ->start, so mtk_wdt_start()'s
++		 * own clearing of these bits never runs — not even when userspace
++		 * opens /dev/watchdog. And a userspace fix is useless for the case
++		 * that matters most: a boot that never reaches userspace.
++		 *
++		 * So clear them at probe, while we are the only thing running.
++		 * From here, expiry is a straight hardware reset. Nothing here
++		 * wants a pretimeout interrupt; if a future caller does, it sets
++		 * these bits back through mtk_wdt_set_pretimeout().
++		 */
++		reg = readl(wdt_base + WDT_MODE);
++		if (reg & (WDT_MODE_IRQ_EN | WDT_MODE_DUAL_EN)) {
++			reg &= ~(WDT_MODE_IRQ_EN | WDT_MODE_DUAL_EN);
++			reg |= WDT_MODE_KEY;
++			iowrite32(reg, wdt_base + WDT_MODE);
++			dev_info(wdt_dev->parent,
++				 "cleared bootloader IRQ/DUAL mode: expiry is now a reset\n");
++		}
+ 	}
+ }
+ 

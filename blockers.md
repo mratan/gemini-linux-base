@@ -1449,6 +1449,38 @@ driver to the MediaTek download-mode IDs so `/dev/ttyUSB*` appears at all —
 without it mtkclient can never see the device even in a state where it would
 otherwise work. That is worth keeping regardless.
 
+## 🔴 B-30 — a SOFTWARE reboot usually does not come back; only a cold power cycle is reliable
+
+**Opened 2026-08-20. This, not any individual driver bug, is what blocks the
+hands-free lab**, because every unattended cycle needs a restart and restarts
+are unreliable.
+
+Tally from one session, all with the same hardware and cabling:
+
+| Reboot | Method | Came back? |
+|---|---|---|
+| 16:05 | `systemctl reboot`, port dark | no |
+| 17:12 | BCB + `adb reboot` | **yes** |
+| 18:06 | BCB + `reboot` | no |
+| 18:26 | BCB + `reboot` | no |
+| every cold power cycle | power button | **yes, every time** |
+
+A failed one presents identically each time: no USB connect bit at the hub
+(`0100 power`), no Wi-Fi, dark panel. Indistinguishable from a powered-off
+device, which is how it was misread more than once today.
+
+**Not yet root-caused.** Candidates: the mtu3 gadget failing to re-initialise
+without a true power cycle (long-standing on this hardware, see the kexec
+notes), or the SoC not fully resetting on a warm restart. Distinguishing them
+needs the serial console, since by definition there is no other channel.
+
+**Consequence:** until this is understood, do NOT chain unattended
+flash-and-reboot cycles. Each software reboot is roughly a coin flip, and a
+lost one costs a physical power cycle. The pieces that make a hands-free lab
+(software slot selection via p1+BCB, flashing, offline image editing, remote
+eyes, state classification) all work — the loop still does not close, because
+the device cannot reliably restart itself.
+
 ## 🔴 B-29 — the RGU watchdog INTERRUPTS instead of resetting: a hang never self-recovers
 
 **Opened 2026-08-20. This is the blocker for the whole hands-free lab**, and it
@@ -1478,10 +1510,22 @@ nowhere and the reset never arrives. **An armed watchdog that interrupts a dead
 kernel is decoration.** Every "leave the watchdog armed so a hang recovers"
 rule in this project has been resting on a mechanism that does not fire.
 
-**Fix (staged, untested):** `gemini-wdt-hardreset` clears `IRQ_EN|DUAL_EN`
-leaving expiry as a straight hardware reset. It must run LATE — mtk_wdt
-rewrites `WDT_MODE` when systemd sets the timeout at open, so clearing the bits
-earlier is simply undone.
+**Root cause found in the driver.** `mtk_wdt_init()` adopts a watchdog the
+bootloader left running — it sets `WDOG_HW_RUNNING` and programs the timeout —
+but never touches `IRQ_EN`/`DUAL_EN`, so LK's choice survives. And because
+`WDOG_HW_RUNNING` is set, the core never calls `->start`, so
+`mtk_wdt_start()`'s own clearing of those bits never runs, not even when
+userspace opens `/dev/watchdog`.
+
+**Fix:** `patches/v6.6/misc/0001-watchdog-mtk-wdt-clear-bootloader-irq-dual-mode.patch`
+clears them at probe, ~1 s into boot. Staged in `boot-wdtfix.img`
+(`e314debe`), NOT yet verified on hardware.
+
+**The first attempt at this was wrong and is worth recording:** a userspace
+service (`gemini-wdt-hardreset`) that cleared the bits after boot. It works
+when it runs — WDT_MODE went 0x5D to 0x15 — but it is useless for the case that
+actually matters, because a boot that never reaches userspace never runs it.
+The fix has to be in the kernel, before the thing it protects against.
 
 **Until this is verified on hardware, treat every unattended experiment as
 one-shot:** a hang costs a physical power cycle, so the payload in the
