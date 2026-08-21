@@ -2511,10 +2511,90 @@ and the `cpufreq` tree there answers "is this a hardware limit or are we simply
 not driving the hardware" in about a minute, for both gaps at once. That is the
 next step, and it is the owner's own suggestion.
 
-## 🔴 B-39 — TWO independent ways to hard-wedge the SoC, both silent
+## 🔴 B-39 — TWO independent ways to hard-wedge the SoC
 
-**Opened 2026-08-21, and rewritten twice the same day as the evidence changed.
-Read this version. Both earlier attributions are retracted at the bottom.**
+**Opened 2026-08-21 and rewritten three times the same day. Read the update
+first; the earlier attributions are retracted at the bottom.**
+
+### UPDATE 2026-08-21 (after B-44): "both silent" is no longer true, and the
+### IOMMU was not the cause
+
+Retested on `#40`/`#41` — the kernels in which the display finally runs behind
+the M4U — because B-44 raised the possibility that trigger 1 was the missing
+IOMMU. **It was not.** Trigger 1 still wedges. But it is no longer silent, and
+what it says changes the diagnosis completely.
+
+*The isolating experiment, run twice in each direction.* Identical workload —
+sway on card0, one terminal in a `while :; do ls -la /usr; done` loop, then
+repeated qterminal open/close cycles — differing only in the renderer:
+
+| renderer | GPU state | result |
+|---|---|---|
+| `WLR_RENDERER=gles2` + `WLR_RENDER_DRM_DEVICE=renderD128` | `active` | **2 wedges in 6 runs** |
+| `WLR_RENDERER=pixman` | never leaves `suspended` | **0 wedges**, 12+1 cycles, twice |
+
+So the compositor, Wayland, the modeset, the panel and the eMMC-heavy workload
+are all cleared. **Panfrost is necessary.**
+
+*What the wedge actually looks like, captured for the first time.* Three
+separate signatures, all on netconsole, all new:
+
+```
+panfrost 13040000.gpu: gpu sched timeout, js=0, config=0x3b01, status=0x8,
+                       head=0xa141640, tail=0xa141640
+panfrost 13040000.gpu: Panfrost Dump: BO has no sgt, cannot dump
+panfrost 13040000.gpu: js fault, js=1, status=DATA_INVALID_FAULT, head=0xa147600
+        ...15 s later...
+mtk-msdc 11240000.mmc: msdc_request_timeout: aborting cmd=52
+```
+
+and, in another run:
+
+```
+gemini-nt36xxx 4-0062: page select failed: -110      (I2C, touchscreen)
+mtk-msdc 11240000.mmc: msdc_request_timeout ... cmd=52   (SDIO)
+mtk-msdc 11230000.mmc: msdc_request_timeout ... cmd=25   (eMMC write)
+```
+
+and, in a third:
+
+```
+rcu: INFO: rcu_preempt detected stalls on CPUs/tasks:
+rcu:  1-...!  2-...!  7-...!   (1 GPs behind)
+rcu:  (detected by 4, t=5256 jiffies, g=26217, q=324 ncpus=8)
+Task dump for CPU 1: task:ls  state:R running task
+```
+
+**Read those together and the shape is clear: a panfrost job faults, and then
+every unrelated bus master on the SoC times out in turn** — I2C, SDIO, eMMC —
+while three of eight CPUs stop making progress. That is not a display bug and
+not a memory-bandwidth problem. It is the GPU's fault-and-reset path taking
+something the whole system needs. `rmmod panfrost` oopsing during a fault loop,
+recorded earlier, is very likely the same thing from the other side.
+
+**The next step is therefore panfrost's reset path, not the display.** Two
+concrete questions, in order: (1) what is `DATA_INVALID_FAULT` on js=1 — a Mesa
+bug on Midgard, or an address panfrost handed the GPU that the M4U-free Mali MMU
+cannot reach; (2) does `panfrost_device_reset()` power-cycle the MFG domain with
+transactions outstanding, given this SoC's bespoke VGPU_SRAM LDO handling
+(`pmdomain/0007`).
+
+**Two process notes.** The reason all of this appeared at once is that
+`configs/gemini-lockup-detect.config` was added the same day: this kernel had
+**no** softlockup, hardlockup, hung-task or workqueue watchdog compiled in, so
+"netconsole captures nothing" was partly a statement about the kernel's
+configuration rather than about the failure. And the hardware watchdog's 30 s
+is shorter than the default 20 s softlockup threshold plus its reporting
+latency, so `kernel.watchdog_thresh=5` after each boot is what gets a report out
+before the machine is reclaimed.
+
+**`mtk_gem_prime_import_sg_table: sg_table is not contiguous` no longer appears
+at all** — the IOMMU removed it, as designed. It was always described here as a
+lead rather than a proof, and it is now closed as a non-cause.
+
+---
+
+**The original entry follows.**
 
 **The signature, common to every occurrence (~9 times in one session):** the
 machine goes away instantly, SSH resets mid-command, `/sys/fs/pstore` is empty
@@ -2659,7 +2739,28 @@ the screen.
 | Xorg, `SWcursor`, `Rotate left` | 5 s | **1021** (~two cores) |
 | sway, GPU compositing | 44 ms | **3** |
 
-Photographed on the glass: full-screen, correctly oriented, `output DSI-1
+**CORRECTION 2026-08-21: "correctly oriented" was never evidence and is
+retracted — `transform 90` is 180 degrees wrong.** The photograph offered for
+it, `04-docs/captures/sway-orange.jpg`, is a **solid orange rectangle**. A
+uniform colour cannot show an orientation, so the claim was not supported by
+the thing cited for it, and it stood for a day until the owner looked at the
+panel and said the desktop was upside down.
+
+Settled properly with two tiled terminals printing `LEFT` and `RIGHT`,
+photographed both ways on the glass: at `transform 90` the text is upside down
+and `LEFT` is on the right-hand side of the panel; at `transform 270` the text
+is upright and `LEFT` is on the left. sway's transform turns the output the
+opposite way from Xorg's `Rotate left`, so the two differ by 180 degrees.
+`scripts/gemini-desktop-setup.sh` now writes **270**.
+
+Worth recording how it was nearly not found: the webcam framed only the
+top-left corner of the panel, so several photographs of sway showed nothing but
+background and settled nothing. It took the owner re-aiming the camera to frame
+the whole screen before the instrument could answer at all. **The photograph is
+the honest instrument only if what is photographed can carry the answer** — a
+solid colour cannot, and neither can a crop that misses the content.
+
+Photographed on the glass: full-screen, `output DSI-1
 transform 90` (`scratchpad/sway-orange.jpg`). Keyboard and the Novatek
 touchscreen both enumerate under sway with no configuration.
 
