@@ -1,0 +1,78 @@
+drm/mediatek: defer the bind only when the DT actually promises an IOMMU
+
+Mainline returns -EPROBE_DEFER from mtk_drm_bind() whenever
+iommu_present() is false, because mediatek-drm cannot scan out scattered
+buffers without one. drm/0010 replaced that with a warning, correctly:
+while mainline mtk-iommu had no MT6797 support no IOMMU would ever
+register, the bind would defer forever, and the machine would have no
+display at all.
+
+With an M4U in the tree that warning is now wrong in the other direction,
+and the margin is small. Measured on kernel #34:
+
+  [0.837] mediatek-drm: no IOMMU, using contiguous CMA buffers
+  [0.886] mtk-iommu 10205000.iommu: bound 14020000.larb
+
+Fifty milliseconds. DRM binds first and comes up on CMA regardless of any
+iommus properties the display components carry -- and it does so
+silently, so the result would read as "the IOMMU did not help" rather
+than "the IOMMU was not there yet". That is a nasty class of bug to chase
+because both look identical from userspace.
+
+Asking the device tree settles it without reintroducing the hang: if an
+enabled m4u node exists then an IOMMU is coming and waiting is right; if
+there is none, nothing is coming and waiting would be fatal.
+--- a/drivers/gpu/drm/mediatek/mtk_drm_drv.c
++++ b/drivers/gpu/drm/mediatek/mtk_drm_drv.c
+@@ -649,15 +649,43 @@
+ 	int ret, i;
+ 
+ 	/*
+-	 * GEMINI (B-13 follow-on): mainline mtk-iommu has no MT6797 support,
+-	 * so no IOMMU ever registers on the platform bus and the stock
+-	 * iommu_present() gate would defer this bind forever. The MT6797
+-	 * bring-up runs the SMI larbs in MMU-bypass mode and uses physically
+-	 * contiguous CMA buffers instead, which the mtk_drm GEM code handles
+-	 * fine via dma_alloc_attrs(). Warn rather than defer.
++	 * GEMINI: defer if and only if the device tree promises an IOMMU.
++	 *
++	 * Mainline returns -EPROBE_DEFER whenever iommu_present() is false,
++	 * because mediatek-drm cannot scan out scattered buffers without one.
++	 * That was wrong here for as long as mainline mtk-iommu had no MT6797
++	 * support: no IOMMU would ever register, the bind would defer forever,
++	 * and the machine would have no display at all. So it was changed to a
++	 * warning, and the bring-up ran the SMI larbs in MMU-bypass mode with
++	 * physically contiguous CMA buffers.
++	 *
++	 * With an M4U now in the tree, an unconditional warning is wrong in the
++	 * other direction. Probe order is against us and it is close: measured
++	 * on kernel #34, mediatek-drm binds at 0.837 s and mtk-iommu binds larb0
++	 * at 0.886 s. Bind fifty milliseconds early and DRM comes up on CMA,
++	 * silently, no matter what iommus properties the display components
++	 * carry -- which would read as "the IOMMU did not help" rather than
++	 * "the IOMMU was not there yet".
++	 *
++	 * Asking the device tree settles it without reintroducing the hang: if
++	 * an enabled m4u node exists then an IOMMU is coming and waiting is
++	 * correct; if it does not, nothing is coming and waiting would be fatal.
+ 	 */
+-	if (!iommu_present(&platform_bus_type))
+-		dev_warn(dev, "no IOMMU, using contiguous CMA buffers\n");
++	if (!iommu_present(&platform_bus_type)) {
++		struct device_node *iommu_np;
++		bool iommu_expected;
++
++		iommu_np = of_find_compatible_node(NULL, NULL,
++						   "mediatek,mt6797-m4u");
++		iommu_expected = iommu_np && of_device_is_available(iommu_np);
++		of_node_put(iommu_np);
++
++		if (iommu_expected) {
++			dev_info(dev, "waiting for the M4U the DT promises\n");
++			return -EPROBE_DEFER;
++		}
++		dev_warn(dev, "no IOMMU and none declared, using contiguous CMA buffers\n");
++	}
+ 
+ 	pdev = of_find_device_by_node(private->mutex_node);
+ 	if (!pdev) {

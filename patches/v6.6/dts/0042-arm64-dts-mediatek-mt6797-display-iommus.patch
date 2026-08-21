@@ -1,0 +1,59 @@
+arm64: dts: mediatek: point the mt6797 display at the M4U
+
+OVL0, OVL0-2L and RDMA0 all reach memory through larb0, and all three now
+declare their M4U ports. OVL0 matters most: it is path[0] of the main DDP
+path, so mtk_drm_crtc makes it the DRM device's dma_dev, and every
+scanout buffer is allocated and mapped against its IOMMU domain.
+
+This is what removes the contiguity requirement. Without an IOMMU,
+mtk_gem_prime_import_sg_table rejects any sg_table that is not physically
+contiguous, and panfrost never allocates one -- so a GPU-rendered buffer
+could not be handed to the display at all and every composited pixel went
+through a CPU copy (B-39). With the ports mapped, dma_map_sgtable produces
+a single contiguous IOVA range and the same check passes.
+
+Port numbers come from the vendor gM4uPort[] table, transcribed in
+dt-bindings/memory/mt6797-larb-port.h: DISP_OVL0 is larb0 port 0,
+DISP_2L_OVL0_LARB0 port 1, DISP_RDMA0 port 2.
+--- a/arch/arm64/boot/dts/mediatek/mt6797.dtsi
++++ b/arch/arm64/boot/dts/mediatek/mt6797.dtsi
+@@ -8,6 +8,7 @@
+ #include <dt-bindings/interrupt-controller/irq.h>
+ #include <dt-bindings/interrupt-controller/arm-gic.h>
+ #include <dt-bindings/pinctrl/mt6797-pinfunc.h>
++#include <dt-bindings/memory/mt6797-larb-port.h>
+ #include <dt-bindings/power/mt6797-power.h>
+ 
+ / {
+@@ -548,6 +549,15 @@
+ 		power-domains = <&scpsys MT6797_POWER_DOMAIN_MM>;
+ 		clocks = <&mmsys CLK_MM_DISP_OVL0>;
+ 		mediatek,larb = <&larb0>;
++		/*
++		 * OVL0 is path[0] of the main DDP path, so mtk_drm_crtc sets
++		 * it as the DRM device's dma_dev — every scanout buffer is
++		 * allocated and mapped against THIS device's IOMMU domain.
++		 * Without it mtk_gem_prime_import_sg_table can only accept
++		 * physically contiguous memory, which panfrost never produces
++		 * (B-39).
++		 */
++		iommus = <&m4u M4U_PORT_DISP_OVL0>;
+ 		status = "disabled";
+ 	};
+ 	disp_ovl_2l0: disp-ovl2l0@1400d000 {
+@@ -557,6 +567,7 @@
+ 		power-domains = <&scpsys MT6797_POWER_DOMAIN_MM>;
+ 		clocks = <&mmsys CLK_MM_DISP_OVL0_2L>;
+ 		mediatek,larb = <&larb0>;
++		iommus = <&m4u M4U_PORT_DISP_2L_OVL0_LARB0>;
+ 		status = "disabled";
+ 	};
+ 	disp_rdma0: disp-rdma0@1400f000 {
+@@ -566,6 +577,7 @@
+ 		power-domains = <&scpsys MT6797_POWER_DOMAIN_MM>;
+ 		clocks = <&mmsys CLK_MM_DISP_RDMA0>;
+ 		mediatek,larb = <&larb0>;
++		iommus = <&m4u M4U_PORT_DISP_RDMA0>;
+ 		width-in-pixel = <1440>;
+ 		fifo-size = <1536>;
+ 		status = "disabled";

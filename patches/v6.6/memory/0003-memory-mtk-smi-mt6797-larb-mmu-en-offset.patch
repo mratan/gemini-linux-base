@@ -1,0 +1,69 @@
+memory: mtk-smi: mt6797's SMI_LARB_MMU_EN is at 0xfc0, not 0xf00
+
+memory/0001 added the mt6797 larb by pointing its compatible at
+mtk_smi_larb_mt8173, "modelled on mt6795". The register offset that
+choice carries is wrong for this SoC, and it is the one thing in that
+structure that matters: the mt8167 and mt8173 larb_gen entries differ in
+nothing except which address config_port writes the per-port MMU enables
+to.
+
+The vendor M4U register map for this exact SoC,
+drivers/misc/mediatek/m4u/mt6797/m4u_reg.h, is unambiguous:
+
+    #define SMI_LARB_MMU_EN  (0xfc0)
+    #define SMI_LARB_SEC_EN  (0xfc4)
+
+0xfc0 is what mainline names MT8167_SMI_LARB_MMU_EN. MT8173's is 0xf00.
+
+The failure this produces is worth describing, because the log actively
+misleads. With the enables written to the wrong register every port stays
+in IOMMU bypass, so once the display components are attached to a domain
+the OVL receives IOVAs and treats them as physical addresses. The screen
+garbles -- and NOT ONE IOMMU fault is logged, because the transactions
+never reach the IOMMU. A clean dmesg is exactly what you get, and it is
+the opposite of reassuring.
+
+Found by flashing the display's iommus properties (dts/0042) and having
+the owner report a garbled panel while the kernel reported a clean bind
+and zero faults.
+--- a/drivers/memory/mtk-smi.c
++++ b/drivers/memory/mtk-smi.c
+@@ -403,6 +403,29 @@
+ 	.config_port = mtk_smi_larb_config_port_mt8167,
+ };
+ 
++static const struct mtk_smi_larb_gen mtk_smi_larb_mt6797 = {
++	/*
++	 * MT6797's SMI_LARB_MMU_EN lives at 0xfc0, NOT the 0xf00 that MT8173
++	 * and MT6795 use. From the vendor M4U register map for this exact SoC,
++	 * drivers/misc/mediatek/m4u/mt6797/m4u_reg.h:
++	 *
++	 *     #define SMI_LARB_MMU_EN  (0xfc0)
++	 *     #define SMI_LARB_SEC_EN  (0xfc4)
++	 *
++	 * 0xfc0 is the offset mainline happens to name MT8167_SMI_LARB_MMU_EN,
++	 * so that config_port is the correct one to reuse; the larb_gen entries
++	 * for mt8167 and mt8173 differ in nothing else.
++	 *
++	 * Getting this wrong is silent and vicious, and it cost a flash to find.
++	 * The per-port MMU enables land in some other register, every port stays
++	 * in bypass, and the display then reads the IOVAs the IOMMU handed it as
++	 * if they were physical addresses. The screen garbles with ZERO IOMMU
++	 * faults logged -- because the transactions never reach the IOMMU at all,
++	 * which makes the log look reassuring at exactly the wrong moment.
++	 */
++	.config_port = mtk_smi_larb_config_port_mt8167,
++};
++
+ static const struct mtk_smi_larb_gen mtk_smi_larb_mt8173 = {
+ 	/* mt8173 do not need the port in larb */
+ 	.config_port = mtk_smi_larb_config_port_mt8173,
+@@ -442,7 +465,7 @@
+ 	{.compatible = "mediatek,mt2712-smi-larb", .data = &mtk_smi_larb_mt2712},
+ 	{.compatible = "mediatek,mt6779-smi-larb", .data = &mtk_smi_larb_mt6779},
+ 	{.compatible = "mediatek,mt6795-smi-larb", .data = &mtk_smi_larb_mt8173},
+-	{.compatible = "mediatek,mt6797-smi-larb", .data = &mtk_smi_larb_mt8173},
++	{.compatible = "mediatek,mt6797-smi-larb", .data = &mtk_smi_larb_mt6797},
+ 	{.compatible = "mediatek,mt8167-smi-larb", .data = &mtk_smi_larb_mt8167},
+ 	{.compatible = "mediatek,mt8173-smi-larb", .data = &mtk_smi_larb_mt8173},
+ 	{.compatible = "mediatek,mt8183-smi-larb", .data = &mtk_smi_larb_mt8183},

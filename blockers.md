@@ -1957,6 +1957,88 @@ required booting boot1 Android and restoring `boot-gpustack4.img`
 other known-good.** Android on boot1 remains the deep fallback and was
 untouched throughout.
 
+## 🔴 B-44 — the display behind the M4U: one real bug fixed, one still there
+
+**Opened 2026-08-21.** Wiring `iommus` into the display (dts/0042) took two
+flashes and produced one solid fix and one unsolved failure. **Currently rolled
+back: p1 holds `#34` (M4U present, display NOT behind it), marked good, desktop
+verified on the glass.**
+
+### Fixed, and worth having regardless: mt6797's SMI_LARB_MMU_EN is at 0xfc0
+
+`memory/0001` added the mt6797 larb by pointing its compatible at
+`mtk_smi_larb_mt8173`, "modelled on mt6795". The one field that structure
+carries is the register `config_port` writes the per-port MMU enables to, and
+mt8173's is **0xf00**. The vendor M4U register map for this exact SoC
+(`drivers/misc/mediatek/m4u/mt6797/m4u_reg.h`) says:
+
+```
+#define SMI_LARB_MMU_EN  (0xfc0)
+#define SMI_LARB_SEC_EN  (0xfc4)
+```
+
+0xfc0 is the offset mainline names `MT8167_SMI_LARB_MMU_EN`; the mt8167 and
+mt8173 `larb_gen` entries differ in nothing else. Fixed in `memory/0003` with a
+dedicated mt6797 entry.
+
+**Verified in hardware, which is the point:**
+
+```
+0x14020fc0 (mt6797 SMI_LARB_MMU_EN) = 0x00000007   <- ports 0,1,2 translating
+0x14020f00 (mt8173 offset, wrong)   = 0x00000000
+```
+
+**The failure this produced is one to remember, because the log lies.** With the
+enables going to the wrong register every port stayed in bypass, so once the
+display was attached to a domain the OVL got IOVAs and treated them as physical
+addresses. The owner saw a garbled panel; the kernel logged a clean bind, zero
+IOMMU faults and zero contiguity errors. **A clean dmesg was not evidence of a
+working IOMMU — it was evidence that nothing ever reached the IOMMU.**
+
+### Not fixed: with the ports actually translating, the display stalls
+
+On `#36`, with `MMU_EN = 0x7`, the panel goes black and:
+
+```
+[drm] *ERROR* flip_done timed out
+[drm] *ERROR* [CRTC:51:crtc-0] commit wait timed out
+[drm] *ERROR* [CONNECTOR:32:DSI-1] commit wait timed out
+[drm] *ERROR* [PLANE:33:plane-0] commit wait timed out
+[drm:mtk_drm_crtc_atomic_begin] *ERROR* new event while there is still a pending event
+```
+
+`OVL_SRC_CON` reads **0x00000000** — no layers enabled at all — while the CRTC
+reads `enable=1 active=1` and the backlight is on. So the commits never land and
+nothing is composited. Still **zero IOMMU faults**, so this is not a translation
+failure; the pipeline stops producing the vblank the commit waits on.
+
+This is the same shape as B-17/#20 (`flip_done`/vblank timeout), now reachable
+by putting the OVL behind the M4U. Whether translation genuinely changes the
+frame-done behaviour, or the IOMMU merely widens an existing race, is **not
+established** and should not be assumed either way.
+
+### Process failures, both mine
+
+1. **I marked `#35` good on a gate PASS while its display was broken.** The
+   panel gate is thirteen register and DCS checks; it says nothing about what
+   reaches the glass. It passed 13/13 with a garbled panel, exactly as it
+   should have.
+2. **The webcam had been re-aimed away from the device**, so `gemini-eyes.py`
+   photographed an empty scene and I read a black frame as evidence. The
+   project's own rule -- the photograph is the only honest instrument for the
+   glass -- is worth nothing when the camera is pointed elsewhere, and nothing
+   in the tooling notices. **Check the frame contains the device before
+   believing it.** (Re-aimed by the owner 2026-08-21.)
+
+### Where to pick this up
+
+`memory/0003` and `dts/0042` and `drm/0014` are all in the series and correct as
+far as they go; only the last of them is unsafe to boot with. The next question
+is why the OVL stops signalling frame-done once it is translating -- start by
+checking whether the SMI **common** configuration (`mtk_smi_common_mt6795`,
+adopted for mt6797 by the same "modelled on" assumption that got the larb offset
+wrong) is right for this SoC.
+
 ## 🟢 B-43 — the MT6797 M4U probes; and there is NO DA9214 on this board
 
 **Opened and half-resolved 2026-08-21, on kernel `#34`.** Two results from one
