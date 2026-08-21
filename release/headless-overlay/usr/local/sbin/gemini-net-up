@@ -13,6 +13,21 @@
 # one reliable success was a manual run at 1-2 minutes. So this waits for a
 # settle floor before touching CONSYS at all. Do not lower it casually.
 #
+# DO NOT ENABLE THIS AS A BOOT SERVICE. Measured 2026-08-20: run automatically
+# at boot it took the whole system down at ~177 s uptime — the gadget vanished,
+# the panel went dark, nothing came back — on two separate boots. Disabling it
+# and re-running the identical kernel gave a system stable well past 275 s.
+#
+# The cause is the CONSYS func-on itself, not this script's logic. The vendor
+# notes are explicit that a func-on on a non-cold CONSYS can wedge the MCU with
+# no software recovery, and warm reboots (which is what an unattended lab does
+# constantly) never present a cold CONSYS. When it wedges, the AXI bus goes
+# with it and the system is gone.
+#
+# So Wi-Fi is now OPT-IN: run this by hand when a second channel is worth the
+# risk, on a system you can afford to lose. It is not worth trading the whole
+# machine for a spare route into it.
+#
 # It deliberately does NOT touch the watchdog — see gemini-watchdog.
 set -u
 
