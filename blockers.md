@@ -1449,7 +1449,56 @@ driver to the MediaTek download-mode IDs so `/dev/ttyUSB*` appears at all —
 without it mtkclient can never see the device even in a state where it would
 otherwise work. That is worth keeping regardless.
 
-## 🔴 B-30 — a SOFTWARE reboot usually does not come back; only a cold power cycle is reliable
+## 🔴 B-30 — a SOFTWARE reboot never comes back — SAME ROOT CAUSE AS B-29
+
+**Root-caused 2026-08-20.** B-29 and B-30 are one bug wearing two hats, and the
+one-line kernel fix for B-29 should fix both.
+
+`mtk_wdt_restart()` is registered as the system restart handler
+(`watchdog_set_restart_priority(..., 128)`), so `reboot` on this device does not
+go through PSCI — it issues a **watchdog software reset**:
+
+```c
+while (1) {
+        writel(WDT_SWRST_KEY, wdt_base + WDT_SWRST);
+        mdelay(5);
+}
+```
+
+With `WDT_MODE`'s `IRQ_EN | DUAL_EN` set — inherited from LK and never cleared,
+see B-29 — that software reset raises an **interrupt** rather than resetting the
+SoC. The kernel is already tearing down for reboot, so nothing services it, and
+the machine simply stops. Same broken mechanism as the timeout path: expiry
+interrupts a CPU that is no longer listening.
+
+**Decisive evidence, and it is what the panel bought us.** After a failed
+reboot the panel is COMPLETELY DARK — no kernel console *and no LK splash*.
+LK draws its splash within a moment of any real reset, so its absence means the
+bootloader never ran at all. The failure is therefore before the kernel: not a
+hang, a failure to restart. Nothing else in the lab could have told us that.
+
+**Consistent with every observation:**
+
+| Reboot | Watchdog config in effect | Came back? |
+|---|---|---|
+| from the experimental system (x4) | LK's IRQ+DUAL, uncorrected | **never** |
+| `adb reboot` from Android | the vendor 3.18 kernel's own | **yes** |
+| cold power cycle | not used at all | **always** |
+
+Every software reboot from the experimental system has failed; the only one that
+worked was issued from Android, whose vendor kernel programs the watchdog
+itself.
+
+**Fix:** the same patch as B-29 —
+`patches/v6.6/misc/0001-watchdog-mtk-wdt-clear-bootloader-irq-dual-mode.patch`,
+clearing the bits at probe. Flashed to p1 as `boot-wdtfix.img` (`e314debe`).
+
+**Prediction to test:** once that kernel has been booted ONCE (which needs a
+cold power cycle, since the current halt cannot be escaped from software), a
+software reboot issued *from it* should work — and a deliberate hang should
+self-recover. If both hold, the hands-free loop closes.
+
+## 🔴 B-30 (original notes) — the tally that led here
 
 **Opened 2026-08-20. This, not any individual driver bug, is what blocks the
 hands-free lab**, because every unattended cycle needs a restart and restarts
