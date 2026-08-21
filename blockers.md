@@ -2686,6 +2686,61 @@ next step, and it is the owner's own suggestion.
 **Opened 2026-08-21 and rewritten three times the same day. Read the update
 first; the earlier attributions are retracted at the bottom.**
 
+### UPDATE 2026-08-21 (night): the trigger is precise, and three hypotheses are dead
+
+**The trigger is a new client surface arriving while the GPU is already
+rendering** — not GPU load, not Qt, not Xwayland, not "a real window".
+
+| what | GPU | result |
+|---|---|---|
+| `glxgears`, 90 s continuous | busy | **survives** |
+| foot / Qt-on-Wayland / xclock / qterminal, opened with the GPU idle | idle | **all survive** |
+| **any** new window opened while `glxgears` renders | busy | **wedges, twice, in seconds** |
+
+That retires the "qterminal is fatal, foot is safe" framing: the difference was
+never the client, it was whether anything else was already on the GPU.
+
+**Refuted, in order:**
+
+1. **The display's IOMMU.** B-44 is fixed; this still wedges.
+2. **The MFG async-bridge timing register.** The vendor ORs
+   `max_freq >= 780000 ? 0xa : 0x5` into `MFG + 0x1c` at every GPU power-on
+   (`mtk_config_platform.c`); ours reads `0x00000000`. Note our GPU clock is
+   500.5 MHz, so the vendor value here is **0x5** — the `0xa` recorded in
+   `STATE-2026-08-21-evening.md` is the >=780 MHz branch and is wrong for this
+   machine. Written live with devmem while the domain was up, verified as
+   `0x00000005`, wedged on the next window anyway.
+3. **`panfrost_device_reset()` cycling the MFG power domain.** It does not:
+   soft-reset, power on cores, MMU reset, unmask interrupts. The domain is only
+   cycled by runtime suspend/resume.
+
+**The strongest remaining lead: panfrost applies 3 of the 15 workarounds the
+vendor applies for this exact GPU revision.** t880 r1p0 maps in the vendor's
+kbase to `base_hw_issues_t86x_r1p0`, 15 entries; panfrost's `hw_issues_t880`
+has three, and only one of those (`T76X_3953`) is referenced anywhere in
+panfrost's C code. The interesting absentee is **`HW_ISSUE_9435`** — *"Compute
+endpoint has a 4-deep queue of tasks, meaning a soft stop won't complete until
+all 4 tasks have completed"* — against `panfrost_reset()`, which soft-stops
+every slot, waits **10 ms**, prints `Soft-stop failed`, and issues
+`GPU_CMD_SOFT_RESET` regardless. Resetting a Mali with tasks still running and
+AXI transactions outstanding is a plausible way to leave the interconnect
+holding one, which is exactly the aftermath.
+
+Stated against my own lead: in the one complete capture, `gpu sched timeout` was
+followed by `js fault DATA_INVALID_FAULT` with **no** `Soft-stop failed` between
+them, so that soft-stop did complete inside 10 ms. 9435 is a lead, not a cause.
+
+`HW_ISSUE_8408` is worth reading too — *"Repeatedly Soft-stopping a job chain
+(Vertex Shader, Cache Flush, Tiler) causes DATA_INVALID_FAULT on tiler job"* —
+which says the `DATA_INVALID_FAULT` is a **consequence of the timeout handling**
+rather than the original problem. The first event is a js=0 job that missed its
+500 ms deadline.
+
+**What this bug actually needs is a serial console.** netconsole dies with the
+machine and its last line is always about a second stale — the touchscreen's
+I2C timeout, which is the first victim to notice, not the cause. B-1's FTDI
+adapter is not in the rig.
+
 ### UPDATE 2026-08-21 (after B-44): "both silent" is no longer true, and the
 ### IOMMU was not the cause
 
