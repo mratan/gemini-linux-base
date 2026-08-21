@@ -1449,6 +1449,53 @@ driver to the MediaTek download-mode IDs so `/dev/ttyUSB*` appears at all —
 without it mtkclient can never see the device even in a state where it would
 otherwise work. That is worth keeping regardless.
 
+## 🟢 B-29 / B-30 — RESOLVED 2026-08-20 (late): the loop closes
+
+**The decisive measurement was finally run, and it passed.** Everything below in
+B-29 and B-30 stands as the diagnostic history; this is the outcome.
+
+**Experiment.** Device booted and healthy on `boot-touch-page.img` (`6aafdd16`,
+`6.6.0-dirty #14`) in p1, BCB armed at `boot-recovery` and *sticky*
+(`/etc/gemini-bcb-sticky` present, so the disarm service leaves it), systemd
+petting `/dev/watchdog0` at 30 s, `panic_timeout=0` so a panic hangs forever.
+Fired `echo c > /proc/sysrq-trigger` over a detached SSH at **21:33:04**.
+
+**Result: it came back by itself at 21:35:37 — about 2 min 33 s, zero human
+action.** Timeline matches the mechanism exactly: ~31 s of watchdog countdown,
+then LK, then a ~75 s boot, then the network.
+
+**Proof it was a real reset and not a warm continuation:** the fresh boot's own
+dmesg shows the driver finding LK's configuration *again* —
+
+```
+[    0.624325] mtk-wdt 10007000.watchdog: WDT_MODE 0x0000005d -> 0x00000011
+               (reset is now internal and immediate)
+[    0.626040] mtk-wdt 10007000.watchdog: Watchdog enabled (timeout=31 sec)
+```
+
+`WDT_MODE` was 0x5d at probe, which is LK's value. The bootloader ran. Uptime
+after recovery was 0 minutes.
+
+**So the fix is the pair, not either half.** Clearing `IRQ_EN | DUAL_EN` alone
+was verified 2026-08-20 midday and did *not* make a reboot work — that failure
+is recorded below and was correct. `EXRST_EN` (bit 2) was the missing piece: it
+routes the reset to the PMIC, which on this board powers the device off instead
+of restarting it. Clearing all three at probe (0x5d → 0x11) makes both the
+timeout path and the `WDT_SWRST` path reset the SoC internally.
+
+**Consequences, replacing the operating rules the earlier entries set:**
+
+- An unattended hang is **no longer one-shot**. A kernel that hangs after probe
+  costs ~2.5 minutes, not a physical power cycle.
+- B-25's kexec ban still stands — this changes nothing about kexec, and flash +
+  cold boot remains the way to enter a kernel.
+- The remaining genuinely-fatal case is a kernel that hangs **before** the
+  watchdog driver probes at 0.62 s. That is still a power cycle, and it is why
+  "never put an unproven kernel in p1 while the BCB points there" survives as a
+  rule even now.
+
+---
+
 ## 🔴 B-30 — a SOFTWARE reboot never comes back — SAME ROOT CAUSE AS B-29
 
 **Root-caused 2026-08-20.** B-29 and B-30 are one bug wearing two hats, and the
