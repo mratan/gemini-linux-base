@@ -1,0 +1,36 @@
+arm64: dts: mediatek: gemini: point the touchscreen at its panel
+
+The touch controller is on the panel's die and power domain (TDDI), so the
+panel's prepare/unprepare is its power sequence. Name the panel from the
+touch node so the driver can register as a drm_panel_follower; label the
+panel node for it.
+
+Signed-off-by: mratan <mattdratan@gmail.com>
+
+--- a/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
++++ b/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
+@@ -608,6 +608,15 @@
+ 		/* Clamshell used in landscape; the panel is natively portrait. */
+ 		touchscreen-swapped-x-y;
+ 		touchscreen-inverted-y;
++		/*
++		 * This is a TDDI part: the touch controller shares the panel's
++		 * die and its power domain, so the panel's prepare/unprepare is
++		 * this chip's power sequence. Naming the panel here makes the
++		 * driver a drm_panel_follower, which is how it learns to stop
++		 * polling an unpowered chip and to re-initialise one that has
++		 * just come back from cold.
++		 */
++		panel = <&gemini_panel>;
+ 		status = "okay";
+ 	};
+ 
+@@ -874,7 +883,7 @@
+ 	 * Solomon SSD2092 FHD panel on DSI0 (LK: aeon_ssd2092_fhd_dsi_solomon,
+ 	 * panel ID 0x01572098 — probed by the stock bootloader at every boot).
+ 	 */
+-	panel@0 {
++	gemini_panel: panel@0 {
+ 		compatible = "solomon,ssd2092";
+ 		reg = <0>;
+ 		avdd-supply = <&lcd_avdd>;
