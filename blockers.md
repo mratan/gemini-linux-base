@@ -1957,6 +1957,83 @@ required booting boot1 Android and restoring `boot-gpustack4.img`
 other known-good.** Android on boot1 remains the deep fallback and was
 untouched throughout.
 
+## 🟢 B-43 — the MT6797 M4U probes; and there is NO DA9214 on this board
+
+**Opened and half-resolved 2026-08-21, on kernel `#34`.** Two results from one
+flash, one good and one that invalidates a plan.
+
+### The IOMMU works (B-39's structural half)
+
+```
+mtk-iommu 10205000.iommu: bound 14020000.larb (ops mtk_smi_larb_component_ops)
+/sys/class/iommu/mtk-iommu.0x0000000010205000
+```
+
+The M4U registers and binds larb0, and the panel is untouched: **panel gate PASS
+13/13**, sddm up, `card0`/`DSI-1` present. Inert exactly as designed, because no
+display component has an `iommus` property yet. `#34` is in p1, marked good.
+
+**A probe-ordering fact that Step B will hit.** The boot log reads:
+
+```
+[0.837] mediatek-drm: no IOMMU, using contiguous CMA buffers
+[0.886] mtk-iommu 10205000.iommu: bound 14020000.larb
+```
+
+mediatek-drm binds **50 ms before the IOMMU exists**. Mainline handles this by
+returning `-EPROBE_DEFER` from `mtk_drm_bind()` when `iommu_present()` is false;
+our `drm/0010` patch turned that into a warning, correctly, for a world with no
+M4U at all. **That patch now has to become conditional** -- otherwise adding
+`iommus` to the display changes nothing, because DRM will have already bound
+without it. Wiring the display without fixing the deferral would look like the
+IOMMU "not helping".
+
+### There is no DA9214, and the A72 regulator plan built on one is void
+
+`echo da9214 0x68 > .../i2c-2/new_device` with the driver loaded:
+
+```
+da9211 2-0068: Unsupported device id = 0x0.
+```
+
+The driver reads DEVICE_ID through its own paged regmap and gets **0x0**; a
+DA9214 returns `0x22`. Raw dumps agree -- every readable register on that
+address is zero. `i2cdetect` does show ACKs at 0x68-0x6b, so something is on the
+wire, but it is not this part.
+
+**So the earlier claim that "VPROC2 comes from a Dialog DA9214 at 0x68 on bus 6,
+and mainline already supports it" is wrong and is retracted.** It came from
+`drivers/misc/mediatek/base/power/mt6797/mt_cpufreq.c`, which is MediaTek
+*reference-platform* code and does not describe Planet's board. The general
+lesson is the one this file keeps relearning: vendor code for an SoC is not
+evidence about a particular device built from it.
+
+**What the board actually has, measured:** `i2c7` (`/dev/i2c-3`) carries one
+external buck at **0x1c**, bound to `fan53555-regulator` and named `rt5735` --
+and it is **VGPU** (enabled, 862.5 mV), not VPROC. The DTS labels that address
+`vproc: regulator@1c`, which is simply wrong; the node is `status = "disabled"`
+so it has never mattered. The live `vproc` is still `vproc_fixed`, a
+`regulator-fixed` asserting a flat 1.000 V with nothing behind it.
+
+**So VPROC and VPROC2 are both unaccounted for on this board.** Whether there is
+a second CPU rail at all, or whether all three clusters share one, is now an
+open question and the next thing to establish. Do not assume a separate VPROC2
+exists.
+
+### Side effect worth knowing: enabling i2c6 renumbered every bus
+
+Linux numbers `/dev/i2c-N` by probe order, not by DT label. Adding i2c6 inserted
+it and shifted the rest:
+
+| /dev | controller | was |
+|---|---|---|
+| i2c-2 | `i2c@1100e000` (i2c6) | *new* |
+| i2c-3 | `i2c@11010000` (i2c7, VGPU buck) | i2c-2 |
+| i2c-5 | `i2c@11014000` (i2c3, **touchscreen**) | i2c-3 |
+
+Anything with a hard-coded bus number is now pointing at the wrong device -- the
+`/root/nvt-*` touchscreen probes in particular.
+
 ## 🔴 B-42 — the device cannot charge faster than 500 mA, which is less than it uses
 
 **Opened 2026-08-21, after the battery went flat and the machine would not
