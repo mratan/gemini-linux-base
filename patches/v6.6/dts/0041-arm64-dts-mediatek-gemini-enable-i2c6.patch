@@ -1,0 +1,70 @@
+arm64: dts: mediatek: gemini: enable i2c6 for the A72 cluster's supply
+
+MT6797 is tri-cluster and the two Cortex-A72 cores have never been
+powered: MP2_CPUSYS_PWR_CON reads its reset value -- unpowered, isolated,
+held in reset with its SRAM down -- while both A53 clusters read identical
+"on" values (B-40). One of the missing pieces is the cluster's core rail,
+VPROC2, and the vendor names its provider precisely: a Dialog DA9214 at
+7-bit 0x68 on bus 6 (drivers/misc/mediatek/power/mt6797/da9214.c).
+
+This enables the bus and adds NO child node, which is the point. The
+DA9214 is a dual buck; VPROC2 is BUCKB (the vendor's DA9214_VPROC2 is
+register 0xD9, and mainline's DA9211_REG_VBUCKB_A is 0xD9), which means
+BUCKA is a separate CPU core rail that may well be the one the running
+A53 clusters depend on. The regulator core disables regulators nothing
+has claimed, so declaring a mis-identified one is not a harmless mistake
+on a machine whose only display would go with the CPUs.
+
+With the bus up and CONFIG_REGULATOR_DA9211=m, the chip can be probed
+deliberately -- both bucks' enable bits and voltages read after boot,
+after the disable-unused sweep has already run -- and the regulator node
+lands as a separate change once that measurement exists.
+
+Pins were already defined in mt6797.dtsi (i2c6_pins_a: SDA=GPIO152,
+SCL=GPIO151); only the enable was missing.
+--- a/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
++++ b/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
+@@ -717,6 +717,43 @@
+ 	};
+ };
+ 
++/*
++ * i2c6: the DA9214 dual buck that supplies VPROC2 — the Cortex-A72 cluster's
++ * core rail. Enabled with NO child node on purpose.
++ *
++ * WHY THE BUS AND NOT THE REGULATOR
++ *
++ * MT6797 is tri-cluster and cpu8/cpu9 (the two A72s) have never been powered:
++ * MP2_CPUSYS_PWR_CON reads its reset value, unpowered and isolated and held in
++ * reset, while both A53 clusters read identical "on" values (B-40). One of the
++ * things missing is the cluster's supply, and the vendor names it precisely —
++ * `DA9214_SLAVE_ADDR_WRITE 0xD0` (7-bit 0x68) on `da9214_BUSNUM` 6, in
++ * drivers/misc/mediatek/power/mt6797/da9214.c. Mainline's da9211 driver covers
++ * DA9214.
++ *
++ * But the DA9214 is a DUAL buck, and which of BUCKA/BUCKB is VPROC2 is not
++ * established — the other one may well be a rail the running system depends
++ * on. Declaring a regulator we have mis-identified is not a harmless mistake:
++ * the regulator core disables unclaimed regulators at late init, so guessing
++ * wrong could switch off a live supply on a machine whose only display is the
++ * panel it would take with it.
++ *
++ * So this step brings up the bus and nothing else. With i2c6 present, the chip
++ * can be read from userspace with i2cget — presence, both bucks' enable bits
++ * and both voltage registers — and the identification becomes a measurement
++ * instead of an inference. The regulator node lands in a separate change once
++ * that read exists.
++ *
++ * Pins are already defined in mt6797.dtsi (i2c6_pins_a: SDA=GPIO152,
++ * SCL=GPIO151); only the enable was missing.
++ */
++&i2c6 {
++	pinctrl-names = "default";
++	pinctrl-0 = <&i2c6_pins_a>;
++	clock-frequency = <400000>;
++	status = "okay";
++};
++
+ /* --- Pinctrl --- */
+ 
+ 
