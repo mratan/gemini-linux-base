@@ -1957,6 +1957,66 @@ required booting boot1 Android and restoring `boot-gpustack4.img`
 other known-good.** Android on boot1 remains the deep fallback and was
 untouched throughout.
 
+## 🟡 B-38 — X11 structurally cannot use this GPU; Wayland can, and does
+
+**Opened 2026-08-21, after B-34.** The Mali renders now, and the desktop still
+does not use it. This is the second half of #36 and it is not a tuning problem.
+
+**The structural fact.** The two DRM devices have disjoint capabilities:
+
+```
+card0 -> mediatek-drm   CRTC + DSI connector, and NO render node
+card1 -> panfrost       renderD128, and NO CRTC and NO connector
+```
+
+Xorg's only bridge between "the device that scans out" and "the device that
+renders" is glamor, and glamor binds EGL to the *display* device's fd. That fd
+has no render capability, so glamor cannot initialise and `AccelMethod "none"`
+is not a choice we made, it is the only thing that works. Confirmed live:
+`xrandr --listproviders` reports **one** provider with `cap: 0x2` (Sink Output
+only — no Source Offload), and `DRI_PRIME=1 glxinfo -B` reports `llvmpipe`
+exactly like the unprefixed one. There is no X configuration that fixes this.
+
+**Wayland does it correctly, measured on hardware the same day.** wlroots takes
+the two devices separately — but it has to be told, because its autodetection
+looks for a render node on the KMS device and finds none:
+
+```
+WLR_RENDER_DRM_DEVICE=/dev/dri/renderD128 sway
+  [wlr] Opening DRM render node '/dev/dri/renderD128' from WLR_RENDER_DRM_DEVICE
+  [wlr] GL renderer: Mali-T880 (Panfrost)
+  [wlr] Using DRM node /dev/dri/card0            (GBM/scanout)
+```
+
+Without that variable sway comes up on the software renderer and the GPU stays
+`runtime_status: suspended` — which looks like success if you only photograph
+the screen.
+
+**What it is worth, same workload as B-37's measurement:**
+
+| 400 pointer moves | wall time | compositor CPU ticks |
+|---|---|---|
+| Xorg, `SWcursor`, `Rotate left` | 5 s | **1021** (~two cores) |
+| sway, GPU compositing | 44 ms | **3** |
+
+Photographed on the glass: full-screen, correctly oriented, `output DSI-1
+transform 90` (`scratchpad/sway-orange.jpg`). Keyboard and the Novatek
+touchscreen both enumerate under sway with no configuration.
+
+Note sway does **not** use the hardware cursor plane either — plane-3 stays at
+`crtc-pos=0x0+0+0` and `DISP_REG_OVL_OFFSET(3)` stays `0`. It composites the
+cursor and it costs 3 ticks, because the compositing is on the GPU. So B-37's
+CPU cost is really a symptom of software compositing, not of the cursor plane.
+
+**Not switching the desktop.** The owner has a working LXQt/X11 session and
+that is their call, not this session's. What a switch would still need:
+`Xwayland` is **not installed** (sway logs `Cannot find Xwayland binary`), so
+every existing X application — including all of LXQt — has nowhere to run yet;
+screen blanking, backlight, the Bluetooth mouse and session management would all
+need re-proving under the new stack.
+
+**Opened 2026-08-21.**
+
 ## 🟡 B-37 — the hardware cursor plane is drawn once and never moves
 
 **Update 2026-08-21 (later): `Atomic "on"` does NOT fix it. The hypothesis
