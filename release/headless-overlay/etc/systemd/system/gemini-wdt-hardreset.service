@@ -1,0 +1,15 @@
+[Unit]
+Description=Make the RGU watchdog reset on expiry instead of raising an interrupt
+Documentation=file:///usr/local/sbin/gemini-wdt-hardreset
+After=multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Late deliberately: mtk_wdt rewrites WDT_MODE when systemd sets the timeout at
+# open, so clearing the bits earlier would simply be undone.
+ExecStartPre=/bin/sleep 20
+ExecStart=/usr/local/sbin/gemini-wdt-hardreset
+
+[Install]
+WantedBy=multi-user.target

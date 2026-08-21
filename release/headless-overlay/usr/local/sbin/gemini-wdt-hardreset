@@ -1,0 +1,50 @@
+#!/bin/sh
+# gemini-wdt-hardreset — make the RGU watchdog actually RESET, not just interrupt.
+#
+# Measured 2026-08-20: a deliberate kernel panic (panic_timeout=0, so it hangs
+# forever) left the device dead for 490 s with the watchdog armed and systemd
+# petting it at 30 s. It never reset. The hands-free lab's entire recovery story
+# depended on that reset, and it does not happen.
+#
+# Cause, from WDT_MODE = 0x0000005D read live and the bit definitions in
+# drivers/watchdog/mtk_wdt.c:
+#
+#   bit0 EN         = 1   enabled
+#   bit2 EXRST_EN   = 1   drives the external reset pin
+#   bit3 IRQ_EN     = 1   <-- expiry raises an INTERRUPT instead of resetting
+#   bit4 AUTO_START = 1
+#   bit6 DUAL_EN    = 1   <-- two-stage: interrupt first, reset only after
+#
+# A panicked kernel has stopped servicing interrupts, so the interrupt stage
+# goes nowhere and the reset never arrives. An armed watchdog that interrupts a
+# dead kernel is decoration.
+#
+# Clearing IRQ_EN and DUAL_EN leaves expiry as a straight hardware reset, which
+# is the only kind that helps when the CPU is no longer running our code.
+#
+# Runs late, after systemd has opened /dev/watchdog and programmed its timeout,
+# because mtk_wdt rewrites WDT_MODE when the timeout is set and would otherwise
+# put the bits back.
+set -u
+REG=0x10007000
+KEY=0x22000000
+IRQ_EN=0x8
+DUAL_EN=0x40
+
+before=$(busybox devmem $REG)
+val=$(printf %d "$before")
+new=$(( (val & ~(IRQ_EN | DUAL_EN)) | KEY ))
+busybox devmem $REG 32 $(printf '0x%08X' $new)
+after=$(busybox devmem $REG)
+
+echo "gemini-wdt-hardreset: WDT_MODE $before -> $after"
+case "$after" in
+    *[13579bBdDfF]) ;;   # bit0 (EN) still set — good
+    *) echo "gemini-wdt-hardreset: WARNING watchdog is no longer enabled!" ;;
+esac
+aval=$(printf %d "$after")
+if [ $(( aval & (IRQ_EN | DUAL_EN) )) -eq 0 ]; then
+    echo "gemini-wdt-hardreset: IRQ/DUAL cleared — expiry is now a hardware reset."
+else
+    echo "gemini-wdt-hardreset: FAILED to clear IRQ/DUAL; a hang will NOT self-recover."
+fi

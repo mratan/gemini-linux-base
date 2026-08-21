@@ -1449,6 +1449,46 @@ driver to the MediaTek download-mode IDs so `/dev/ttyUSB*` appears at all —
 without it mtkclient can never see the device even in a state where it would
 otherwise work. That is worth keeping regardless.
 
+## 🔴 B-29 — the RGU watchdog INTERRUPTS instead of resetting: a hang never self-recovers
+
+**Opened 2026-08-20. This is the blocker for the whole hands-free lab**, and it
+was found by finally running the test rather than reasoning about it.
+
+**The experiment.** Device booted and healthy, watchdog armed
+(`WDT_MODE=0x0000005D`), systemd petting at 30 s, `panic_timeout=0` so a panic
+hangs forever rather than rebooting. Triggered a deliberate kernel panic via
+`sysrq-trigger`. Then watched for 490 s.
+
+**It never reset.** No re-enumeration, panel dark, nothing. The device needed a
+physical power cycle.
+
+**Cause.** Decoding `WDT_MODE=0x5D` against the bit definitions in
+`drivers/watchdog/mtk_wdt.c`:
+
+| bit | name | value | meaning |
+|---|---|---|---|
+| 0 | `WDT_MODE_EN` | 1 | enabled |
+| 2 | `WDT_MODE_EXRST_EN` | 1 | drives the external reset pin |
+| 3 | `WDT_MODE_IRQ_EN` | **1** | **expiry raises an INTERRUPT, not a reset** |
+| 4 | `WDT_MODE_AUTO_START` | 1 | |
+| 6 | `WDT_MODE_DUAL_EN` | **1** | **two-stage: interrupt first, reset only after** |
+
+A panicked kernel has stopped servicing interrupts, so the interrupt stage goes
+nowhere and the reset never arrives. **An armed watchdog that interrupts a dead
+kernel is decoration.** Every "leave the watchdog armed so a hang recovers"
+rule in this project has been resting on a mechanism that does not fire.
+
+**Fix (staged, untested):** `gemini-wdt-hardreset` clears `IRQ_EN|DUAL_EN`
+leaving expiry as a straight hardware reset. It must run LATE — mtk_wdt
+rewrites `WDT_MODE` when systemd sets the timeout at open, so clearing the bits
+earlier is simply undone.
+
+**Until this is verified on hardware, treat every unattended experiment as
+one-shot:** a hang costs a physical power cycle, so the payload in the
+software-selectable slot must be one that has already been observed reaching
+userspace. This also explains B-26's 8-minute non-reset and, most likely, why
+several "it booted but never came back" episodes today needed hands.
+
 ## 🔴 B-26 — a booted kernel with no userspace never resets: the watchdog pets itself
 
 **Opened 2026-08-20.** The hardware watchdog cannot rescue an unattended hang
