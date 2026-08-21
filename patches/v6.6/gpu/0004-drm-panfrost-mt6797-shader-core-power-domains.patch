@@ -1,0 +1,56 @@
+drm/panfrost: mt6797 attaches its four shader-core power domains
+
+gpu/0002 wired mediatek,mt6797-mali to default_data and said so
+explicitly: "The four Mali shader-core domains would need an
+mt8192-style multi-domain compatible ... deferred as a known UNPROVEN
+follow-up; single-MFG-domain attach is enough to probe."
+
+It was enough to probe and not enough to work. With only the MFG top
+domain attached, panfrost powers the L2 — L2_READY reads 0x1 — and then
+SHADER_PWRON never acks, because MFG_CORE0..3 are still gated at the SPM.
+Every resume logged "error powering up gpu shader" and "error powering up
+gpu tiler", and all rendering stayed on llvmpipe.
+
+Give mt6797 its own compatible data with the four core domains, the same
+shape mt8183/mt8186/mt8192 use. Needs the matching power-domains and
+power-domain-names in the DT (dts/0037) and the split-SRAM-ACK handling in
+pmdomain/0006; MFG and MFG_ASYNC come along as the cores' scpsys parents.
+
+Signed-off-by: mratan <mattdratan@gmail.com>
+
+--- a/drivers/gpu/drm/panfrost/panfrost_drv.c
++++ b/drivers/gpu/drm/panfrost/panfrost_drv.c
+@@ -692,6 +692,24 @@
+ 	.pm_domain_names = mediatek_mt8192_pm_domains,
+ };
+ 
++/*
++ * MT6797 (Gemini PDA): Mali-T880 MP4, so four shader-core power domains, one
++ * "mali" supply (the RT5735 buck on i2c7). Attaching only the MFG top domain
++ * — which is what the first mt6797 support did — powers the L2 and leaves all
++ * four cores gated at the SPM, so SHADER_PWRON never acks. Listing the core
++ * domains here and in the DT is what actually turns the GPU on; MFG and
++ * MFG_ASYNC follow as their scpsys parents.
++ */
++static const char * const mediatek_mt6797_supplies[] = { "mali", NULL };
++static const char * const mediatek_mt6797_pm_domains[] = { "core0", "core1",
++							   "core2", "core3" };
++static const struct panfrost_compatible mediatek_mt6797_data = {
++	.num_supplies = ARRAY_SIZE(mediatek_mt6797_supplies) - 1,
++	.supply_names = mediatek_mt6797_supplies,
++	.num_pm_domains = ARRAY_SIZE(mediatek_mt6797_pm_domains),
++	.pm_domain_names = mediatek_mt6797_pm_domains,
++};
++
+ static const struct of_device_id dt_match[] = {
+ 	/* Set first to probe before the generic compatibles */
+ 	{ .compatible = "amlogic,meson-gxm-mali",
+@@ -715,7 +733,7 @@
+ 	 * the generic arm,mali-t880 fallback so the SoC compatible wins.
+ 	 * gemini_linux tracker #7 (Track 2, UNPROVEN).
+ 	 */
+-	{ .compatible = "mediatek,mt6797-mali", .data = &default_data },
++	{ .compatible = "mediatek,mt6797-mali", .data = &mediatek_mt6797_data },
+ 	{ .compatible = "mediatek,mt8183-mali", .data = &mediatek_mt8183_data },
+ 	{ .compatible = "mediatek,mt8183b-mali", .data = &mediatek_mt8183_b_data },
+ 	{ .compatible = "mediatek,mt8186-mali", .data = &mediatek_mt8186_data },

@@ -1,0 +1,40 @@
+arm64: dts: mediatek: gemini: attach the GPU's four shader-core domains
+
+power-domains named only MT6797_POWER_DOMAIN_MFG, the GPU top. That
+powers the L2 and leaves all four shader cores gated at the SPM, so
+SHADER_PWRON never acks and panfrost logs "error powering up gpu shader"
+on every resume.
+
+List the core domains instead, with power-domain-names, which is what
+panfrost's multi-domain attach path consumes — the same shape mt8183 uses
+(it also lists only its core domains). MFG and MFG_ASYNC still come up:
+they are the cores' parents in the scpsys subdomain hierarchy.
+
+Pairs with gpu/0004 and pmdomain/0006.
+
+Signed-off-by: mratan <mattdratan@gmail.com>
+
+--- a/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
++++ b/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
+@@ -1924,7 +1924,20 @@
+ 		clocks = <&mfgcfg CLK_MFGCFG_BG3D>;
+ 		clock-names = "core";
+ 		mali-supply = <&vgpu>;
+-		power-domains = <&scpsys MT6797_POWER_DOMAIN_MFG>;
++		/*
++		 * The four shader-core domains, not the MFG top. Powering only
++		 * MFG (as this node did until 2026-08-21) brings up the L2 and
++		 * nothing else: the cores stay gated at the SPM, SHADER_PWRON
++		 * never acks, and panfrost logs "error powering up gpu shader"
++		 * on every resume. MFG and MFG_ASYNC come along anyway — they
++		 * are the cores' parents in the scpsys subdomain hierarchy.
++		 * Same shape as mt8183, which lists only its core domains.
++		 */
++		power-domains = <&scpsys MT6797_POWER_DOMAIN_MFG_CORE0>,
++				<&scpsys MT6797_POWER_DOMAIN_MFG_CORE1>,
++				<&scpsys MT6797_POWER_DOMAIN_MFG_CORE2>,
++				<&scpsys MT6797_POWER_DOMAIN_MFG_CORE3>;
++		power-domain-names = "core0", "core1", "core2", "core3";
+ 		operating-points-v2 = <&gpu_opp_table>;
+ 	};
+ };

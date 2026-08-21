@@ -1,0 +1,225 @@
+pmdomain: mediatek: mt6797: power the MFG shader-core domains (split SRAM ACK)
+
+The follow-up pmdomain/0003 and 0004 deferred: MFG_COREx has its SRAM PDN
+bit in one register and the matching ACK in another, which neither
+ext_sram_ctl_offs nor the generic single-register SRAM engine can
+express.
+
+  MFG        PDN and ACK both in MFG_SRAM_CON 0x33C   -> ext_sram_ctl_offs
+  MFG_COREn  PDN is bit 8 of MFG_COREn_PWR_CON,
+             ACK is bit 20+n of MFG_SRAM_CON          -> ext_sram_ack_offs
+
+(vendor clk-mt6797-pg.c, spm_mtcmos_ctrl_mfg_core0..3: "Set SRAM_PDN = 0"
+writes MFG_CORE0_PWR_CON, then "Wait until MFG_CORE0_SRAM_PDN_ACK = 0"
+polls MFG_SRAM_CON.)
+
+So split the one address the SRAM helpers took into two — where the PDN
+bit is written, and where its ACK is read — and add ext_sram_ack_offs for
+the second. Every existing domain passes the same address for both and is
+unaffected.
+
+Measured on hardware before this landed, with panfrost bound and
+runtime-resumed: PWR_STATUS 0x2B00305E (MFG and MFG_ASYNC on, cores bits
+8..11 off), MFG_COREn_PWR_CON all 0x112 — untouched at reset — and on the
+GPU side L2_READY 0x1, SHADER_READY 0x0, SHADER_PWRTRANS 0xF: all four
+cores stuck mid-transition because nothing had ungated them. That is what
+"error powering up gpu shader" was.
+
+Measured after, same conditions: PWR_STATUS 0x2B003F5E (bits 8..13 all
+set), MFG_SRAM_CON 0x000000FC (every SRAM ACK clear), SHADER_READY 0xF,
+TILER_READY 0x1, SHADER_PWRTRANS 0x0. The shader cores power up.
+
+Signed-off-by: mratan <mattdratan@gmail.com>
+
+--- a/drivers/pmdomain/mediatek/mtk-scpsys.c
++++ b/drivers/pmdomain/mediatek/mtk-scpsys.c
+@@ -121,6 +121,12 @@
+  *		SRAM PDN/ACK bits (e.g. mt6797 MFG_SRAM_CON 0x33C); when set,
+  *		sram_pdn_bits/sram_pdn_ack_bits apply to this register instead
+  *		of the domain's own control register.
++ * @ext_sram_ack_offs: Optional separate SPM register holding ONLY the
++ *		domain's SRAM PDN ACK bits, while the PDN bit itself stays in
++ *		the domain's own control register (e.g. mt6797 MFG_CORE0..3,
++ *		whose PDN is bit 8 of MFG_COREn_PWR_CON but whose ACK is bit
++ *		20+n of MFG_SRAM_CON). Takes precedence over ext_sram_ctl_offs
++ *		for the poll.
+  * @sram_pdn_ack_bits: The mask for sram power control acked bits.
+  * @bus_prot_mask: The mask for single step bus protection.
+  * @clk_id: The basic clocks required by this power domain.
+@@ -133,6 +139,7 @@
+ 	u32 sram_pdn_bits;
+ 	u32 sram_pdn_ack_bits;
+ 	u32 ext_sram_ctl_offs;
++	u32 ext_sram_ack_offs;
+ 	u32 bus_prot_mask;
+ 	enum clk_id clk_id[MAX_CLKS];
+ 	u8 caps;
+@@ -238,7 +245,8 @@
+ 	return ret;
+ }
+ 
+-static int scpsys_sram_enable(struct scp_domain *scpd, void __iomem *ctl_addr)
++static int scpsys_sram_enable(struct scp_domain *scpd, void __iomem *ctl_addr,
++			      void __iomem *ack_addr)
+ {
+ 	u32 val;
+ 	u32 pdn_ack = scpd->data->sram_pdn_ack_bits;
+@@ -258,7 +266,7 @@
+ 		usleep_range(12000, 12100);
+ 	} else {
+ 		/* Either wait until SRAM_PDN_ACK all 1 or 0 */
+-		int ret = readl_poll_timeout(ctl_addr, tmp,
++		int ret = readl_poll_timeout(ack_addr, tmp,
+ 				(tmp & pdn_ack) == 0,
+ 				MTK_POLL_DELAY_US, MTK_POLL_TIMEOUT);
+ 		if (ret < 0)
+@@ -268,7 +276,8 @@
+ 	return 0;
+ }
+ 
+-static int scpsys_sram_disable(struct scp_domain *scpd, void __iomem *ctl_addr)
++static int scpsys_sram_disable(struct scp_domain *scpd, void __iomem *ctl_addr,
++			       void __iomem *ack_addr)
+ {
+ 	u32 val;
+ 	u32 pdn_ack = scpd->data->sram_pdn_ack_bits;
+@@ -279,11 +288,40 @@
+ 	writel(val, ctl_addr);
+ 
+ 	/* Either wait until SRAM_PDN_ACK all 1 or 0 */
+-	return readl_poll_timeout(ctl_addr, tmp,
++	return readl_poll_timeout(ack_addr, tmp,
+ 			(tmp & pdn_ack) == pdn_ack,
+ 			MTK_POLL_DELAY_US, MTK_POLL_TIMEOUT);
+ }
+ 
++/*
++ * Where the SRAM PDN bit is WRITTEN, and where its ACK is READ. Normally both
++ * are the domain's own control register. mt6797's MFG domains are two
++ * different exceptions:
++ *
++ *   MFG        PDN and ACK both live in MFG_SRAM_CON 0x33C -> ext_sram_ctl_offs
++ *   MFG_COREn  PDN is bit 8 of MFG_COREn_PWR_CON, but the ACK is bit 20+n of
++ *              MFG_SRAM_CON                                -> ext_sram_ack_offs
++ *
++ * (vendor clk-mt6797-pg.c, spm_mtcmos_ctrl_mfg and spm_mtcmos_ctrl_mfg_core0..3)
++ */
++static void __iomem *scpsys_sram_pdn_addr(struct scp *scp,
++					  struct scp_domain *scpd,
++					  void __iomem *ctl_addr)
++{
++	if (scpd->data->ext_sram_ctl_offs)
++		return scp->base + scpd->data->ext_sram_ctl_offs;
++	return ctl_addr;
++}
++
++static void __iomem *scpsys_sram_ack_addr(struct scp *scp,
++					  struct scp_domain *scpd,
++					  void __iomem *ctl_addr)
++{
++	if (scpd->data->ext_sram_ack_offs)
++		return scp->base + scpd->data->ext_sram_ack_offs;
++	return scpsys_sram_pdn_addr(scp, scpd, ctl_addr);
++}
++
+ static int scpsys_bus_protect_enable(struct scp_domain *scpd)
+ {
+ 	struct scp *scp = scpd->scp;
+@@ -346,9 +384,9 @@
+ 	val |= PWR_RST_B_BIT;
+ 	writel(val, ctl_addr);
+ 
+-	ret = scpsys_sram_enable(scpd, scpd->data->ext_sram_ctl_offs ?
+-				 scp->base + scpd->data->ext_sram_ctl_offs :
+-				 ctl_addr);
++	ret = scpsys_sram_enable(scpd,
++				 scpsys_sram_pdn_addr(scp, scpd, ctl_addr),
++				 scpsys_sram_ack_addr(scp, scpd, ctl_addr));
+ 	if (ret < 0)
+ 		goto err_pwr_ack;
+ 
+@@ -380,9 +418,9 @@
+ 	if (ret < 0)
+ 		goto out;
+ 
+-	ret = scpsys_sram_disable(scpd, scpd->data->ext_sram_ctl_offs ?
+-				  scp->base + scpd->data->ext_sram_ctl_offs :
+-				  ctl_addr);
++	ret = scpsys_sram_disable(scpd,
++				  scpsys_sram_pdn_addr(scp, scpd, ctl_addr),
++				  scpsys_sram_ack_addr(scp, scpd, ctl_addr));
+ 	if (ret < 0)
+ 		goto out;
+ 
+@@ -906,40 +944,59 @@
+ 		.clk_id = {CLK_MFG52M},
+ 		.caps = MTK_SCPD_KEEP_DEFAULT_OFF,
+ 	},
++	/*
++	 * The four shader-core domains. Their SRAM controls are SPLIT, which
++	 * is why pmdomain/0004's ext_sram_ctl_offs was not enough for them:
++	 * the PDN bit is bit 8 of the core's OWN MFG_COREn_PWR_CON, but its
++	 * ACK is bit 20+n of the shared MFG_SRAM_CON (vendor
++	 * clk-mt6797-pg.c spm_mtcmos_ctrl_mfg_core0..3). ext_sram_ack_offs
++	 * expresses exactly that, and nothing else needs it.
++	 *
++	 * Measured before this landed (2026-08-21, panfrost bound and
++	 * runtime-resumed): PWR_STATUS 0x2B00305E — MFG and MFG_ASYNC on,
++	 * cores bits 8..11 off; MFG_COREn_PWR_CON all 0x112, i.e. untouched
++	 * at reset; and on the GPU side L2_READY 0x1, SHADER_READY 0x0,
++	 * SHADER_PWRTRANS 0xF — all four cores stuck mid-transition because
++	 * nothing had ungated them. That is "error powering up gpu shader".
++	 */
+ 	[MT6797_POWER_DOMAIN_MFG_CORE0] = {
+ 		.name = "mfg_core0",
+ 		.sta_mask = BIT(11),
+ 		.ctl_offs = 0x340,
+-		.sram_pdn_bits = 0,
+-		.sram_pdn_ack_bits = 0,
+-		.clk_id = {CLK_NONE},
++		.sram_pdn_bits = BIT(8),
++		.sram_pdn_ack_bits = BIT(20),
++		.ext_sram_ack_offs = 0x33C,
++		.clk_id = {CLK_MFG52M},
+ 		.caps = MTK_SCPD_KEEP_DEFAULT_OFF,
+ 	},
+ 	[MT6797_POWER_DOMAIN_MFG_CORE1] = {
+ 		.name = "mfg_core1",
+ 		.sta_mask = BIT(10),
+ 		.ctl_offs = 0x344,
+-		.sram_pdn_bits = 0,
+-		.sram_pdn_ack_bits = 0,
+-		.clk_id = {CLK_NONE},
++		.sram_pdn_bits = BIT(8),
++		.sram_pdn_ack_bits = BIT(21),
++		.ext_sram_ack_offs = 0x33C,
++		.clk_id = {CLK_MFG52M},
+ 		.caps = MTK_SCPD_KEEP_DEFAULT_OFF,
+ 	},
+ 	[MT6797_POWER_DOMAIN_MFG_CORE2] = {
+ 		.name = "mfg_core2",
+ 		.sta_mask = BIT(9),
+ 		.ctl_offs = 0x348,
+-		.sram_pdn_bits = 0,
+-		.sram_pdn_ack_bits = 0,
+-		.clk_id = {CLK_NONE},
++		.sram_pdn_bits = BIT(8),
++		.sram_pdn_ack_bits = BIT(22),
++		.ext_sram_ack_offs = 0x33C,
++		.clk_id = {CLK_MFG52M},
+ 		.caps = MTK_SCPD_KEEP_DEFAULT_OFF,
+ 	},
+ 	[MT6797_POWER_DOMAIN_MFG_CORE3] = {
+ 		.name = "mfg_core3",
+ 		.sta_mask = BIT(8),
+ 		.ctl_offs = 0x34c,
+-		.sram_pdn_bits = 0,
+-		.sram_pdn_ack_bits = 0,
+-		.clk_id = {CLK_NONE},
++		.sram_pdn_bits = BIT(8),
++		.sram_pdn_ack_bits = BIT(23),
++		.ext_sram_ack_offs = 0x33C,
++		.clk_id = {CLK_MFG52M},
+ 		.caps = MTK_SCPD_KEEP_DEFAULT_OFF,
+ 	},
+ 	[MT6797_POWER_DOMAIN_MJC] = {
