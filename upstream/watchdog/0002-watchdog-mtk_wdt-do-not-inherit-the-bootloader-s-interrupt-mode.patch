@@ -1,0 +1,95 @@
+From: mratan <mattdratan@gmail.com>
+Subject: [PATCH 2/3] watchdog: mtk_wdt: do not inherit the bootloader's interrupt mode
+
+When the bootloader leaves the watchdog running, mtk_wdt_init() adopts it:
+it sets WDOG_HW_RUNNING and reprograms the timeout, but leaves WDT_MODE
+exactly as the bootloader wrote it. Bootloaders arm it with
+IRQ_EN | DUAL_EN, so expiry raises an interrupt first and only resets
+afterwards.
+
+A hung kernel services no interrupts, so the first stage goes nowhere and
+the reset never arrives — precisely in the situation the watchdog exists
+for. Measured on an MT6797 board: a deliberate panic, with the watchdog
+armed and being petted right up to the panic, left the machine dead for
+490 s before it was power-cycled by hand. An armed watchdog that interrupts
+a dead kernel is decoration.
+
+This cannot be corrected later in the lifecycle. Because WDOG_HW_RUNNING is
+set, the watchdog core never calls ->start, so mtk_wdt_start()'s own
+clearing of these bits never runs — not even when userspace opens
+/dev/watchdog. And a userspace fix would do nothing for the case that
+matters most, a boot that never reaches userspace at all.
+
+So clear IRQ_EN and DUAL_EN during adoption, while probe is the only thing
+running. From there expiry is a straight hardware reset; a caller that
+genuinely wants a pretimeout interrupt sets the bits back through
+mtk_wdt_set_pretimeout().
+
+Apply the DT mode preferences on this path too. mtk_wdt_start() honours
+disable_wdt_extrst and reset_by_toprgu already, but it is never called for
+an inherited watchdog, so a board that asks for internal reset in its device
+tree was silently not getting it.
+
+Verified on an MT6797 board: with the mode corrected at probe, a deliberate
+panic with panic_timeout=0 self-recovered in 2 min 33 s with no human
+action, and the fresh boot's dmesg shows the driver finding the
+bootloader's value again — which is also the proof that a real reset
+occurred rather than a warm continuation.
+
+Signed-off-by: mratan <mattdratan@gmail.com>
+---
+--- a/drivers/watchdog/mtk_wdt.c
++++ b/drivers/watchdog/mtk_wdt.c
+@@ -243,8 +243,52 @@
+ 	wdt_base = mtk_wdt->wdt_base;
+ 
+ 	if (readl(wdt_base + WDT_MODE) & WDT_MODE_EN) {
++		u32 reg, fixed;
++
+ 		set_bit(WDOG_HW_RUNNING, &wdt_dev->status);
+ 		mtk_wdt_set_timeout(wdt_dev, wdt_dev->timeout);
++
++		/*
++		 * Adopting a watchdog the bootloader left running also adopts
++		 * the bootloader's WDT_MODE, and bootloaders arm it with
++		 * IRQ_EN | DUAL_EN: expiry raises an interrupt first and only
++		 * resets afterwards.
++		 *
++		 * A hung kernel services no interrupts, so that first stage
++		 * goes nowhere and the reset never arrives — precisely when the
++		 * watchdog was the last line of defence. Measured on an MT6797
++		 * board: a deliberate panic with the watchdog armed and being
++		 * petted left the machine dead for 490 s.
++		 *
++		 * It cannot be corrected later. WDOG_HW_RUNNING is set here, so
++		 * the watchdog core never calls ->start and mtk_wdt_start()'s
++		 * own clearing of these bits never runs, not even when
++		 * userspace opens /dev/watchdog. And a userspace fix does
++		 * nothing for the case that matters most: a boot that never
++		 * reaches userspace.
++		 *
++		 * So clear them at probe. From here, expiry is a straight
++		 * hardware reset; a caller that wants a pretimeout interrupt
++		 * sets the bits back through mtk_wdt_set_pretimeout().
++		 *
++		 * Apply the DT mode preferences here too. mtk_wdt_start()
++		 * honours them already, but it is never called for a watchdog
++		 * inherited from the bootloader.
++		 */
++		reg = readl(wdt_base + WDT_MODE);
++		fixed = reg & ~(WDT_MODE_IRQ_EN | WDT_MODE_DUAL_EN);
++
++		if (mtk_wdt->disable_wdt_extrst)
++			fixed &= ~WDT_MODE_EXRST_EN;
++		if (mtk_wdt->reset_by_toprgu)
++			fixed |= WDT_MODE_CNT_SEL;
++
++		if (fixed != reg) {
++			iowrite32(fixed | WDT_MODE_KEY, wdt_base + WDT_MODE);
++			dev_info(wdt_dev->parent,
++				 "WDT_MODE %#010x -> %#010x (reset is now internal and immediate)\n",
++				 reg, fixed);
++		}
+ 	}
+ }
+ 

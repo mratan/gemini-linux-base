@@ -1,0 +1,62 @@
+From: mratan <mattdratan@gmail.com>
+Subject: [PATCH 3/3] watchdog: mtk_wdt: program WDT_MODE in the restart handler
+
+mtk_wdt_restart() issues WDT_SWRST with whatever mode the shutdown path
+happened to leave behind. Two things make that unreliable.
+
+probe() calls watchdog_stop_on_reboot(), so by the time the restart handler
+runs the reboot notifier has already called mtk_wdt_stop() and cleared
+WDT_MODE_EN — and WDT_SWRST does nothing at all with the block disabled.
+
+WDT_MODE_EXRST_EN routes the reset to an external pin rather than resetting
+the SoC internally. On boards where that pin reaches the PMIC, the PMIC
+powers the machine off instead of restarting it.
+
+Since watchdog_set_restart_priority() makes this the platform's system
+restart handler, between them `reboot` was indistinguishable from a dead
+machine on an MT6797 board: no USB, no network, a dark panel, not even a
+bootloader splash, and only the power button brought it back. With the
+block enabled and EXRST_EN cleared, the same WDT_SWRST restarted the SoC
+and the system was back on the network in 77 s.
+
+Program the mode immediately before requesting the reset, so the handler
+does not depend on state it does not control.
+
+Signed-off-by: mratan <mattdratan@gmail.com>
+---
+--- a/drivers/watchdog/mtk_wdt.c
++++ b/drivers/watchdog/mtk_wdt.c
+@@ -186,9 +186,33 @@
+ {
+ 	struct mtk_wdt_dev *mtk_wdt = watchdog_get_drvdata(wdt_dev);
+ 	void __iomem *wdt_base;
++	u32 reg;
+ 
+ 	wdt_base = mtk_wdt->wdt_base;
+ 
++	/*
++	 * Program the mode we need immediately before asking for the reset,
++	 * rather than depending on whatever state the shutdown path left.
++	 *
++	 * Two things otherwise conspire against this handler. probe() calls
++	 * watchdog_stop_on_reboot(), so the reboot notifier has already run
++	 * mtk_wdt_stop() and cleared WDT_MODE_EN — and WDT_SWRST does nothing
++	 * with the block disabled. And WDT_MODE_EXRST_EN routes the reset to an
++	 * external pin, which on some boards reaches the PMIC and powers the
++	 * machine OFF instead of restarting it.
++	 *
++	 * Since watchdog_set_restart_priority() makes this the platform's
++	 * system restart handler, between them `reboot` was indistinguishable
++	 * from a dead machine on an MT6797 board: no USB, no network, a dark
++	 * panel and not even a bootloader splash, recoverable only with the
++	 * power button. With the block enabled and EXRST_EN cleared the same
++	 * WDT_SWRST restarted the SoC and it was back on the network in 77 s.
++	 */
++	reg = readl(wdt_base + WDT_MODE);
++	reg &= ~(WDT_MODE_IRQ_EN | WDT_MODE_DUAL_EN | WDT_MODE_EXRST_EN);
++	reg |= WDT_MODE_EN | WDT_MODE_KEY;
++	writel(reg, wdt_base + WDT_MODE);
++
+ 	while (1) {
+ 		writel(WDT_SWRST_KEY, wdt_base + WDT_SWRST);
+ 		mdelay(5);
