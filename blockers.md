@@ -1957,6 +1957,68 @@ required booting boot1 Android and restoring `boot-gpustack4.img`
 other known-good.** Android on boot1 remains the deep fallback and was
 untouched throughout.
 
+## 🟡 B-40 — the two Cortex-A72 cores never come up, and there is no cpufreq at all
+
+**Opened 2026-08-21.** MT6797 is a **tri-cluster** Helio X20 and we are using
+two thirds of it, at an unknown fixed clock.
+
+**Measured on the device:**
+
+```
+possible: 0-9   present: 0-9   offline: 8-9
+all 8 online cores report CPU part 0xd03  (Cortex-A53)
+/sys/devices/system/cpu/cpu0/cpufreq       does not exist
+/sys/devices/system/cpu/cpufreq/           does not exist
+dmesg: "smp: Brought up 1 node, 8 CPUs"    -- no failure message for cpu8/9
+```
+
+`echo 1 > /sys/devices/system/cpu/cpu8/online` **hangs the SoC** -- the write
+never returns and the watchdog reclaims the machine. That is the signature of
+PSCI `CPU_ON` blocking on a core that has no power, not of a rejected call.
+
+**What the hardware actually is, from the vendor 3.18 DT
+(`arch/arm64/boot/dts/mt6797.dts`) and `mt_cpufreq.c`:**
+
+| cluster | cores | vendor `clock-frequency` | vendor OPP range |
+|---|---|---|---|
+| 0 (LL) | 4 x Cortex-A53 | 1391 MHz | 1391 down to 221 MHz, 16 steps |
+| 1 (L) | 4 x Cortex-A53 | 1950 MHz | 1846 MHz top (FY bin) |
+| 2 (B) | **2 x Cortex-A72** | 2288 MHz | **2145 MHz** top (FY1221 bin) |
+
+Our DT declares all ten with `enable-method = "psci"`, exactly as the vendor
+does, so the missing cores are not a DT-description problem.
+
+**Two separate gaps, and they should not be conflated:**
+
+1. **The A72 cluster (MP2) is not powered.** The vendor's own
+   `mt-smp.c`/`hotplug.c` drive per-core MTCMOS through
+   `spm_mtcmos_ctrl_cpu1..cpu7` -- i.e. Linux powers the two A53 clusters'
+   cores itself -- and there is no `spm_mtcmos_ctrl_cpusys2` anywhere in
+   `base/power/mt6797/`. So cluster 2's power sequence lives somewhere we have
+   not found yet (firmware/ATF, or `mt-plat`). Until it is found, plain PSCI
+   `CPU_ON` has nothing to talk to and hangs.
+2. **There is no cpufreq, for a mundane and fixable reason.**
+   `CONFIG_ARM_MEDIATEK_CPUFREQ=y` is already set and the driver is present; it
+   has nothing to bind to because our CPU nodes carry no
+   `operating-points-v2`, no `proc-supply`, no `sram-supply` and no `clocks`.
+   The full OPP and voltage tables exist in the vendor `mt_cpufreq.c` and are
+   straightforwardly transcribable. This is a port, not a mystery.
+
+**What is NOT known and should be measured before either is attempted:** the
+frequency the A53s are actually running at right now. There is no cpufreq to
+ask, and the mt6797 clk driver does not model ARMPLL, so `clk_summary` has no
+CPU entry. Empirically one core does 173 Miter/s on a fixed integer loop
+against 209 on a Raspberry Pi 4 (Cortex-A72 @1.8 GHz), consistent with roughly
+1.2-1.4 GHz but not pinning it. **If LK has left the clusters at a low OPP,
+DVFS is worth more than the A72s.**
+
+**The instrument nobody has used: boot1.** The device carries stock rooted
+Android on p22, which is software-selectable, and it drives all three clusters
+with the vendor stack every day. Reading `/sys/devices/system/cpu/{present,online}`
+and the `cpufreq` tree there answers "is this a hardware limit or are we simply
+not driving the hardware" in about a minute, for both gaps at once. That is the
+next step, and it is the owner's own suggestion.
+
 ## 🔴 B-39 — TWO independent ways to hard-wedge the SoC, both silent
 
 **Opened 2026-08-21, and rewritten twice the same day as the evidence changed.
