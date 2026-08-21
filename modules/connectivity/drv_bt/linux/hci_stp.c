@@ -1034,13 +1034,14 @@ void stp_tx_event_cb(void)
 /*
   Direct delivery of bluez not changed hands through the stp buffer
 */
-/* churn/quirk: this controller's Read Local Supported Commands bitmap
- * advertises post-BT4.1 commands it cannot actually execute (e.g. LE Read
- * Buffer Size v2, 0x202f, failed -56 right after the event-mask fix), so
- * the 6.6 core keeps aborting LE init on the next bogus command. Clear
- * bitmap octets >= 35 (the 4.2+ command range) in the Command Complete
- * response so the core simply never issues them. Single choke point for
- * all rx delivery.
+/* churn/quirk: this controller's Read Local Supported Commands bitmap is
+ * wrong in both directions. It advertises post-BT4.1 commands it cannot
+ * execute (e.g. LE Read Buffer Size v2, 0x202f, failed -56 right after the
+ * event-mask fix), so the 6.6 core keeps aborting LE init on the next bogus
+ * command; and it hides the entire BT 4.0 LE command range that it does
+ * implement, which silently disables the LE event mask bits the core
+ * derives from it. Correct both here — a single choke point for all rx
+ * delivery.
  */
 static inline void hci_stp_recv(struct hci_dev *hd, struct sk_buff *skb)
 {
@@ -1053,6 +1054,28 @@ static inline void hci_stp_recv(struct hci_dev *hd, struct sk_buff *skb)
         /* ...and Get MWS Transport Layer Configuration (octet 30 bit 3,
          * 4.0-CSA3-era) is advertised but fails too (0x140c, -107). */
         d[6 + 30] &= ~0x08;
+        /* The bitmap lies in the other direction too, and that one is
+         * fatal. Octets 25..28 — the whole BT 4.0 LE command range,
+         * 0x2001 LE Set Event Mask through 0x201f LE Test End — read back
+         * as 0x00 0x00 0x00 0x00 on this controller, yet every command in
+         * that range executes and returns Success (measured 2026-08-21 by
+         * issuing all of them over an HCI raw socket).
+         *
+         * hci_le_set_event_mask_sync() gates each LE event bit on the
+         * corresponding command bit, so with these octets zero the core
+         * programs an LE event mask with LE Advertising Report (and
+         * Connection Complete, and Connection Update Complete, and Read
+         * Remote Features Complete) switched OFF at the controller. The
+         * symptom is a scan that enables cleanly and never reports a
+         * single device, with no asynchronous event of any kind arriving —
+         * which reads like a dead RX path or a dead radio and is neither.
+         *
+         * Assert what the hardware actually does.
+         */
+        d[6 + 25] = 0xff;
+        d[6 + 26] = 0xff;
+        d[6 + 27] = 0xff;
+        d[6 + 28] = 0xff;
     }
 
     /* Same disease, third source: the LE features response claims
