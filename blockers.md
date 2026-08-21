@@ -1957,31 +1957,74 @@ required booting boot1 Android and restoring `boot-gpustack4.img`
 other known-good.** Android on boot1 remains the deep fallback and was
 untouched throughout.
 
-## 🔴 B-39 — a real client under sway hard-wedges the SoC; the display has no IOMMU
+## 🔴 B-39 — sustained full-screen updates on the USB display wedge the SoC
 
-**Opened 2026-08-21.** With `gemini-dock` running and both outputs live, opening
-an actual application window kills the machine outright. Reproduced **four
-times**: `wl-mirror DSI-1` twice, `qterminal` twice — once with the window on
-the external monitor and once on the internal panel, so it is **not** an
-external-display bug. Each time the machine goes away instantly, SSH resets
-mid-command, and the hardware watchdog reclaims it ~90 s later. It recovered
-unattended every time.
+**Opened 2026-08-21. Substantially CORRECTED the same day — read this, not the
+first version, which is retracted below.**
 
-**There is no evidence, and that is itself the finding.** `/sys/fs/pstore` is
-empty afterwards (B-35 again), and netconsole — armed and listening — captured
-**nothing at the moment of death**. The last line it ever gets is:
+The machine hard-wedges: it goes away instantly, SSH resets mid-command,
+`/sys/fs/pstore` is empty afterwards, and netconsole — armed and listening on
+every occasion — captures **nothing at the moment of death**. The hardware
+watchdog reclaimed it unattended every single time (roughly eight times over
+this session).
 
-```
-[  162.750881] [drm:mtk_gem_prime_import_sg_table] *ERROR* sg_table is not contiguous
-```
+### What was retracted
 
-**Do not read that as the cause.** The same error appears in runs that survive
-(twice in a session that then ran normally for minutes), so it is a necessary
-part of the picture and not a sufficient one. What it does establish is the
-structural problem underneath.
+The first version of this entry said the trigger was "a real client surface
+under sway", and pointed at the missing IOMMU via
+`mtk_gem_prime_import_sg_table: sg_table is not contiguous` as the structural
+cause. **That attribution was wrong.** It was drawn from the sway cases alone,
+before the isolating experiment was run. The IOMMU facts below are still true
+and still matter for the GPU-to-display path — they are just not what is
+wedging the machine.
 
-**The structural problem: mediatek-drm can only scan out physically contiguous
-memory, and panfrost does not allocate any.**
+### The isolating experiment
+
+With `Xorg` running **only on the udl device** (`Option "kmsdev"
+"/dev/dri/card2"`), and therefore **no compositor, no window manager, no
+panfrost, and no cross-device buffer sharing of any kind**:
+
+| on the udl X screen | result |
+|---|---|
+| `xclock` | fine, survives |
+| `qterminal` (screenshotted, a real window) | fine, survives |
+| a full LXQt session | **wedges**, twice |
+| **30 × `xsetroot -solid`** — nothing but full-screen 1920x1080 fills | **wedges** |
+
+The last row is the one that matters. `xsetroot` is a two-line X client; there
+is nothing in that test but the X server repainting 1920x1080 and `udl` pushing
+it over USB. That removes sway, Wayland, LXQt, panfrost and the IOMMU from the
+list of required conditions.
+
+**So: large or sustained updates to the USB display are sufficient to wedge the
+SoC. Small, incremental ones are not.** That is why a clock and a terminal
+window are fine and a desktop is not.
+
+### What is NOT established
+
+Whether an active udl output is *necessary*. Every wedge observed today had the
+adapter bound and an output live, and the one sway session run before the
+adapter was on the bus survived — but that session had no clients, so it proves
+little. A control run with `udl` removed died with no output at all, and it
+cannot be told apart from `rmmod udl` itself wedging the machine. **Do not
+record this as "udl-only" until someone runs that control properly.**
+
+### Where this most likely belongs
+
+This looks like ADR-0004's own gate failing, not a DRM bug. The ADR made
+"sustained, robust USB 2.0 **high-speed bulk**" the precondition for any USB
+display, and named the two known gaps: the right-port MUSB host is **PIO-only
+with single-buffered 512 B FIFOs**, measured at ~43-64 Mbit/s TCP, and **a
+misbehaving device wedges the host until reboot** (issue #27, B-22 follow-up).
+A 1920x1080x32 frame is ~66 Mbit. A full-screen repaint is therefore about a
+second of saturated bulk-OUT on a host with no DMA — precisely the workload the
+ADR said had to be proven and precisely the failure it predicted. **#27 is
+closed; on this evidence it was closed against a lighter workload than a display
+imposes, and should be reopened rather than assumed.**
+
+### The IOMMU finding, which stands on its own
+
+Still true, still worth fixing, and no longer claimed as the cause of the wedge:
 
 ```c
 /* mtk_drm_gem.c, mtk_gem_prime_import_sg_table() */
@@ -1991,33 +2034,25 @@ if (drm_prime_get_contiguous_size(sg) < attach->dmabuf->size) {
 }
 ```
 
-That check exists because the display engine here has no IOMMU to map a
-scattered buffer through. Verified device-free:
-
 - `mt6797.dtsi` has **no `m4u` node and zero `iommus` properties**. The SMI
-  larb0/smi_common nodes are there and the display components reference
-  `mediatek,larb`, but a larb is the bandwidth arbiter, not the translator.
-- `CONFIG_MTK_IOMMU=y` is set and does nothing here, because **mainline
-  `drivers/iommu/mtk_iommu.c` has no mt6797 support at all** — no compatible
-  entry, and no `dt-bindings/memory/mt6797-*.h` port definitions. The vendor
-  3.18 tree does have an m4u node (`arch/arm64/boot/dts/mt6797.dts`).
+  larb0/smi_common nodes exist and the display components reference
+  `mediatek,larb`, but a larb is the bandwidth arbiter, not a translator.
+- `CONFIG_MTK_IOMMU=y` does nothing here: **mainline `drivers/iommu/mtk_iommu.c`
+  has no mt6797 support at all** — no compatible entry, no
+  `dt-bindings/memory/mt6797-*.h`. The vendor 3.18 tree does have the node.
 
-So every pixel the Mali renders and the panel displays goes through a CPU copy
-today (wlroots' multi-GPU path), and any attempt to hand a panfrost-rendered
-buffer directly to the display fails that check. Adding mt6797 to `mtk_iommu`
-and wiring the display's `iommus` is the piece of work this points at, and it
-is much bigger than a config toggle.
+Consequence: every pixel the Mali renders reaches the panel through a CPU copy,
+and a panfrost buffer can never be handed straight to the display. That is a
+real ceiling on Track 2, independent of this blocker.
 
-**The discriminating observation, unexplained: `glxgears` does not wedge it.**
-Under the same compositor, with both outputs up and the window focused onto the
-external monitor, `glxgears -info` ran for 22 s and reported 34-40 FPS. Whatever
-separates it from `qterminal` and `wl-mirror` is the thread to pull, and
-guessing at it here would be exactly the mistake this file exists to prevent.
+### Practical consequence
 
-**Practical consequence.** `gemini-dock` brings up a GPU-composited desktop with
-the external monitor live and X clients reporting `Mali-T880 (Panfrost)` — and
-you cannot yet open a window in it. Do not offer it as a usable desktop until
-this is understood.
+A docked desktop **on plain X, on the udl device alone, works** — 1920x1080@60,
+`VGA-1 connected primary`, real windows, screenshotted. What it will not
+currently survive is a full desktop session repainting the whole screen. Until
+the USB host side is understood, treat the external display as usable for
+low-update work and expect a watchdog reset from anything that repaints
+1920x1080 repeatedly.
 
 ## 🟡 B-38 — X11 structurally cannot use this GPU; Wayland can, and does
 
