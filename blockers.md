@@ -1957,6 +1957,53 @@ required booting boot1 Android and restoring `boot-gpustack4.img`
 other known-good.** Android on boot1 remains the deep fallback and was
 untouched throughout.
 
+## 🔴 B-42 — the device cannot charge faster than 500 mA, which is less than it uses
+
+**Opened 2026-08-21, after the battery went flat and the machine would not
+boot.** This is why, and it is not "the battery is old".
+
+`bq25890-charger-0` reports `POWER_SUPPLY_INPUT_CURRENT_LIMIT=500000` **on every
+supply**, including a proper wall charger. 500 mA is a USB SDP default: nothing
+is doing charger-type detection, so the driver never asks for more. A running
+desktop on eight A53s with the backlight at 200/255 draws more than that. **The
+machine therefore discharges while plugged in**, which is exactly what happened
+across a day of hard resets and GPU load.
+
+**Measured, and the fix is one sysfs write** (`input_current_limit` is
+writable):
+
+| input limit | cell voltage |
+|---|---|
+| 500 mA (as found) | **3.204 V** — near cutoff |
+| 1.0 A, +20 s | 3.384 V |
+| 1.0 A, +45 s | 3.404 V |
+| 1.5 A, +70 s | 3.424 V |
+| 1.5 A, +95 s | **3.444 V** |
+
+240 mV in a minute and a half, against a supply that had been "charging" for
+much longer at 500 mA and losing ground. The charger was always able to deliver
+it; the kernel simply never asked.
+
+**Why the naive fix is wrong.** Writing 1.5 A unconditionally at boot would be
+actively harmful on the lab hub, whose port is a 500 mA source — the owner
+plugged the device into USB with a nearly flat battery and it **browned out
+instantly**. The limit has to follow what is actually connected. The bq25890
+has the hardware for this (D+/D- input-source detection, plus VINDPM and the
+input current optimiser, which back off automatically when VBUS sags); none of
+it is wired up in our DT/driver path.
+
+**So there are two fixes and they are not the same:**
+
+1. **Short term, userspace:** something that raises the limit when the cell is
+   low and backs off if the rail sags. Must not be a fixed 1.5 A.
+2. **Right answer, kernel:** wire up charger-type detection so the driver asks
+   for what the supply can give. This is the fix; it needs DT/driver work.
+
+**Related, and the reason this was invisible:** there is no fuel gauge at all —
+`/sys/class/power_supply/bq25890-charger-0/capacity` is empty, so nothing ever
+reports a percentage. The only battery reading available is `voltage_now`, and
+nobody was watching it. **Treat 3.3 V as the point to stop working and charge.**
+
 ## 🟡 B-41 — touch is rotated twice: the DT rotates it AND X rotates it again
 
 **Opened 2026-08-21**, reported by the owner as "touch is not in the right place
