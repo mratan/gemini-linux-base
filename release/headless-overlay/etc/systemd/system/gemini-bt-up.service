@@ -1,0 +1,19 @@
+[Unit]
+Description=Register hci0 on the shared CONSYS MCU once the WMT chain is up
+Documentation=file:///usr/local/sbin/gemini-bt-up
+# Strictly after Wi-Fi: BT and Wi-Fi are one MCU, and gemini-net-up is the only
+# thing allowed to power CONSYS on. After= without Requires= on purpose — if
+# Wi-Fi stands down, this stands down too, and says so, rather than failing.
+After=multi-user.target gemini-net-up.service
+Wants=gemini-net-up.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# gemini-net-up waits for a 120 s settle floor and can spend another ~90 s
+# associating; this has to outlast it.
+TimeoutStartSec=600
+ExecStart=/usr/local/sbin/gemini-bt-up
+
+[Install]
+WantedBy=multi-user.target

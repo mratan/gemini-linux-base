@@ -1,0 +1,114 @@
+#!/bin/sh
+# gemini-bt-up — register hci0 on a clean boot, so Bluetooth is a property of
+# the machine rather than of someone remembering to run a script.
+#
+# WHAT THIS IS NOT
+#
+# It is not a CONSYS bring-up. Bluetooth and Wi-Fi share one MCU: the WMT core,
+# BTIF and wmt_launcher are brought up exactly once, by gemini-net-up, and this
+# script refuses to run if that has not happened. Powering CONSYS on from two
+# places is how you get a half-initialised WMT core, and mtk_stp_wmt_soc CANNOT
+# be unloaded (wmt_lib_deinit deadlocks in kthread_stop), so the only way back
+# from that is a reboot. After= in the unit orders us; this check is what makes
+# the ordering load-bearing rather than decorative.
+#
+# THE ATTEMPT COUNTER
+#
+# hci_stp_open() calls wmt_func_on(BT). No BT-side wedge has ever been observed
+# — the CONSYS wedges recorded in gemini-net-up were all Wi-Fi func-on on a
+# cold CONSYS, and by the time we run, CONSYS is warm and already on. But an
+# unattended lab reboots constantly, and a bring-up that can wedge the machine
+# must never be able to wedge it in a loop. The counter costs nothing and
+# bounds the worst case at MAXFAIL power cycles instead of an infinite one.
+#
+# It deliberately does NOT pair or connect anything. Pairing is the user's.
+set -u
+
+LOG=/var/log/gemini-bt-up.log
+K=/lib/modules/$(uname -r)/updates
+STATE=/var/lib/gemini
+STAMP=$STATE/bt-attempts
+MAXFAIL=${GEMINI_BT_MAXFAIL:-2}
+
+exec >>"$LOG" 2>&1
+echo "=== gemini-bt-up $(date -Is) uptime=$(cut -d. -f1 /proc/uptime)s ==="
+
+if [ -e /sys/class/bluetooth/hci0 ]; then
+    echo "hci0 already present; nothing to do"
+    exit 0
+fi
+
+# The WMT chain must already be up, and must have been brought up by someone
+# else. /dev/stpwmt is the WMT core's own character device: it exists only once
+# mtk_stp_wmt_soc has probed.
+if ! grep -qw '^mtk_stp_wmt_soc' /proc/modules; then
+    echo "WMT core is not loaded — gemini-net-up has not run or stood down."
+    echo "Bluetooth rides the same CONSYS and will not power it on by itself."
+    exit 0
+fi
+if ! pgrep -f wmt_launcher >/dev/null 2>&1; then
+    echo "wmt_launcher is not running; the BT func-on would fail. Standing down."
+    exit 0
+fi
+
+mkdir -p "$STATE"
+
+if [ -e /run/gemini-bt-up.attempted ]; then
+    echo "already attempted this boot"
+    exit 0
+fi
+: > /run/gemini-bt-up.attempted   # /run is tmpfs: cleared every boot
+
+fails=$(cat "$STAMP" 2>/dev/null || echo 0)
+case "$fails" in ''|*[!0-9]*) fails=0 ;; esac
+if [ "$fails" -ge "$MAXFAIL" ]; then
+    echo "STANDING DOWN: $fails consecutive attempts did not complete."
+    echo "Clear $STAMP by hand to try again."
+    exit 0
+fi
+echo $((fails + 1)) > "$STAMP"
+sync
+echo "attempt $((fails + 1)) of $MAXFAIL"
+
+# ecdh_generic/ecc are what BlueZ's LE Secure Connections needs; without them
+# the core registers hci0 but SMP pairing fails later, a long way from here.
+for m in ecb cmac ecc ecdh_generic bluetooth hidp uhid mtk_hci_stp; do
+    grep -qw "^$m" /proc/modules && continue
+    if [ -f "$K/$m.ko" ]; then
+        insmod "$K/$m.ko" 2>&1 | sed "s/^/   $m: /"
+    else
+        modprobe "$m" 2>&1 | sed "s/^/   $m: /"
+    fi
+done
+
+for _ in $(seq 1 20); do
+    [ -e /sys/class/bluetooth/hci0 ] && break
+    sleep 1
+done
+
+if [ ! -e /sys/class/bluetooth/hci0 ]; then
+    echo "hci0 never registered:"
+    dmesg | grep -iE 'hci|bluetooth' | tail -10
+    exit 1
+fi
+
+echo "hci0 registered"
+# bluetoothd is what actually opens hci0, which is what triggers the BT
+# func-on. Starting it here rather than letting it start at boot means it never
+# runs before the WMT chain exists.
+systemctl start bluetooth 2>&1 | sed 's/^/   bluetooth.service: /'
+
+for _ in $(seq 1 20); do
+    hciconfig hci0 2>/dev/null | grep -q 'UP RUNNING' && break
+    sleep 1
+done
+hciconfig hci0 2>/dev/null | sed 's/^/   /'
+
+if hciconfig hci0 2>/dev/null | grep -q 'UP RUNNING'; then
+    echo 0 > "$STAMP"
+    sync
+    echo "GEMINI-BT-UP-OK $(hciconfig hci0 | sed -n 's/.*BD Address: \([0-9A-F:]*\).*/\1/p')"
+else
+    echo "hci0 registered but never came UP RUNNING"
+    exit 2
+fi
