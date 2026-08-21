@@ -1,0 +1,48 @@
+#!/bin/sh
+# gemini-reboot — a software reboot that actually comes back on this device.
+#
+# `systemctl reboot` does not. Measured repeatedly on 2026-08-20: every attempt
+# left the machine indistinguishable from dead — no USB, no network, dark panel
+# — recoverable only with the power button. That held even after WDT_MODE was
+# corrected at probe (IRQ/DUAL/EXRST all cleared, verified in dmesg) and after
+# the restart handler was made self-sufficient. So the fault is not the reset
+# itself.
+#
+# The evidence that matters: a bare WDT_SWRST issued from a running system
+# restarts the SoC and is back on the network in ~75 s. Twice, reliably. The
+# difference between that and `systemctl reboot` is everything systemd does in
+# between — unmounting, stopping units, tearing drivers down. Something in that
+# sequence leaves hardware in a state the next boot cannot recover from. Which
+# part is still unknown (`sysrq-b` would narrow it: it uses the kernel restart
+# path with no systemd shutdown at all).
+#
+# Until that is understood, this is the reboot the lab uses. It is deliberately
+# blunt: flush everything to disk, drop the page cache, then hit the reset. No
+# clean unmount, so the rootfs journal replays on the next boot — which is what
+# journals are for, and a fair trade for a machine that comes back.
+set -u
+REG_MODE=0x10007000
+REG_SWRST=0x10007014
+SWRST_KEY=0x1209
+
+echo "gemini-reboot: syncing"
+sync; sync
+sleep 1
+# Best effort: get the rootfs to a consistent state. It stays mounted, so this
+# is a journal-replay reboot, not a clean one.
+mount -o remount,ro / 2>/dev/null || echo "gemini-reboot: rootfs stayed rw (journal will replay)"
+sync
+echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+
+# The reset needs the block ENABLED and EXRST_EN CLEAR: enabled because
+# WDT_SWRST does nothing on a disabled watchdog, and EXRST clear because that
+# bit routes the reset to the PMIC, which powers this board off instead of
+# restarting it.
+busybox devmem $REG_MODE 32 0x22000011
+echo "gemini-reboot: WDT_MODE=$(busybox devmem $REG_MODE), resetting now"
+busybox devmem $REG_SWRST 32 $SWRST_KEY
+
+# Should never be reached.
+sleep 10
+echo "gemini-reboot: STILL ALIVE — the reset did not take" >&2
+exit 1
