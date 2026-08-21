@@ -1,0 +1,15 @@
+[Unit]
+Description=Write a boot self-report (panel gate + watchdog + panel dmesg) to /var/log
+Documentation=file:///usr/local/sbin/gemini-selfreport
+After=multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Late enough that the panel driver and DRM have settled, early enough that a
+# boot which later loses its network still leaves the report behind.
+ExecStartPre=/bin/sleep 45
+ExecStart=/usr/local/sbin/gemini-selfreport
+
+[Install]
+WantedBy=multi-user.target

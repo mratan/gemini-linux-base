@@ -1,0 +1,34 @@
+#!/bin/sh
+# gemini-selfreport — leave evidence on disk about how this boot went.
+#
+# Reachability is not guaranteed: the USB gadget dies on many boots and Wi-Fi
+# takes ~3 minutes to arrive. If a boot goes badly the lab may never get a
+# session on it at all, and the whole boot is then wasted — no evidence, only
+# the observation "it did not come up", which is the least informative possible
+# outcome.
+#
+# So the device writes its own verdict to a file. Whatever channel comes back
+# later — SSH, or an offline loop-mount of this image from Android — the
+# evidence is already there, timestamped and complete.
+set -u
+OUT=/var/log/gemini-selfreport.log
+{
+    echo "================ boot report $(date -Is 2>/dev/null) ================"
+    echo "kernel : $(uname -srv)"
+    echo "cmdline: $(cat /proc/cmdline)"
+    echo "uptime : $(cut -d. -f1 /proc/uptime)s"
+    echo "systemd: $(systemctl is-system-running 2>/dev/null)"
+    echo
+    echo "---- watchdog ----"
+    echo "wdt_mode=$(busybox devmem 0x10007000 2>/dev/null)"
+    ls -l /dev/watchdog0 2>&1
+    systemctl show -p RuntimeWatchdogUSec 2>/dev/null
+    echo
+    echo "---- panel driver messages ----"
+    dmesg 2>/dev/null | grep -iE "ssd2092|panel|dsi|mediatek-drm|init command|init sequence" | tail -40
+    echo
+    echo "---- panel gate ----"
+    /usr/local/sbin/gemini-panel-gate 2>&1
+    echo "gate exit=$?"
+    echo "================ end ================"
+} >> "$OUT" 2>&1
