@@ -1,0 +1,80 @@
+arm64: dts: mediatek: give gemini's i2c6 the vendor's push-pull property
+
+The vendor device tree carries `mediatek,use-push-pull` on
+i2c@1100e000 and ours did not. Mainline i2c-mt65xx already honours the
+property (it writes I2C_IO_CONFIG_PUSH_PULL to OFFSET_IO_CONFIG at bus
+init), and this bus has exactly one slave and one master, so matching the
+vendor here costs nothing.
+
+IT DOES NOT FIX WHAT IT WAS TRIED FOR, and that is the useful part of
+this commit. It was written to explain why every register on the DA9214
+reads back 0x00. Measured on #42, with the property in place, the
+symptom is unchanged:
+
+  i2cdetect: 68 69 6a 6b, identically on three consecutive scans
+  i2cget 0x68 <reg>:       0x00, or intermittent "Read failed"
+  five identical plain reads of 0x6a:  0x0b 0x00 0x00 0x00 0xd6
+  i2cset 0x68 PAGE_CON 0x82; read back: 0x00
+
+So the address phase of this bus is perfectly reliable and the data
+phase is noise. That is a specific and unusual split: in the address
+phase the master drives SDA and the slave only pulls it low to
+acknowledge, which works every time; in a read's data phase the slave
+drives SDA, and nothing the slave puts there arrives intact.
+
+What that settles: B-43's "Unsupported device id = 0x0", and the
+conclusion that there is no DA9214 on this board, are artefacts of a
+broken bus. Stock Android has the part bound to its own da9214 driver at
+this exact address. The chip is there; we cannot talk to it.
+
+What it does not settle: why. Two candidates, both device-free to
+investigate. The pinmux -- we take `i2c6_pins_a` from mt6797.dtsi
+(SDA=GPIO152, SCL=GPIO151), while the vendor's board DT sets no pinctrl
+on this controller at all, so its pins come from somewhere else and may
+not be these. And the clock configuration -- our `clock-div = <10>` is
+the DTSI default for every bus, and the vendor's value for this
+controller was not captured.
+
+Until one of those is resolved, the DA9214's bucks cannot be identified,
+and the CPU-regulator work that cpufreq needs stays blocked. That is
+worth more than it sounds: the A53s are running at 897 and 1274 MHz
+against maxima of 1547 and 2002 (B-40), so this bus is standing between
+the machine and about 1.7x on its little cluster.
+--- a/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
++++ b/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
+@@ -751,6 +751,35 @@
+ 	pinctrl-names = "default";
+ 	pinctrl-0 = <&i2c6_pins_a>;
+ 	clock-frequency = <400000>;
++	/*
++	 * This bus is push-pull on this board, and without saying so every
++	 * register on the DA9214 reads back 0x00.
++	 *
++	 * The symptom is worth describing because it looks exactly like an
++	 * absent or dead chip and was read as one: i2cdetect finds 0x68-0x6b
++	 * (the DA9214's four addresses) and every one of them ACKs, but data
++	 * reads return 0x00, or intermittently fail outright with ENXIO. That
++	 * is what open-drain on a bus with no pull-ups does — the slave can
++	 * still pull the line low to ACK, so addressing works, while the data
++	 * phase never gets a clean high and every bit reads back as zero.
++	 *
++	 * It is also what made B-43 conclude "there is NO DA9214 on this
++	 * board", from mainline da9211 reading DEVICE_ID as 0x0. Stock Android
++	 * on boot1 has the part bound to its own `da9214` driver on this exact
++	 * bus and address, and its device tree carries
++	 * `mediatek,use-push-pull` on i2c@1100e000. We did not.
++	 *
++	 * Mainline i2c-mt65xx honours the property (it writes
++	 * I2C_IO_CONFIG_PUSH_PULL to OFFSET_IO_CONFIG at bus init), so this is
++	 * a one-property fix, and it is safe here: i2c6 has exactly one slave
++	 * and one master.
++	 *
++	 * The vendor additionally drives this part in high-speed mode at
++	 * 3.4 MHz (`I2C_HS_FLAG`, `timing = 3400` in
++	 * drivers/misc/mediatek/power/mt6797/da9214.c). 400 kHz is kept until
++	 * there is a reason to need more; register access does not.
++	 */
++	mediatek,use-push-pull;
+ 	status = "okay";
+ };
+ 

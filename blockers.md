@@ -1957,6 +1957,59 @@ required booting boot1 Android and restoring `boot-gpustack4.img`
 other known-good.** Android on boot1 remains the deep fallback and was
 untouched throughout.
 
+## 🔴 B-45 — i2c6's address phase works and its data phase does not, which is why the DA9214 "isn't there"
+
+**Opened 2026-08-21.** This bus is what stands between the machine and its own
+clock speed, so it is worth more attention than an I2C bug usually gets.
+
+**The measurement, on `#42`:**
+
+```
+i2cdetect -y -r 2   ->  68 69 6a 6b     identical on three consecutive scans
+i2cget -y 2 0x68 <reg> b                0x00, or intermittent "Read failed"
+five identical plain reads of 0x6a      0x0b  0x00  0x00  0x00  0xd6
+i2cset -y 2 0x68 0x00 0x82; read back   0x00
+```
+
+**The address phase of this bus is perfectly reliable and the data phase is
+noise.** That split is specific: in the address phase the master drives SDA and
+the slave only pulls it low to acknowledge, and that works every single time; in
+a read's data phase the slave drives SDA, and nothing it puts there arrives
+intact. Writes cannot be confirmed either — `PAGE_CON` never reads back what was
+written, though a broken read is enough to explain that on its own.
+
+**What it settles.** B-43's `Unsupported device id = 0x0`, and the conclusion
+drawn from it that there is no DA9214 on this board, are artefacts of a broken
+bus. Stock Android on boot1 has the part bound to its own `da9214` driver at
+this exact bus and address (B-40's update). The chip is there; we cannot talk
+to it. **A negative probe result on a bus that has never carried a working
+transaction is not a measurement of the silicon.**
+
+**What was tried and did not work.** `mediatek,use-push-pull`, which the vendor
+device tree carries on `i2c@1100e000` and ours lacked. Landed as `dts/0043`
+because matching the vendor costs nothing and this bus has one master and one
+slave, but the symptom is bit-for-bit the same with and without it. It is not
+the cause.
+
+**The two candidates left, both device-free to investigate.**
+
+1. **Pinmux.** We take `i2c6_pins_a` from `mt6797.dtsi` — SDA=GPIO152,
+   SCL=GPIO151. The vendor's board DT sets **no pinctrl at all** on this
+   controller, so its pins are configured somewhere else and may not be these.
+   Note a wrong SDA with a right SCL would look very like this if the real SDA
+   still floats to the slave.
+2. **Clock.** Our `clock-div = <10>` is the DTSI default applied to every bus;
+   the vendor's value for this controller was not captured on the boot1 trip.
+   `parent_clk /= clk_src_div` in `i2c-mt65xx.c`, so a wrong divider puts SCL
+   somewhere other than 400 kHz — survivable for address decode, not for
+   sampling data.
+
+**Why this is worth doing.** The DA9214's two bucks cannot be identified until
+the bus works; the CPU regulator cannot be declared until they are; and cpufreq
+cannot bind until the regulator exists. Meanwhile the A53s run at 897 and
+1274 MHz against maxima of 1547 and 2002 (B-40). **This bus is standing between
+the machine and roughly 1.7x on its little cluster.**
+
 ## 🟢 B-44 — the display runs behind the M4U (RESOLVED 2026-08-21)
 
 **Opened and closed 2026-08-21.** Three bugs, all of the same kind: a register
