@@ -1888,7 +1888,42 @@ switching would fix that specific case; nothing in software will.
 
 Side effect worth keeping: the device charges while "unplugged".
 
-## 🔴 B-24 — NT36672 panel retarget hangs the boot at DRM bind (watchdog loop)
+**Update 2026-08-21 — the cable-at-boot download-mode park did not reproduce.**
+Two unplanned hardware watchdog resets happened tonight with the cable attached
+— one from a panfrost probe wedging the SoC, one from a display measurement
+reading an unpowered register block — and **both came back to a normal boot**
+with no human action (once into Android because the BCB had been consumed, once
+into the experimental system). That is not proof the trap is gone; it is two
+counter-examples on the current LK/BCB arrangement, and it means the gap
+per-port VBUS switching was partly meant to close is narrower than #49 assumed.
+The gap that remains is real and unfixable in software: a wedged device-side UDC
+(B-25) clears only when the device sees VBUS drop, and on this hub it never
+does.
+
+## 🟢 B-24 — RESOLVED 2026-08-21, but NOT root-caused: the hang was made harmless, not explained
+
+**Read this before the history below.** The panel displays the kernel console
+on a cold boot, the system reaches userspace with no watchdog reset, the panel
+gate reports PASS 13/13, and the LXQt desktop runs on the glass. The init
+sequence completes in **156 ms for 183 commands** with no command slow enough
+to trip the >= 200 ms warning. The hang does not reproduce.
+
+**What is not known is which command was stalling.** `panel/0009` gave the init
+sequence a deadline (`init_budget_ms`, default on) so a stalled transfer aborts
+the sequence instead of wedging DRM bind, and `drm/0013` forces command mode at
+poweron. Between them the symptom disappeared. Nobody ever read the last index
+before the stall, which is what the plan called for and what would have named
+the cause.
+
+So: the failure mode is bounded rather than understood. If it returns, the
+instrumentation to name it is already in the tree and disabled by default —
+`panel_gemini_fhd.init_verbose=1` logs every command with its duration, and
+`init_budget_ms=0` removes the deadline so the stall is reproducible again.
+Marked resolved because the acceptance criteria of #45 are met on hardware; the
+first criterion, "the stalling command or condition is identified", is not, and
+saying so is more useful than ticking it.
+
+## (history) B-24 — NT36672 panel retarget hangs the boot at DRM bind (watchdog loop)
 
 **Opened 2026-08-20.** The NT36672 panel retarget (`panel/0007` + `panel/0008`,
 fork `33d641c`) **does light the physical panel** — the operator confirmed
@@ -1921,6 +1956,144 @@ required booting boot1 Android and restoring `boot-gpustack4.img`
 (`4a912fae…`) to p30/p31 over adb. **Flash one slot at a time and keep the
 other known-good.** Android on boot1 remains the deep fallback and was
 untouched throughout.
+
+## 🔴 B-32 — the build ignored its own config fragments for three days
+
+**Opened and fixed 2026-08-21.** `07-kernel/build-local/src/.config` was seeded
+once from CI artifact `235e1e8` (2026-08-17) and never re-merged. The Bluetooth
+fragment landed at `4c22b9d` and the GPU MFGCFG fragment at `aaa17c6`, both
+after it. So from 2026-08-18 onward, **adding a symbol to `configs/*.config`
+changed nothing about anything flashed to the device**, silently:
+
+- `CONFIG_COMMON_CLK_MT6797_MFGCFG` was off, so the GPU node's
+  `clocks = <&mfgcfg CLK_MFGCFG_BG3D>` had no provider and **panfrost could not
+  bind at all** — while the tracker recorded the GPU as "binds, shader cores
+  never power up". The issue was describing a build nobody had flashed for days.
+- `CONFIG_UHID` was off. BlueZ needs uhid to expose an LE HID peripheral as an
+  input device, so a Bluetooth mouse would have paired and produced no events.
+- `CONFIG_BT_LE` and `CONFIG_BT_HCIVHCI` were off too.
+
+**Fix:** `scripts/gemini-kbuild.sh` re-merges every fragment on every build and
+then asserts that each symbol a fragment asked for survived `merge_config` and
+`olddefconfig`. A dropped symbol is a hard error. It found one on its first run:
+`CONFIG_PSTORE_FTRACE`, which depends on `FUNCTION_TRACER` and had therefore
+been discarded on every build since the fragment was written.
+
+**The general shape, worth carrying:** a build that ignores its configuration is
+worse than a build that fails, because the tracker keeps describing a machine
+that does not exist.
+
+## 🔴 B-33 — the patch series could not rebuild the kernel we flash
+
+**Opened and fixed 2026-08-21.** Applying every patch in `patches/v6.6/` to a
+pristine v6.6 and diffing against `build-local/src` — apparently for the first
+time — showed they were not the same tree:
+
+- `input/0003` created the touchscreen driver's **first** version and never
+  added its Kconfig or Makefile entries, so a kernel built from the series
+  compiled the file it had just created into nothing. Every change after that
+  (ready-line gating, the paged-read fix that resolved B-31, the panel-follower
+  work) lived in a loose copy at `patches/v6.6/input/gemini-nt36xxx.c` that
+  nothing applies.
+- The touchscreen's **device-tree node was in no patch at all**. It existed only
+  as a hand-edit to the build tree.
+
+Recreating the build tree from the patch series would have silently deleted the
+touchscreen — the subsystem that took the longest to get working.
+
+**Fix:** `input/0003` regenerated as the source of truth and wiring the driver
+into the build; the loose copy deleted; `dts/0038` adds the touch node.
+`scripts/gemini-patch-check.sh` asks the question on demand and reports
+IDENTICAL.
+
+**Trap it encodes:** the baseline must come from `git archive`, not `cp -a`.
+`07-kernel/linux-6.6` has its own uncommitted state, so copying the working tree
+gives a baseline that is neither pristine nor patched; half the series then
+applies with fuzz and the comparison means nothing.
+
+## 🔴 B-34 — panfrost: the GPU's first read of DRAM comes back as noise
+
+**Opened 2026-08-21.** With the MFG shader-core power domains fixed
+(`pmdomain/0006`, `dts/0037`, `gpu/0004`) the GPU powers up completely —
+`PWR_STATUS 0x2B003F5E`, `SHADER_READY 0xF`, `TILER_READY 0x1`,
+`SHADER_PWRTRANS 0x0` — reports its full feature set, and Mesa brings up
+`Mali-T880 (Panfrost)` OpenGL ES 3.1 on the GBM platform.
+
+Submitting a job then fails:
+
+```
+panfrost 13040000.gpu: AS_ACTIVE bit stuck
+panfrost 13040000.gpu: GPU Fault 0x00ff0388 (GPU_SHAREABILITY_FAULT) at 0x000000fff7fddb00
+```
+
+**Established:**
+
+- The **first** fault arrives before `panfrost_mmu_enable()` finishes its opening
+  `AS_COMMAND_FLUSH_MEM`, so it is not a page-table-content problem — it is the
+  GPU's first memory transaction.
+- Fault addresses vary per fault and sit near the top of the 40-bit PA space
+  with long runs of `F`s and `D`s (`0xd7bfbddb00`, `0xffffffda40`,
+  `0xfff7bdd300`). That is the signature of reads returning noise, not of one
+  bad pointer.
+- `INFRA_TOPAXI_PROTECTEN = 0x000104B8` — MFG bus-protection bit 21 is clear, so
+  `pmdomain/0003`'s decision to leave `bus_prot_mask = 0` is not the cause.
+
+**Eliminated by measurement, one build each:**
+
+1. **`GPU_COHERENCY_ENABLE` left at its ACE-Lite reset default.**
+   `COHERENCY_FEATURES` reads `0x0` and kbase writes this register on every init
+   while panfrost never does, so writing `COHERENCY_NONE` looked right. The
+   register is **RAZ/WI on this part**: it reads back `0x0` after the write and
+   nothing changed. Reverted.
+2. **Inner- vs outer-shareable PTEs.** io-pgtable's Mali path always sets
+   `SH_OS`; kbase uses `SH_IS` on non-coherent systems. Switching it changed
+   nothing, and could not have, since the first fault precedes any PTE use.
+   Reverted rather than left in the tree unproven.
+3. **Page tables above 4 GB.** DRAM is `0x40000000`-`0x13FFFFFFF`, so pgd
+   allocations land above 4 GB routinely, and `AS_TRANSTAB_LO` alone reads
+   `0x0930F007` — an address that is not RAM. Instrumented: `transtab=0x109564007`,
+   `readback lo=09564007 hi=00000001`. **The hardware keeps the high half.** A
+   `mem=3G` kernel did not help either.
+
+**Next places to look:** the EMI MPU's master-domain permissions for the GPU's
+AXI ID; the MFG_ASYNC bridge's own clock (`pmdomain/0005` *replaced* `CLK_MFG`
+with `CLK_MFG52M` on MFG_ASYNC rather than adding it, and `MAX_CLKS` is 3 so
+both would fit); a register-level comparison against the vendor stack actually
+running a job.
+
+**Side finding:** `rmmod panfrost` while a reset is queued oopses in
+`drm_sched_start` -> `kthread_unpark(NULL)` from `panfrost_reset_work`. Upstream
+teardown race, only reachable once the GPU is in a permanent fault loop, but it
+means the module is not hot-swappable while faulting. Use a reboot.
+
+## 🟡 B-35 — ramoops does not survive a hard watchdog reset; netconsole does
+
+**Opened 2026-08-21.** A hang left **no evidence at all**. There is no serial
+console in the rig, SSH needs userspace, and `/sys/fs/pstore` was completely
+empty after a real hang and watchdog reset — despite `CONFIG_PSTORE_RAM=y` and a
+256 KB console zone in the `ramoops@44410000` node. The RAM contents do not
+survive the reset here.
+
+**Worked around** with `CONFIG_NETCONSOLE=y` + `scripts/gemini-netconsole.sh`,
+which streams the kernel log to the host over the USB gadget as it is printed,
+so the last line before a wedge is already on the host. It caught the
+`mtk_drm_crtc_atomic_disable` vblank timeout (issue #20) on its first use.
+
+Not marked resolved: pstore would still be the better instrument for a failure
+that takes the network with it, and why the region does not survive is unknown.
+
+## 🟡 B-36 — reading a DSI register block with the display asleep can hang the SoC
+
+**Opened 2026-08-21.** The documented trap was that such a read returns
+`0x00000000`. It is worse than that: a measurement script that read
+`0x1401b000` after a DPMS blank **wedged the machine** hard enough that the
+watchdog needed about five minutes to reclaim it, and the failure looked exactly
+like "DPMS off hangs the kernel" — which it does not; a clean run returns
+normally and the system stays up.
+
+Two rules follow. Do not read display registers while the display is asleep,
+and note that the panel gate's DSI base is `0x1401c000`; `0x1401b000` is a
+different block and reading it is what did the damage.
 
 ## 🟡 B-17 — DRM atomic commit never completes (`flip_done`/vblank timeout loop), panel stays dark
 
