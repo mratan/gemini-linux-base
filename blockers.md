@@ -1957,6 +1957,58 @@ required booting boot1 Android and restoring `boot-gpustack4.img`
 other known-good.** Android on boot1 remains the deep fallback and was
 untouched throughout.
 
+## 🟡 B-37 — the hardware cursor plane is drawn once and never moves
+
+**Opened 2026-08-21.** The pointer on the glass had not moved since login, and
+every layer underneath was working: the mouse delivers `REL_X`/`REL_Y`,
+libinput passes them, X's pointer position tracks exactly, clicks land where
+the pointer really is. Only the drawn arrow is stale. It presents to a user as
+"the mouse does nothing" and is not an input problem at all.
+
+**Measurement.** Warp the X pointer with `xdotool mousemove`, photograph the
+panel, repeat at a second position:
+
+| X reports | drawn cursor |
+|---|---|
+| `x:200 y:150` | centre of screen |
+| `x:1900 y:950` | centre of screen, unmoved |
+
+Both on a **freshly started X server** with nothing reading the input devices.
+The primary plane is fine throughout — the panel clock ticks between
+photographs. Xorg logs `Silken mouse enabled`, i.e. it believes it has a
+working hardware cursor: `drmModeSetCursor` draws the pointer once at the
+initial centre position and `drmModeMoveCursor` is then ignored.
+
+**Worked around, not fixed:** `Option "SWcursor" "true"` in the OutputClass
+(`scripts/gemini-desktop-setup.sh`). Verified by the same warp-and-photograph
+method.
+
+**The workaround is expensive.** Measured Xorg CPU: ~0% idle, and **1021 ticks
+over 5 s for 400 pointer moves — about two cores' worth, ~25 ms of CPU per
+move.** (Upper bound: `xdotool` warps jump randomly across the whole screen and
+maximise the damaged area.) It is costly *because of rotation* — with
+`Rotate left` every cursor move damages a region that must be rotated in
+software and flushed. This is a large part of the desktop's perceived lag.
+
+**Untested hypothesis, and the reason this is really #20's.** `Option "Atomic"
+"off"` is set, so modesetting uses the legacy `drmModeMoveCursor` path rather
+than an atomic commit. If mediatek-drm only latches cursor-plane position as
+part of a commit something else triggers, the cursor would track while the
+session is actively painting and freeze once the desktop goes idle. **That fits
+the owner's observation that it tracked when the Bluetooth mouse was first
+connected and stopped later**, which nothing else here explains — a fresh X
+server does not restore it.
+
+**The one-build experiment:** set `Atomic "on"`, keep the hardware cursor,
+repeat warp-and-photograph. Tracks under atomic and not legacy → the legacy
+cursor path on this driver is broken and SWcursor is the right permanent answer
+for the internal panel. Fails under both → the plane never latches at all.
+
+**Method note.** X screenshots cannot see this bug: the hardware cursor is not
+in the framebuffer, so `import -window root` shows the cursor at the correct
+position or not at all. The webcam is the only honest instrument — the same
+lesson as "screenshots cannot judge rotation", for the same reason.
+
 ## 🔴 B-32 — the build ignored its own config fragments for three days
 
 **Opened and fixed 2026-08-21.** `07-kernel/build-local/src/.config` was seeded
