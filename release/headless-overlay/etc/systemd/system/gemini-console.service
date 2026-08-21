@@ -1,0 +1,42 @@
+[Unit]
+# A shell on the panel that does not depend on the desktop.
+#
+# WHY THIS UNIT EXISTS RATHER THAN JUST `systemctl enable getty@tty1`
+#
+# getty@tty1 IS enabled, and getty.target IS active, and getty.target's Wants
+# does list it:
+#
+#   $ systemctl show getty.target -p Wants -p ActiveState
+#   Wants=getty@tty1.service getty-static.service serial-getty@ttyS0.service
+#   ActiveState=active
+#   $ systemctl show getty@tty1 -p UnitFileState -p ActiveState -p ConditionTimestamp
+#   UnitFileState=enabled
+#   ActiveState=inactive
+#   ConditionTimestamp=
+#
+# The empty ConditionTimestamp is the interesting part: systemd never even
+# evaluated the unit's conditions, and `journalctl -u getty@tty1 -b` says
+# "-- No entries --". So the start job was never queued, for a reason I could
+# not identify — it is not a masked unit, not a failed condition, and not a
+# missing .wants symlink. Starting it by hand works immediately and the shell
+# is usable on the panel. Ruled out: /dev/tty0 exists; the drop-in clearing
+# ConditionPathExists made no difference; getty-static is inactive too.
+#
+# It matters because a console fallback is worth most exactly when the desktop
+# is what broke, and until now there was no shell on the panel at all unless
+# sddm was running. So ask for it explicitly, from a unit whose start job is
+# not in doubt, and leave the underlying question written down rather than
+# papered over.
+Description=Shell on the panel's first VT, independent of the desktop
+After=getty.target
+Wants=getty@tty1.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# `start`, not a dependency alone: the Wants above is exactly what already
+# fails to take effect from getty.target, so do not rely on it twice.
+ExecStart=/bin/systemctl start getty@tty1.service
+
+[Install]
+WantedBy=multi-user.target
