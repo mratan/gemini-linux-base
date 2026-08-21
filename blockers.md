@@ -443,7 +443,7 @@ but no register detail (B-5).
 - **Unblocks:** Phase 5 hardware iteration; manage expectations — a reduced
   display mode may need to be accepted per the project priority order.
 
-## 🟡 B-9 — Touchscreen chip identity unknown
+## 🟢 B-9 — Touchscreen chip identity unknown (RESOLVED 2026-08-20: Novatek NT36772 at 0x62/0x01, trim ID `00 00 03 72 66 03`; the remaining defect is B-31)
 
 Novatek model is runtime-identified (`nvtpid`); cannot pick a driver path
 until the ID is read on hardware or found in a Gemian/Kali boot log.
@@ -1381,6 +1381,98 @@ before relying on the device being back to a good state.
 
 ---
 
+
+## 🔴 B-31 — Novatek touch firmware never reaches NORMAL_RUN: it re-inits every ~43 ms
+
+**Opened 2026-08-20 late.** This supersedes B-9 ("touchscreen chip identity
+unknown") — the identity question is closed, and what is left is a different
+and more specific defect.
+
+### What is settled
+
+The controller is a **Novatek NT36772-class** part at I2C 0x62 (reports and
+firmware info at 0x01), on i2c-3. Its trim ID, read with the vendor's own
+sequence (`nvt_bootloader_reset` → `nvt_sw_reset_idle` → write 0x00 0x35 →
+page 0x01F6 → read 6 bytes at 0x4E):
+
+```
+trim ID: 00 00 03 72 66 03   ->  NT36772 map, EVENT_BUF_ADDR = 0x11E00
+```
+
+which is the value `gemini-nt36xxx.c` already defaulted to. **The memory map
+was never the bug.** `FWINFO` at 0x78 on that page reads
+`05 fa 12 20 04 38 08 70`: fw_ver 0x05 with complement 0xFA (the vendor's
+`buf[1]+buf[2] == 0xFF` checksum passes), 18x32 sensor, 1080x2160. A real
+firmware image is present and its info block is intact.
+
+### The defect
+
+The firmware **restarts about every 43 ms and never leaves initialisation.**
+`RESET_COMPLETE` (0x60) cycles between `RESET_STATE_INIT` (0xA0),
+`RESET_STATE_REK` (0xA1) and 0x00, and never reaches `REK_FINISH` (0xA2) or
+`NORMAL_RUN` (0xA3). `HANDSHAKING` (0x51) reads 0x00 on every sample. The point
+buffer at register 0x00 is a fixed pattern, byte-identical across every read —
+uninitialised memory, which is what a firmware that never enters its main loop
+leaves behind.
+
+It is genuinely periodic, not noise. Paired reads of the same static register:
+
+| gap between reads | agree |
+|---|---|
+| 0 ms | 98% |
+| 5 ms | 71% |
+| 20 ms | **20%** |
+| 50 ms | 72% |
+
+Adjacent transactions agree; transactions half a period apart disagree; a full
+period apart they agree again. No per-transaction corruption can do that.
+
+### Ruled out, each by measurement
+
+| Hypothesis | Verdict | Evidence |
+|---|---|---|
+| Wrong `EVENT_BUF_ADDR` | no | trim ID read; 0x11E00 confirmed |
+| Missing firmware download | no | `novatek_ts_fw.bin` is in no partition of the stock image |
+| Flaky I2C link | no | the paired-read table above |
+| Transfer shape or length | no | 4 shapes, 10 lengths, identical result |
+| CTP_RST mis-driven | no | 3 assert/release timings; duty cycle unchanged to the sample |
+| Event buffer not writable | no | writes stick 57/60 |
+| Missing HOST_READY handshake | no | `HOST_CMD=0x00` + `HANDSHAKING=0xBB` sent blind and phase-locked; no effect |
+| Backlight | no | brightness 0 changes nothing |
+
+### The one hard new constraint
+
+**Touch shares the panel's power domain.** With `xset dpms force off` the
+controller does not merely stop reporting, it **vanishes from the bus** —
+150/150 I/O errors — and returns when the display does. Consequences:
+
+- Screen blanking is a one-way trip for touch until suspend/resume re-inits the
+  controller (issue #39). Blanking is disabled for now.
+- Any panel-gate or touch measurement taken with the display asleep measures a
+  powered-down block. This already produced one false alarm: a gate run where
+  every DSI register read 0x00000000 looked like a catastrophic regression and
+  was simply a 10-minute idle timeout.
+
+### Where to look next
+
+The cycling requires the DSI to be up, this panel is a Novatek DDIC, and the
+trim ID is its touch companion — very likely one TDDI part, in which case our
+183-command DSI init table (B-24's table, ours rather than the vendor's) is a
+plausible cause of a touch side that will not finish calibrating. The decisive
+experiment is to read `RESET_COMPLETE` on the vendor kernel on this same unit,
+where touch works: 0xA3 there and cycling here makes this a display problem,
+not an input one.
+
+Second candidate: supply. The vendor DTB powers touch from MT6351 VLDO28;
+`/sys/class/regulator` on our kernel has no touch consumer at all, so whatever
+LK left is what it gets.
+
+Scripts: `scripts/nvt-trim-probe.py` and `04-docs/touch-probes/`. They drive
+the controller from userspace over `/dev/i2c-3`, which turns a
+build-flash-boot cycle into a 30-second read — worth reaching for before any
+kernel change here.
+
+---
 
 ## 🔴 B-28 — MediaTek download/vendor mode: entered easily, exit NOT understood
 
