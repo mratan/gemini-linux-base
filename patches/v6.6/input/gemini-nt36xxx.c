@@ -79,6 +79,27 @@
 #define NVT_DEFAULT_MAX_X	1080
 #define NVT_DEFAULT_MAX_Y	1920
 
+/*
+ * The controller is PAGED. Reads at register 0x00 return whatever xdata page
+ * is currently selected, so a driver that just reads 0x00 gets a fixed pattern
+ * that never changes with touch — which is exactly what this driver did before
+ * the page select was added, and it looked convincingly like "the chip is not
+ * reporting". The vendor selects the page by writing 0xFF followed by the top
+ * two bytes of EVENT_BUF_ADDR.
+ *
+ * That address is chip-specific. The vendor carries four memory maps
+ * (NT36772 0x11E00, NT36525 0x11A00, NT36870 0x25000, NT36676F 0x11A00) and
+ * picks by chip ID. This panel is an NT36672, closest to the NT36772 map, but
+ * rather than assume, the value is writable at runtime:
+ *
+ *     echo 0x11E00 > /sys/module/gemini_nt36xxx/parameters/event_buf_addr
+ *
+ * so all four can be tried in a single boot instead of four reflashes.
+ */
+static unsigned int event_buf_addr = 0x11E00;
+module_param(event_buf_addr, uint, 0644);
+MODULE_PARM_DESC(event_buf_addr, "xdata page holding the touch event buffer");
+
 static bool raw_debug;
 module_param(raw_debug, bool, 0644);
 MODULE_PARM_DESC(raw_debug, "log the raw point buffer whenever it is non-zero");
@@ -120,6 +141,19 @@ static int nvt_read(struct nvt_ts *ts, u8 reg, u8 *buf, size_t len)
 	}
 
 	return ret < 0 ? ret : -EIO;
+}
+
+/* Write 0xFF <addr[23:16]> <addr[15:8]> to move the xdata window. */
+static int nvt_set_page(struct nvt_ts *ts, u32 addr)
+{
+	u8 buf[3] = { 0xff, (addr >> 16) & 0xff, (addr >> 8) & 0xff };
+	struct i2c_msg msg = {
+		.addr = NVT_FW_ADDR, .flags = 0, .len = sizeof(buf), .buf = buf,
+	};
+	int ret;
+
+	ret = i2c_transfer(ts->client->adapter, &msg, 1);
+	return ret == 1 ? 0 : (ret < 0 ? ret : -EIO);
 }
 
 static void nvt_reset(struct nvt_ts *ts)
@@ -185,6 +219,13 @@ static void nvt_ts_poll(struct input_dev *input)
 	 */
 	if (ts->rdy_gpio && !gpiod_get_value_cansleep(ts->rdy_gpio))
 		return;
+
+	/* Select the page the event buffer lives on before reading it. */
+	ret = nvt_set_page(ts, event_buf_addr);
+	if (ret) {
+		dev_err_ratelimited(&ts->client->dev, "page select failed: %d\n", ret);
+		return;
+	}
 
 	ret = nvt_read(ts, 0x00, point_data, sizeof(point_data));
 	if (ret) {
