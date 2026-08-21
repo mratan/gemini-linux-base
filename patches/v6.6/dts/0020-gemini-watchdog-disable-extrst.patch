@@ -1,0 +1,26 @@
+arm64: dts: mediatek: gemini: disable the watchdog's external reset (B-30)
+
+The RGU's external-reset output reaches the PMIC on this board, and the PMIC
+powers the machine off instead of restarting it. Since mtk_wdt_restart() is the
+platform's system restart handler, that made every `reboot` look like the device
+had died. Clearing EXRST_EN makes the reset internal and immediate.
+
+--- a/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
++++ b/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
+@@ -2037,3 +2037,16 @@
+ &scpsys {
+ 	mfg-supply = <&vgpu>;
+ };
++
++/*
++ * GEMINI (B-30): the RGU's external-reset output reaches the PMIC, which powers
++ * the board OFF instead of restarting it. Since mtk_wdt_restart() is this
++ * platform's system restart handler, that made every `reboot` look like the
++ * device had died — no USB, no network, dark panel, not even an LK splash — and
++ * only the power button brought it back. Measured 2026-08-20: with EXRST_EN
++ * cleared the same WDT_SWRST restarts the SoC and the system is back on the
++ * network in 77 s.
++ */
++&watchdog {
++	mediatek,disable-extrst;
++};

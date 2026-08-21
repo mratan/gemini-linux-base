@@ -1,36 +1,80 @@
-watchdog: mtk_wdt: clear the bootloader's IRQ/DUAL mode when adopting a running WDT (B-29)
+watchdog: mtk_wdt: make reset actually reset on the Gemini (B-29/B-30)
 
-mtk_wdt_init() adopts a watchdog the bootloader left running: it sets
-WDOG_HW_RUNNING and programs the timeout. What it does not do is touch
-WDT_MODE's IRQ_EN/DUAL_EN bits, so the bootloader's choice survives — and LK on
-the Gemini arms the RGU with both set, meaning expiry raises an interrupt first
-and only resets afterwards.
+Three defects in the same register, found by bisecting WDT_MODE against a
+device that would not restart.
 
-A hung kernel services no interrupts, so that first stage goes nowhere and the
-reset never arrives. Measured on hardware 2026-08-20: a deliberate panic
-(panic_timeout=0) with the watchdog armed and systemd petting it at 30 s left
-the device dead for 490 s and needing a physical power cycle. An armed watchdog
-that interrupts a dead kernel is decoration.
+1. Adopting a bootloader-armed watchdog inherits the bootloader's WDT_MODE.
+   mtk_wdt_init() sets WDOG_HW_RUNNING and programs the timeout but never
+   touches the mode bits, and because WDOG_HW_RUNNING is set the core never
+   calls ->start, so mtk_wdt_start()'s own handling of them never runs. LK
+   leaves IRQ_EN|DUAL_EN set, so expiry raises an interrupt instead of
+   resetting — useless precisely when the kernel has stopped servicing
+   interrupts. Measured: a deliberate panic left the device dead for 490 s
+   with the watchdog armed and being petted.
 
-It cannot be corrected anywhere later. Setting WDOG_HW_RUNNING means the
-watchdog core never calls ->start, so mtk_wdt_start()'s own clearing of these
-bits never executes — not even when userspace opens /dev/watchdog. A userspace
-workaround was tried and is useless for the case that matters most: a boot that
-never reaches userspace never runs it.
+2. The DT mode properties were parsed AFTER mtk_wdt_init() ran, so they could
+   not influence the adoption path even in principle. Moved earlier, and the
+   adoption path now honours disable_wdt_extrst and reset_by_toprgu.
 
-So clear them at probe, roughly a second into boot, while nothing else is
-running. From that point expiry is a straight hardware reset, which is the only
-kind that helps once the CPU has stopped executing our code. Anything that
-genuinely wants a pretimeout interrupt still sets the bits back through
-mtk_wdt_set_pretimeout().
+3. mtk_wdt_restart() is this platform's system restart handler
+   (watchdog_set_restart_priority(..., 128)), so `reboot` IS a WDT_SWRST. It
+   ran with whatever mode the shutdown path left behind — and probe registers
+   watchdog_stop_on_reboot(), so the notifier had already cleared WDT_MODE_EN,
+   with which WDT_SWRST does nothing. It now programs the mode it needs
+   immediately before requesting the reset.
+
+EXRST_EN matters as much as the enable bit: it routes the reset to an external
+pin which on the Gemini reaches the PMIC, and the PMIC powers the board OFF
+rather than restarting it. That is why `reboot` was indistinguishable from a
+dead device — no USB, no network, and a dark panel with not even an LK splash,
+recoverable only with the power button.
+
+Verified on hardware 2026-08-20: with the block enabled and EXRST_EN cleared, a
+WDT_SWRST restarts the SoC and the system is back on the network in 77 s.
 
 --- a/drivers/watchdog/mtk_wdt.c
 +++ b/drivers/watchdog/mtk_wdt.c
-@@ -243,8 +243,42 @@
+@@ -187,8 +187,35 @@
+ 	struct mtk_wdt_dev *mtk_wdt = watchdog_get_drvdata(wdt_dev);
+ 	void __iomem *wdt_base;
+ 
++	u32 reg;
++
+ 	wdt_base = mtk_wdt->wdt_base;
+ 
++	/*
++	 * GEMINI (B-30): make the restart path self-sufficient.
++	 *
++	 * Two things conspire to make `reboot` a silent death on this board.
++	 * First, probe registers watchdog_stop_on_reboot(), so the reboot
++	 * notifier calls mtk_wdt_stop() and clears WDT_MODE_EN before we get
++	 * here — and WDT_SWRST does nothing with the block disabled. Second,
++	 * WDT_MODE_EXRST_EN routes the reset to an external pin which on this
++	 * board reaches the PMIC and powers the machine OFF instead of
++	 * restarting it.
++	 *
++	 * Between them, `reboot` left the device indistinguishable from dead:
++	 * no USB, no network, dark panel, not even an LK splash, recoverable
++	 * only with the power button. Measured 2026-08-20: a WDT_SWRST issued
++	 * with the block still enabled and EXRST_EN cleared restarted the SoC
++	 * and the system was back on the network in 77 s.
++	 *
++	 * So program the mode we need immediately before asking for the reset,
++	 * rather than depending on whatever state the shutdown path left.
++	 */
++	reg = readl(wdt_base + WDT_MODE);
++	reg &= ~(WDT_MODE_IRQ_EN | WDT_MODE_DUAL_EN | WDT_MODE_EXRST_EN);
++	reg |= WDT_MODE_EN | WDT_MODE_KEY;
++	writel(reg, wdt_base + WDT_MODE);
++
+ 	while (1) {
+ 		writel(WDT_SWRST_KEY, wdt_base + WDT_SWRST);
+ 		mdelay(5);
+@@ -243,8 +270,62 @@
  	wdt_base = mtk_wdt->wdt_base;
  
  	if (readl(wdt_base + WDT_MODE) & WDT_MODE_EN) {
-+		u32 reg;
++		u32 reg, fixed;
 +
  		set_bit(WDOG_HW_RUNNING, &wdt_dev->status);
  		mtk_wdt_set_timeout(wdt_dev, wdt_dev->timeout);
@@ -59,13 +103,64 @@ mtk_wdt_set_pretimeout().
 +		 * these bits back through mtk_wdt_set_pretimeout().
 +		 */
 +		reg = readl(wdt_base + WDT_MODE);
-+		if (reg & (WDT_MODE_IRQ_EN | WDT_MODE_DUAL_EN)) {
-+			reg &= ~(WDT_MODE_IRQ_EN | WDT_MODE_DUAL_EN);
-+			reg |= WDT_MODE_KEY;
-+			iowrite32(reg, wdt_base + WDT_MODE);
++		fixed = reg & ~(WDT_MODE_IRQ_EN | WDT_MODE_DUAL_EN);
++
++		/*
++		 * EXRST_EN routes the reset to an external pin instead of
++		 * resetting the SoC internally. On the Gemini that pin reaches
++		 * the PMIC, which POWERS THE BOARD OFF rather than restarting
++		 * it — so with this bit set, `reboot` is indistinguishable from
++		 * a device that died: no USB, no network, and a dark panel with
++		 * not even an LK splash. Measured 2026-08-20: clearing this bit
++		 * turned a WDT_SWRST that killed the device into one that
++		 * restarted it and was back on the network in 77 s.
++		 *
++		 * mtk_wdt_start() honours disable_wdt_extrst already, but it is
++		 * never called for a watchdog inherited from the bootloader, so
++		 * the preference has to be applied here too.
++		 */
++		if (mtk_wdt->disable_wdt_extrst)
++			fixed &= ~WDT_MODE_EXRST_EN;
++		if (mtk_wdt->reset_by_toprgu)
++			fixed |= WDT_MODE_CNT_SEL;
++
++		if (fixed != reg) {
++			iowrite32(fixed | WDT_MODE_KEY, wdt_base + WDT_MODE);
 +			dev_info(wdt_dev->parent,
-+				 "cleared bootloader IRQ/DUAL mode: expiry is now a reset\n");
++				 "WDT_MODE %#010x -> %#010x (reset is now internal and immediate)\n",
++				 reg, fixed);
 +		}
  	}
+ }
+ 
+@@ -390,6 +471,17 @@
+ 
+ 	watchdog_set_drvdata(&mtk_wdt->wdt_dev, mtk_wdt);
+ 
++	/*
++	 * These were parsed at the end of probe, i.e. AFTER mtk_wdt_init() had
++	 * already decided what to do with a watchdog the bootloader left
++	 * running — so they could not influence it. Read them first.
++	 */
++	mtk_wdt->disable_wdt_extrst =
++		of_property_read_bool(dev->of_node, "mediatek,disable-extrst");
++
++	mtk_wdt->reset_by_toprgu =
++		of_property_read_bool(dev->of_node, "mediatek,reset-by-toprgu");
++
+ 	mtk_wdt_init(&mtk_wdt->wdt_dev);
+ 
+ 	watchdog_stop_on_reboot(&mtk_wdt->wdt_dev);
+@@ -408,12 +500,6 @@
+ 			return err;
+ 	}
+ 
+-	mtk_wdt->disable_wdt_extrst =
+-		of_property_read_bool(dev->of_node, "mediatek,disable-extrst");
+-
+-	mtk_wdt->reset_by_toprgu =
+-		of_property_read_bool(dev->of_node, "mediatek,reset-by-toprgu");
+-
+ 	return 0;
  }
  
