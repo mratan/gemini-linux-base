@@ -1,0 +1,52 @@
+diff --git a/drivers/gpu/drm/mediatek/mtk_dsi.c b/drivers/gpu/drm/mediatek/mtk_dsi.c
+--- a/drivers/gpu/drm/mediatek/mtk_dsi.c
++++ b/drivers/gpu/drm/mediatek/mtk_dsi.c
+@@ -542,6 +542,48 @@
+ 			(vm->hactive * dsi_tmp_buf_bpp + 2) % dsi->lanes;
+ 	}
+ 
++	/*
++	 * GEMINI (MT6797): use LK's horizontal word counts, not the ones the
++	 * formula above derives. This is not cosmetic and it is not about the
++	 * display.
++	 *
++	 * The panel is a Novatek NT36672, a TDDI part: the touch controller
++	 * shares the panel's silicon and power domain, and its sensor scan and
++	 * calibration run DURING HORIZONTAL BLANKING. The code above reserves
++	 * data_phy_cycles * lanes -- 200 bytes on this panel -- out of the
++	 * porches to leave room for LP->HS transitions, taking HFP_WC from 116
++	 * down to 34 and HBP_WC from 148 down to 39. LK reserves nothing and
++	 * programs the full porches.
++	 *
++	 * Both configurations light the panel, so this looked for a long time
++	 * like a difference that did not matter. It matters to the touch side:
++	 * with the shortened blanking the touch firmware never finishes
++	 * re-calibration. It sits cycling between RESET_STATE_INIT (0xA0) and
++	 * RESET_STATE_REK (0xA1) roughly every 43 ms, its event buffer stays
++	 * uninitialised, and no contact ever decodes -- which is what issue #37
++	 * spent weeks looking at from the input side.
++	 *
++	 * Measured directly, 2026-08-20, by writing these registers live on a
++	 * running system and watching EVENT_MAP_RESET_COMPLETE:
++	 *
++	 *   ours  (0x14/0x27/0x22)  ->  0xA0/0xA1, cycling, fw_ver valid 69/120
++	 *   LK    (0x1C/0x94/0x74)  ->  0xA3 RESET_STATE_NORMAL_RUN, stable,
++	 *                               fw_ver valid 120/120, and contacts
++	 *                               decode on the first touch
++	 *
++	 * Isolating them one at a time: HFP_WC is necessary in every passing
++	 * combination, and needs margin from one of the other two. The front
++	 * porch is the quiet window immediately after active video, which is
++	 * where a TDDI part scans.
++	 *
++	 * Same shape as the PHY_TIMCON override above (patch drm/0015): the
++	 * formula is defensible in general and wrong for this panel, and LK is
++	 * the reference because LK provably drives this hardware.
++	 */
++	horizontal_sync_active_byte = 0x1C;
++	horizontal_backporch_byte   = 0x94;
++	horizontal_frontporch_byte  = 0x74;
++
+ 	writel(horizontal_sync_active_byte, dsi->regs + DSI_HSA_WC);
+ 	writel(horizontal_backporch_byte, dsi->regs + DSI_HBP_WC);
+ 	writel(horizontal_frontporch_byte, dsi->regs + DSI_HFP_WC);
