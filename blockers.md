@@ -1957,74 +1957,80 @@ required booting boot1 Android and restoring `boot-gpustack4.img`
 other known-good.** Android on boot1 remains the deep fallback and was
 untouched throughout.
 
-## 🔴 B-39 — sustained full-screen updates on the USB display wedge the SoC
+## 🔴 B-39 — TWO independent ways to hard-wedge the SoC, both silent
 
-**Opened 2026-08-21. Substantially CORRECTED the same day — read this, not the
-first version, which is retracted below.**
+**Opened 2026-08-21, and rewritten twice the same day as the evidence changed.
+Read this version. Both earlier attributions are retracted at the bottom.**
 
-The machine hard-wedges: it goes away instantly, SSH resets mid-command,
-`/sys/fs/pstore` is empty afterwards, and netconsole — armed and listening on
-every occasion — captures **nothing at the moment of death**. The hardware
-watchdog reclaimed it unattended every single time (roughly eight times over
-this session).
+**The signature, common to every occurrence (~9 times in one session):** the
+machine goes away instantly, SSH resets mid-command, `/sys/fs/pstore` is empty
+afterwards, and netconsole — armed and listening every time — captures
+**nothing at the moment of death**. The hardware watchdog reclaimed it
+unattended on every single occasion, which is the one genuinely good news here.
 
-### What was retracted
+### Trigger 1 — a real window under sway, with no USB display involved
 
-The first version of this entry said the trigger was "a real client surface
-under sway", and pointed at the missing IOMMU via
-`mtk_gem_prime_import_sg_table: sg_table is not contiguous` as the structural
-cause. **That attribution was wrong.** It was drawn from the sway cases alone,
-before the isolating experiment was run. The IOMMU facts below are still true
-and still matter for the GPU-to-display path — they are just not what is
-wedging the machine.
+sway started with `WLR_DRM_DEVICES=/dev/dri/card0`, so it never opens the udl
+card at all; the adapter stays bound and idle. Backgrounds alone run happily for
+minutes and the cursor moves at 3 CPU ticks per 400 warps. **Open one
+`qterminal` and the machine dies.** Also reproduced with `wl-mirror`, and with
+`qterminal` on either output when both were active. Four-plus occurrences.
 
-### The isolating experiment
+In the runs where netconsole caught anything at all, the last line was:
 
-With `Xorg` running **only on the udl device** (`Option "kmsdev"
-"/dev/dri/card2"`), and therefore **no compositor, no window manager, no
-panfrost, and no cross-device buffer sharing of any kind**:
+```
+[drm:mtk_gem_prime_import_sg_table] *ERROR* sg_table is not contiguous
+```
+
+which is what a direct-scanout attempt on a panfrost-rendered client buffer
+would produce — see the IOMMU section below. It also appears in runs that
+survive, so it is a lead, not a proof.
+
+### Trigger 2 — sustained full-screen updates on the USB display
+
+`Xorg` running on the **udl device alone** (`Option "kmsdev" "/dev/dri/card2"`)
+— no compositor, no window manager, no panfrost, no cross-device buffer
+sharing whatsoever:
 
 | on the udl X screen | result |
 |---|---|
-| `xclock` | fine, survives |
-| `qterminal` (screenshotted, a real window) | fine, survives |
+| `xclock` | fine |
+| `qterminal`, a real window (screenshotted) | fine |
 | a full LXQt session | **wedges**, twice |
-| **30 × `xsetroot -solid`** — nothing but full-screen 1920x1080 fills | **wedges** |
+| **30 x `xsetroot -solid`** — nothing but full-screen 1920x1080 fills | **wedges** |
 
-The last row is the one that matters. `xsetroot` is a two-line X client; there
-is nothing in that test but the X server repainting 1920x1080 and `udl` pushing
-it over USB. That removes sway, Wayland, LXQt, panfrost and the IOMMU from the
-list of required conditions.
+`xsetroot` is a two-line X client. Nothing is in that test but the X server
+repainting 1920x1080 and `udl` pushing it over USB. Small, incremental updates
+are fine; large or sustained ones are not.
 
-**So: large or sustained updates to the USB display are sufficient to wedge the
-SoC. Small, incremental ones are not.** That is why a clock and a terminal
-window are fine and a desktop is not.
+**These are not the same bug and must not be merged.** Trigger 1 needs
+panfrost and mediatek-drm and no USB display; Trigger 2 needs the USB display
+and neither panfrost nor a compositor.
 
-### What is NOT established
+### What does NOT wedge
 
-Whether an active udl output is *necessary*. Every wedge observed today had the
-adapter bound and an output live, and the one sway session run before the
-adapter was on the bus survived — but that session had no clients, so it proves
-little. A control run with `udl` removed died with no output at all, and it
-cannot be told apart from `rmmod udl` itself wedging the machine. **Do not
-record this as "udl-only" until someone runs that control properly.**
+The ordinary LXQt/X11 desktop on the internal panel — the machine's daily
+configuration — runs for hours. That is because modesetting with
+`AccelMethod "none"` memcpys damaged regions into the scanout buffer and
+essentially never page-flips: measured **zero** display interrupts across 20
+full-screen `xsetroot` repaints on the panel. It is slow, and it is stable, and
+those two facts have the same cause.
 
-### Where this most likely belongs
+### Where Trigger 2 most likely belongs: ADR-0004's own gate
 
-This looks like ADR-0004's own gate failing, not a DRM bug. The ADR made
-"sustained, robust USB 2.0 **high-speed bulk**" the precondition for any USB
-display, and named the two known gaps: the right-port MUSB host is **PIO-only
-with single-buffered 512 B FIFOs**, measured at ~43-64 Mbit/s TCP, and **a
-misbehaving device wedges the host until reboot** (issue #27, B-22 follow-up).
-A 1920x1080x32 frame is ~66 Mbit. A full-screen repaint is therefore about a
-second of saturated bulk-OUT on a host with no DMA — precisely the workload the
-ADR said had to be proven and precisely the failure it predicted. **#27 is
-closed; on this evidence it was closed against a lighter workload than a display
-imposes, and should be reopened rather than assumed.**
+The ADR made "sustained, robust USB 2.0 **high-speed bulk**" the precondition
+for any USB display and named both gaps: the right-port MUSB host is
+**PIO-only with single-buffered 512 B FIFOs**, ~43-64 Mbit/s measured, and **a
+misbehaving device wedges the host until reboot** (issue #27). A 1920x1080x32
+frame is ~66 Mbit, so a full-screen repaint is about a second of saturated
+bulk-OUT on a host with no DMA — the exact workload the ADR said had to be
+proven, and the exact failure it predicted. **#27 has been reopened**: it was
+closed against a much lighter workload than a display imposes.
 
 ### The IOMMU finding, which stands on its own
 
-Still true, still worth fixing, and no longer claimed as the cause of the wedge:
+Relevant to Trigger 1 and to Track 2 generally; not claimed as proven cause of
+either wedge.
 
 ```c
 /* mtk_drm_gem.c, mtk_gem_prime_import_sg_table() */
@@ -2034,25 +2040,28 @@ if (drm_prime_get_contiguous_size(sg) < attach->dmabuf->size) {
 }
 ```
 
-- `mt6797.dtsi` has **no `m4u` node and zero `iommus` properties**. The SMI
-  larb0/smi_common nodes exist and the display components reference
-  `mediatek,larb`, but a larb is the bandwidth arbiter, not a translator.
-- `CONFIG_MTK_IOMMU=y` does nothing here: **mainline `drivers/iommu/mtk_iommu.c`
-  has no mt6797 support at all** — no compatible entry, no
-  `dt-bindings/memory/mt6797-*.h`. The vendor 3.18 tree does have the node.
+`mt6797.dtsi` has **no `m4u` node and zero `iommus` properties**, and
+`CONFIG_MTK_IOMMU=y` does nothing because **mainline `mtk_iommu.c` has no
+mt6797 support at all** — no compatible entry, no
+`dt-bindings/memory/mt6797-*.h`. The vendor 3.18 tree does have the node. So
+mediatek-drm can only scan out physically contiguous memory, panfrost never
+allocates any, and every pixel the Mali renders reaches the panel through a CPU
+copy. That is a real ceiling on Track 2 whatever the wedges turn out to be.
 
-Consequence: every pixel the Mali renders reaches the panel through a CPU copy,
-and a panfrost buffer can never be handed straight to the display. That is a
-real ceiling on Track 2, independent of this blocker.
+### Retractions, in order
 
-### Practical consequence
+1. **First version:** "a real client surface under sway", with the missing
+   IOMMU named as the structural cause. Drawn from the sway cases alone before
+   any isolating experiment. Overstated: it did not know about Trigger 2.
+2. **Second version:** claimed the `xsetroot` result "removes sway, Wayland,
+   LXQt, panfrost and the IOMMU from the list of required conditions". True for
+   Trigger 2 **only**. It was written before sway was tested with
+   `WLR_DRM_DEVICES=/dev/dri/card0`, which then wedged with no USB display in
+   play at all and showed there are two separate problems.
 
-A docked desktop **on plain X, on the udl device alone, works** — 1920x1080@60,
-`VGA-1 connected primary`, real windows, screenshotted. What it will not
-currently survive is a full desktop session repainting the whole screen. Until
-the USB host side is understood, treat the external display as usable for
-low-update work and expect a watchdog reset from anything that repaints
-1920x1080 repeatedly.
+Both were cases of generalising from whichever half had been measured most
+recently. The lesson is the ordinary one: an isolating experiment tells you
+about the path it isolated, and says nothing about the path it removed.
 
 ## 🟡 B-38 — X11 structurally cannot use this GPU; Wayland can, and does
 
