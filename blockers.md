@@ -1957,6 +1957,68 @@ required booting boot1 Android and restoring `boot-gpustack4.img`
 other known-good.** Android on boot1 remains the deep fallback and was
 untouched throughout.
 
+## 🔴 B-39 — a real client under sway hard-wedges the SoC; the display has no IOMMU
+
+**Opened 2026-08-21.** With `gemini-dock` running and both outputs live, opening
+an actual application window kills the machine outright. Reproduced **four
+times**: `wl-mirror DSI-1` twice, `qterminal` twice — once with the window on
+the external monitor and once on the internal panel, so it is **not** an
+external-display bug. Each time the machine goes away instantly, SSH resets
+mid-command, and the hardware watchdog reclaims it ~90 s later. It recovered
+unattended every time.
+
+**There is no evidence, and that is itself the finding.** `/sys/fs/pstore` is
+empty afterwards (B-35 again), and netconsole — armed and listening — captured
+**nothing at the moment of death**. The last line it ever gets is:
+
+```
+[  162.750881] [drm:mtk_gem_prime_import_sg_table] *ERROR* sg_table is not contiguous
+```
+
+**Do not read that as the cause.** The same error appears in runs that survive
+(twice in a session that then ran normally for minutes), so it is a necessary
+part of the picture and not a sufficient one. What it does establish is the
+structural problem underneath.
+
+**The structural problem: mediatek-drm can only scan out physically contiguous
+memory, and panfrost does not allocate any.**
+
+```c
+/* mtk_drm_gem.c, mtk_gem_prime_import_sg_table() */
+if (drm_prime_get_contiguous_size(sg) < attach->dmabuf->size) {
+        DRM_ERROR("sg_table is not contiguous");
+        return ERR_PTR(-EINVAL);
+}
+```
+
+That check exists because the display engine here has no IOMMU to map a
+scattered buffer through. Verified device-free:
+
+- `mt6797.dtsi` has **no `m4u` node and zero `iommus` properties**. The SMI
+  larb0/smi_common nodes are there and the display components reference
+  `mediatek,larb`, but a larb is the bandwidth arbiter, not the translator.
+- `CONFIG_MTK_IOMMU=y` is set and does nothing here, because **mainline
+  `drivers/iommu/mtk_iommu.c` has no mt6797 support at all** — no compatible
+  entry, and no `dt-bindings/memory/mt6797-*.h` port definitions. The vendor
+  3.18 tree does have an m4u node (`arch/arm64/boot/dts/mt6797.dts`).
+
+So every pixel the Mali renders and the panel displays goes through a CPU copy
+today (wlroots' multi-GPU path), and any attempt to hand a panfrost-rendered
+buffer directly to the display fails that check. Adding mt6797 to `mtk_iommu`
+and wiring the display's `iommus` is the piece of work this points at, and it
+is much bigger than a config toggle.
+
+**The discriminating observation, unexplained: `glxgears` does not wedge it.**
+Under the same compositor, with both outputs up and the window focused onto the
+external monitor, `glxgears -info` ran for 22 s and reported 34-40 FPS. Whatever
+separates it from `qterminal` and `wl-mirror` is the thread to pull, and
+guessing at it here would be exactly the mistake this file exists to prevent.
+
+**Practical consequence.** `gemini-dock` brings up a GPU-composited desktop with
+the external monitor live and X clients reporting `Mali-T880 (Panfrost)` — and
+you cannot yet open a window in it. Do not offer it as a usable desktop until
+this is understood.
+
 ## 🟡 B-38 — X11 structurally cannot use this GPU; Wayland can, and does
 
 **Opened 2026-08-21, after B-34.** The Mali renders now, and the desktop still
