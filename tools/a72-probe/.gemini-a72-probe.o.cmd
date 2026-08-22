@@ -1402,6 +1402,12 @@ deps_/mercury/data/projects/gemini_linux/07-kernel/wt-main/tools/a72-probe/gemin
     $(wildcard include/config/HOTPLUG_CORE_SYNC_DEAD) \
   include/linux/cpu_smt.h \
     $(wildcard include/config/HOTPLUG_SMT) \
+  include/linux/clk.h \
+    $(wildcard include/config/COMMON_CLK) \
+    $(wildcard include/config/HAVE_CLK_PREPARE) \
+    $(wildcard include/config/HAVE_CLK) \
+  include/linux/clk-provider.h \
+  include/linux/of_clk.h \
 
 /mercury/data/projects/gemini_linux/07-kernel/wt-main/tools/a72-probe/gemini-a72-probe.o: $(deps_/mercury/data/projects/gemini_linux/07-kernel/wt-main/tools/a72-probe/gemini-a72-probe.o)
 

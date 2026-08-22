@@ -2651,6 +2651,76 @@ currently wrong in exactly this way, and nobody has looked.
 
 ## 🟡 B-40 — the two Cortex-A72 cores never come up, and there is no cpufreq at all
 
+### CORRECTION, later the same evening: the iDVFS SMC service IS present. The SETTERS work; only the getters are missing.
+
+The section below concludes "there is no SMC shortcut" from four read-only
+getters all returning SMC_UNK against a bogus-id control. The control was
+sound and the getters really are absent — but the conclusion drawn from them
+was wrong, because **the calls the vendor actually uses on the A72 path are
+setters, and this ATF implements them**:
+
+```
+BIGIDVFSSRAMLDOSET(110000)   fn=0xC20003BF  ->  0    ANSWERED
+BIGIDVFSENABLE(0x0010a203, 100000, 110000)
+                             fn=0xC20003B0  ->  0    ANSWERED
+```
+
+against `BIGIDVFSPLLGETFREQ/GETPOSDIV/GETPCW/SRAMLDOGET` (0xC20003BA/BC/BE/C0)
+which all return SMC_UNK, exactly like the bogus id. So the family is
+**partially implemented: writes yes, reads no.**
+
+**The methodological error is the useful part.** I chose the getters
+deliberately, because they are read-only and therefore safe to probe cold.
+That is good instinct for safety and bad sampling for the question asked:
+"is this service present?" was answered with the subset of the service least
+likely to be implemented, and the answer generalised to the whole family. A
+safe probe is not automatically a representative one.
+
+It also explains a puzzle recorded above. Android's `/proc/idvfs/dvt_test`
+reports `Big Vsram = 1100mv` and a 16-bit `LDO_Cal/eFuse = 0x998d` — and the
+16-bit width is the tell: `BigiDVFSSRAMLDOEFUSE()` only returns 16 bits on the
+path taken when both A72s are offline, i.e. the one that does NOT do a secure
+read. Android was never exercising the getters either.
+
+**What this changes.** The last unreproduced step of `cpu_power_on_buck()` —
+`BigiDVFSSRAMLDOSet(110000)`, the big cluster's SRAM rail — is available after
+all, and so is `BigiDVFSEnable`. MCUCFG being unreadable from the non-secure
+world (verified: reads 0, writes dropped, and enabling the Device APC clock
+changes nothing) stops mattering, because ATF will do those accesses for us.
+
+**And it is STILL not enough.** With the full sequence run — MP2 bit 0 set,
+VPROC2 enabled, CPU_EXT_BUCK_ISO cleared 0x2 -> 0x0, SRAMLDOSET and
+BIGIDVFSENABLE both returning 0 — ATF's CPU_ON still reaches
+`MP2_CPUSYS_PWR_CON = 0x00010137` and stops. Decoded against the vendor's own
+bit names:
+
+| bit | name | MP2 stalled | MP0 running |
+|---|---|---|---|
+| 0 | PWR_RST_B | 1 (we set it) | 1 |
+| 1 | PWR_ISO | **1** | 0 |
+| 2 | PWR_ON | 1 (ATF) | 1 |
+| 3 | **PWR_ON_2ND** | **0** | **1** |
+| 4 | PWR_CLK_DIS | 1 | 0 |
+| 5 | SRAM_CKISO | 1 | 0 |
+| 8 | SRAM_PDN | 1 | 0 |
+
+ATF sets PWR_ON and waits for the power-good before setting PWR_ON_2ND, and
+the good never comes.
+
+**The next measurement, and it is read-only.** The ack ATF polls is not in
+PWR_CON at all — it is `PWR_STATUS` at SPM+0x180 and `CPU_PWR_STATUS` at
+SPM+0x188 (this blocker previously looked at 0x60c, which is another SoC's
+header and reads 0 here even for the running MP0/MP1). Reading those four
+registers with MP2's PWR_ON asserted says directly whether the power switch is
+acknowledging at all — which separates "the supply is not reaching the domain"
+from "the sequence is wrong".
+
+Also note B-40's earlier "SRAM_PDN_ACK stays set" reading used a bit position
+that does not match this header: SRAM_PDN_ACK is bit **12**, and it is 0 in
+both the quoted 0x0001004C and the resting 0x00010132.
+
+---
+
 ### 2026-08-22 (evening): there is NO SMC shortcut to the A72s. Measured, and it cost 15 minutes.
 
 Before porting 2500 lines of CSPM, a cheaper hypothesis was worth eliminating,

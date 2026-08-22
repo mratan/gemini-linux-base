@@ -66,7 +66,39 @@
 #include <linux/cpu.h>
 #include <linux/kthread.h>
 #include <linux/mm.h>
+#include <linux/clk.h>
+#include <linux/of.h>
+#include <linux/clk-provider.h>
 #include <asm/cacheflush.h>
+
+#define CLK_INFRA_DEVICE_APC	47
+
+/*
+ * The iDVFS secure calls the vendor actually uses on the A72 path. Android's
+ * /proc/idvfs/dvt_test reports "idvfs Enable/SWREQ cnt = 345/0", so
+ * BIGIDVFSENABLE has run 345 times there, and Android's dmesg carries no
+ * idvfs_error() at all -- so these succeed under the SAME ATF we are running.
+ * The getters returned SMC_UNK when probed cold; calling the one the vendor
+ * calls, with the arguments Android reports, is the test that matters.
+ */
+#define MTK_SIP_IDVFS_BIGIDVFSENABLE	0xC20003B0U
+#define MTK_SIP_IDVFS_SRAMLDOSET	0xC20003BFU
+#define IDVFS_CTRL_REG_ANDROID		0x0010a203U	/* from /proc/idvfs/dvt_test */
+#define IS_SMC_UNK(v)			(((u32)(v)) == 0xFFFFFFFFU)
+
+static long do_smc(const char *what, u32 fn, u64 a1, u64 a2, u64 a3)
+{
+	struct arm_smccc_res res;
+
+	pr_emerg("a72-probe: SMC %s fn=0x%08x a1=0x%llx a2=0x%llx a3=0x%llx\n",
+		 what, fn, a1, a2, a3);
+	mdelay(20);
+	arm_smccc_smc(fn, a1, a2, a3, 0, 0, 0, 0, &res);
+	pr_emerg("a72-probe: SMC %s -> 0x%lx (%ld) %s\n", what,
+		 (unsigned long)res.a0, (long)res.a0,
+		 IS_SMC_UNK(res.a0) ? "<- SMC_UNK, not implemented" : "<- ANSWERED");
+	return (long)res.a0;
+}
 
 /*
  * A park page of "wfi; b .-4", the same trick tools/psci-probe uses. A core
@@ -224,6 +256,72 @@ static int __init a72_probe_init(void)
 
 	report("before anything");
 
+	/*
+	 * stage 0: is MCUCFG reachable at all?
+	 *
+	 * Every offset tried in MCUCFG (0x10200000) and MCUCFG2 (0x10222000)
+	 * reads 0x00000000 from the non-secure world, including from here --
+	 * and that region cannot be unpowered, because it holds the config for
+	 * the clusters currently running this code. So it is access-protected.
+	 *
+	 * That matters because the remaining unported step of the vendor's A72
+	 * power-on -- BigiDVFSSRAMLDOSet(), the big cluster's SRAM rail at
+	 * 0x102222b0 -- lives there, and the vendor reaches it through an
+	 * iDVFS SMC this ATF does not implement.
+	 *
+	 * The one cheap hypothesis left is that the Device APC block gates the
+	 * bus and its clock is off in our tree (infra_device_apc, disabled).
+	 * Enable it and look again.
+	 */
+	if (stage == 0) {
+		struct of_phandle_args spec = { };
+		struct clk *apc;
+		int i;
+		static const u32 offs[] = { 0x000, 0x274, 0x2b0, 0x4a0 };
+
+		P("MCUCFG2 before touching the APC clock:");
+		for (i = 0; i < ARRAY_SIZE(offs); i++)
+			P("  0x10222%03x = 0x%08x", offs[i],
+			  readl(mcucfg2 + offs[i]));
+
+		spec.np = of_find_compatible_node(NULL, NULL,
+						  "mediatek,mt6797-infracfg");
+		if (!spec.np) {
+			P("no infracfg node");
+			goto out;
+		}
+		spec.args_count = 1;
+		spec.args[0] = CLK_INFRA_DEVICE_APC;
+		apc = of_clk_get_from_provider(&spec);
+		of_node_put(spec.np);
+		if (IS_ERR(apc)) {
+			P("could not get infra_device_apc (%ld)", PTR_ERR(apc));
+			goto out;
+		}
+		if (clk_prepare_enable(apc)) {
+			P("could not enable infra_device_apc");
+			goto out;
+		}
+		P("infra_device_apc ENABLED");
+		udelay(100);
+
+		P("MCUCFG2 after:");
+		for (i = 0; i < ARRAY_SIZE(offs); i++)
+			P("  0x10222%03x = 0x%08x", offs[i],
+			  readl(mcucfg2 + offs[i]));
+
+		/* write/read-back test on the MP2 sync-DCM register (MP2 is off) */
+		writel(0x0000000f, mcucfg2 + 0x274);
+		P("wrote 0x0f to 0x10222274, reads back 0x%08x — %s",
+		  readl(mcucfg2 + 0x274),
+		  readl(mcucfg2 + 0x274) ? "WRITABLE" : "still dropped");
+		writel(0x0, mcucfg2 + 0x274);
+
+		clk_disable_unprepare(apc);
+		P("infra_device_apc released");
+		goto out;
+	}
+
 	if (stage < 2) {
 		P("stage 1 — reported only, nothing written.");
 		goto out;
@@ -231,9 +329,29 @@ static int __init a72_probe_init(void)
 
 	power_on_buck();
 
+	if (stage == 4 || stage == 5) {
+		/*
+		 * Ask ATF to enable the big cluster's iDVFS, exactly as the
+		 * vendor does, with the control word Android reports. If this
+		 * answers, the service exists and the cold getter probe was
+		 * misleading; if it is SMC_UNK, this ATF really does lack it.
+		 */
+		do_smc("BIGIDVFSSRAMLDOSET(110000)", MTK_SIP_IDVFS_SRAMLDOSET,
+		       110000, 0, 0);
+		do_smc("BIGIDVFSENABLE(ctrl,vproc,vsram)",
+		       MTK_SIP_IDVFS_BIGIDVFSENABLE, IDVFS_CTRL_REG_ANDROID,
+		       100000, 110000);
+		report("after iDVFS enable");
+	}
+
 	if (stage < 3) {
 		P("stage 2 — sequence run, no CPU_ON. MP2 will not move on its own;");
 		P("ATF is what drives it, and nothing has asked ATF for anything yet.");
+		goto out;
+	}
+
+	if (stage == 4) {
+		P("stage 4 — iDVFS asked, no CPU_ON.");
 		goto out;
 	}
 
