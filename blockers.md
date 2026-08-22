@@ -2651,6 +2651,274 @@ currently wrong in exactly this way, and nobody has looked.
 
 ## 🟡 B-40 — the two Cortex-A72 cores never come up, and there is no cpufreq at all
 
+### 2026-08-22 (late): the ATF was disassembled, and it moves the blocker
+
+**The two A72 cores are still not online.** But four of the previous entry's
+load-bearing conclusions are now refuted by reading the firmware itself, and
+the cluster gets much further than it ever has: MP2 is powered, clocked,
+its MCUCFG block is alive, iDVFS is enabled, and `MP2_CPU0_PWR_CON` reaches
+`0x0001004d` — bit-identical to a running A53 core. The cores still do not
+fetch. The remaining gap is narrow and different.
+
+Tool: `tools/a72-bringup/` (stages 0–6; stage 1 writes nothing).
+Captures: `04-docs/captures/a72-bringup-2026-08-22/`.
+
+#### The firmware is readable, and it is not the one we were reasoning about
+
+`02-firmware/flash-set/tee.img` **is** the on-device ATF — its 98304 bytes are
+byte-identical to the head of `01-backups/tee1.bin`, and the banner matches
+what the running firmware prints: `BL3-1: v1.0(debug):7f8e0c2`, built
+2019-05-08. It is a **debug build**, so it carries assert text and INFO format
+strings. `02-firmware/flash-set/trustzone.bin` is a *different, older* build
+(`fa2508c`, 2018-10-31) and is **not** what runs — do not reverse that one.
+
+Disassembly (`aarch64-linux-objdump -b binary -m aarch64`, 512-byte header
+stripped) is saved next to the captures. Note that `adrp`+`add` targets need a
+**-0x5C0** correction to land on the right rodata offsets; that constant was
+solved by matching one assert triple, not assumed.
+
+#### 1. There is a general secure register accessor into MCUCFG, and it works
+
+```
+0xC200035F  IDVFS_READ (addr)       -> *(u32 *)addr
+0xC200035E  IDVFS_WRITE(addr, val)  -> *(u32 *)addr = val
+```
+
+Both are guarded by exactly one check — `(addr & 0xFFFFC000) == 0x10220000` —
+and return -3 otherwise. **This entry previously recorded "IDVFS_READ returns 0
+for every address tried" from two probes, `0x10006218` and `0x1001a204`. Both
+are outside that window.** The measurement was about the guard, not the
+service. Inside the window it is unrestricted read *and write* to all of
+MCUCFG from EL1, and `IDVFS_WRITE` had never been tried at all.
+
+Proof, same address two ways, on the running machine:
+
+| address | non-secure `ioremap` | SMC |
+|---|---|---|
+| `0x102222a0` | `00000000` | `00ba0100` |
+| `0x102224a0` | `00000000` | `00ff1101` |
+
+#### 2. `BIGIDVFSSRAMLDOSET` does exactly what it says. It is not a stub.
+
+ATF's handler is a plain register write with **no EEM/PTP dependency anywhere
+in it**:
+
+```c
+w = mmio_read(0x1020666C) & 0xffff;          /* the eFuse cal */
+mmio_write(0x102222B4, w ? w : 0x7777);
+vosel = (mv_x100 <= 70000) ? 0x8f1
+      : (mv_x100 <= 90000) ? 0x8f2
+      : 0x8f0 | (3 + (mv_x100 - 90000) / 2500);
+mmio_write(0x102222B0, (mmio_read(0x102222B0) & 0xFFFFF000) | vosel);
+```
+
+Measured: `0x102222b0` goes `00411fc9 -> 004118fb`, which is
+`(old & ~0xfff) | 0x8f0 | 0xb` to the bit, and `0x102222b4` reads `0000998d` —
+**exactly Android's `LDO_Cal/eFuse = 0x998d`**. "Returns success and does
+nothing" was an artefact of having no read-back. **So the whole EEM/PTP lead
+that this entry recommended as "the thread to pull next" is dead.**
+
+#### 3. The MP2 MCUCFG block is powered through the external-buck isolation cell
+
+This is the finding that unlocked everything else. At rest, every register in
+`0x10222xxx` reads zero **even through the secure accessor**, while the MP0 and
+MP1 blocks return real values through the same call:
+
+| state | `0x1022222c` | `0x102222a0` | `0x102222b0` | `0x102222b4` |
+|---|---|---|---|---|
+| at rest | 0 | 0 | 0 | 0 |
+| VPROC2 on, still isolated | 0 | 0 | 0 | 0 |
+| **VPROC2 on + `CPU_EXT_BUCK_ISO` cleared** | `ffffffff` | `00400100` | `00411fc9` | `0000998d` |
+
+So the big cluster's config block lives on VPROC2 behind `B_EXT_BUCK_ISO`
+(SPM+0x290 bit 1). Until both are done, every read of it is meaningless — which
+is why so many earlier readings of this region were zeros.
+
+#### 4. ATF's cluster power-on, transcribed, and where it really hangs
+
+```
+power_on_cl3():                                    /* plat/mt6797/power.c */
+    INFO("%s before top:%x c0:%x c1:%x", ...)
+    MP2_CPUSYS_PWR_CON |= PWR_ON                   /* SPM+0x218 bit 2 */
+    udelay(2)
+    while (!(CPU_PWR_STATUS & BIT(17))) ;          /* SPM+0x188  <-- the spin */
+    while (!(mcucfg(0x102222A0) & BIT(17))) ;
+    assert(mcucfg(0x102224A0) == 0x00FF1100)
+    assert(mcucfg(0x102224A4) == 0xB9B13B14)
+    assert(mcucfg(0x102224AC) == 0x01B10100)
+    assert(mcucfg(0x102224B0) == 0x00AF00AF)
+    assert(mcucfg(0x102224B4) == 0x00000010)
+    MP2_CPUSYS_PWR_CON &= ~PWR_CLK_DIS
+    mcucfg(0x102224A0) = 0x00FF0100 / 0x00FF0101 / 0x00FF1101   /* big PLL */
+    CSPM(0x11015000) = 0x0B160001 ; take sema 0x11015448
+    MCUMIXED 0x1001A270 |= 1 ; 0x1001A274 = (x & ~0x1f) | 8
+    <freq meter on abist source 37>  expect ~750000 kHz, else RETRY (unbounded)
+
+power_on_big(cpu):
+    if (big_on == 0) power_on_cl3()
+    mcucfg(0x10222208) = 0x000F0000
+    mcucfg(0x10222290 + idx*8) = entry ; (+4) = 0     /* the core's reset vector */
+    MP2_CPUn_PWR_CON &= ~PWR_RST_B ; |= PWR_ON        /* SPM+0x240 + idx*4 */
+    while (!(CPU_PWR_STATUS & BIT(15 - cpu))) ;
+    while (!(mcucfg(0x10222430 + idx*4) & BIT(17))) ;
+    MP2_CPUn_PWR_CON |= PWR_RST_B
+    big_spark2_setldo(0, 0)                            /* mcucfg(0x10222700) = 0x3f */
+```
+
+**`CPU_PWR_STATUS` bit 17 is MP2_CPUTOP**, established by measurement, not by
+a header: bits [21:16] read `0x3d` on a machine where MP2 is the only dark
+cluster — bit 17 is the only clear one.
+
+Two things follow. The core-level bits are `BIT(15 - cpu)`, so cpu8 = bit 7 and
+cpu9 = bit 6 (which confirms this entry's earlier `MP2_CPU0..3 = 7..4`). And
+**the reset vector for a big core is MCUCFG `0x10222290 + idx*8`, written
+*after* the poll that hangs** — so in every previous attempt the A72 had no
+entry point, and `MP2_CPU0_PWR_CON` (SPM+0x240) was never driven at all. The
+"the A72 core executes nothing" verdict below was measuring a core that was
+never told where to start and never individually powered.
+
+#### 5. Driven by hand, the cluster comes all the way up
+
+Running the prerequisites and then the sequence from Linux, with no PSCI call
+anywhere (`tools/a72-bringup` stage 5/6):
+
+```
+SPMC ack (bit17)           OK after 0 us
+MP2=00010137  MCUCFG 0x102222a0=00ba0100     (bit 17 set)
+0x102224a0=00ff1100   <- ATF's asserted value, exactly
+0x102224a4=b9b13b14   <- ATF's asserted value, exactly
+0x102224ac=01b10100   0x102224b0=00af00af   0x102224b4=00000010
+```
+
+**All five of ATF's assertions hold.** Both of its polls would pass. Walking the
+MTCMOS bits the way `spm_mtcmos_ctrl_cpusys0()` does for MP0 then gets:
+
+```
+MP2_CPUSYS_PWR_CON  = 0001004d   (MP0 running = 0009004d)
+MP2_CPU0_PWR_CON    = 0001004d   (every running A53 core = 0001004d)
+core SPMC 0x10222430 = 00bb0100  (bit 17 set)
+```
+
+The core register is **bit-identical to a running A53 core**. Note the SPMC ack
+is *not* the whole state: with bit 17 asserted, PWR_CON still read `0x00010127`
+until the software sequence was walked.
+
+`MP3_CPUSYS_PWR_CON` — a cluster this SoC does not have — reads `0x0001004D`.
+That is the same value this entry previously celebrated reaching on MP2, so
+that number on its own proves nothing.
+
+#### 6. The clock is real, and it is not the one ATF expects
+
+The vendor's own freq meter (`_mt_get_cpu_freq_idvfs`, abist sources 34/35/36/37
+= LL/L/CCI/Big) was validated against clocks we already know before its answer
+about cluster B was believed:
+
+```
+LL=624000  L=1209000  CCI=629992  BIG=629992 kHz
+```
+
+LL and L are real cpufreq points, so the instrument works. **Cluster B measures
+630 MHz — the same as CCI — while its own PLL is programmed for 750 MHz**
+(`0x102224a4 = 0xb9b13b14` -> `0x39b13b14 * 26 / 2^24 = 1501 MHz`, posdiv 2).
+So `ARMPLLDIV_MUXSEL[1:0]` is not what switches this cluster, which agrees with
+the vendor's own per-cluster table (`MT_CPU_DVFS_B` has no ARMPLL).
+
+`BIGIDVFSENABLE` was then issued the way the vendor does it, after configuring
+the iDVFSAPB i2c bridge at `0x11017000` first so the co-processor does not
+collide with our regulator on i2c6. It works:
+
+```
+BIGIDVFSENABLE(0x0010a203, 100000, 120000) -> 0
+0x10222470 = 0010a203     <- Android's control word, now live
+0x102224c8 = 0f00466c     <- was 0
+```
+
+and ATF's own log ring agrees: `iDVFS enable start.` /
+`IDVFS_PLLINDEX = 0xf627, rg_armpll_sdm_pcw_r = 0x39b13b14, IDVFS_SWREQ = 0x1e000`
+/ `iDVFS enable success.` Cluster B still measures 630 MHz afterwards.
+
+#### 7. ATF logs to a ring buffer we can read from our own kernel
+
+`/proc/atf_log` on Android is just a ring in reserved DRAM, and **LK puts
+`tee_reserved_mem` in our device tree too**: physical **`0x7FF40000`, 0x40000
+bytes**, 256-byte control header then the ring. `busybox devmem` reads the
+header; the body needs an `mmap` of `/dev/mem` (a plain `read()` returns
+zeros). This is ATF narrating itself, live, and it survives into our system.
+
+It is also how the little cores' reset vector was found:
+
+```
+... power on CPU5 ...
+little_spark2_setldo sparkvretcntrl=3f
+Little power on:0x3F
+mt_on_1, entry 10103c
+```
+
+`0x0010103c` is ATF's warm-boot entry in **on-chip SRAM**, and MP0's boot
+address register `0x10220038` holds exactly that on this machine.
+
+#### 8. What is actually still wrong
+
+With all of the above in place, the core does not fetch. Two independent
+witnesses, both of which were checked for their ability to say otherwise:
+
+* a magic word written to an **uncached** `dma_alloc_coherent` mailbox (the
+  earlier probe used a cacheable page cleaned only to the PoU, which a
+  cache-off core outside the coherency domain need never see) — stays zero;
+* `SLEEP_TIMER_STA` bit 10, `MP2_CPU0_STANDBYWFI` — stays **1**. The stub was
+  changed from `wfi` to a branch-to-self precisely so this bit would have to
+  move if the core ran a single instruction. It does not.
+
+Tried and did not help: pointing the core at our DRAM stub; pointing it at
+`0x0010103c`, the entry the A53s actually use; `0x10222208 = 0x000F0000`
+(AA64nAA32); toggling `SRAM_SLEEP_B` for an edge; `big_spark2_setldo` (already
+`0x3f`, and MP0/MP1 read `0x3f3f3f3f`).
+
+Two concrete anomalies remain, and they are the leads:
+
+1. **`SRAM_SLEEP_B_ACK` (bit 19) never asserts on the cluster.** MP0 and MP1
+   both have it (`0x0009004d`); MP2 reaches `0x0001004d` and stops. Every
+   running *core* reads `0x0001004d` with bit 19 clear, so this is specifically
+   the cluster's L2 SRAM.
+2. **`0x10222220`–`0x1022223c` reads `0xffffffff` and drops writes**, while
+   `0x10222200`–`0x1022221c` reads real values through the same call. That
+   range contains MP2's `AXI_CONFIG` (`0x1022222c`, ACINACTM bit 4) — ATF's own
+   cluster switch is `0x1022002c` / `0x1022022c` / `0x1022222c`. An all-ones
+   sub-block next to a working one is an unclocked or ungated slave, and
+   ACINACTM stuck at 1 would keep the cluster out of the coherency domain.
+
+#### 9. The obvious next experiment, and why it was not run
+
+**Call PSCI `CPU_ON` now.** Every precondition ATF checks is verifiably
+satisfied — both polls pass, all five asserts match, and `MP2_CPU0_PWR_CON` is
+left powered down so `power_on_big` will not refuse with "was powered on". ATF
+also knows the correct reset vector and sets up its own per-CPU context, which
+hand-driving cannot.
+
+The reason it was left for a session with someone watching: `power_on_cl3`
+ends in a **frequency check with an unbounded retry loop** — it wants
+750000 ±15000 kHz on the first pass and 500000 ±10000 on later ones, and
+cluster B measures 630 MHz. If it never matches, ATF spins at EL3 with
+interrupts masked and the machine is lost until
+`03-tools/uhubctl/uhubctl -l 1-10 -p 1 -a cycle -d 8` (leave the port `-a on`).
+
+#### 10. Housekeeping, and one thing that bit
+
+`tools/a72-bringup` **stage 0 restores everything** — cores down, cluster down,
+`B_EXT_BUCK_ISO` re-asserted, VPROC2 off. This matters: B-47 is an energy
+limit, and leaving VPROC2 up costs current continuously.
+
+**Running stage 0 took the machine down** at the cluster power-down step
+(`cluster SRAM_PDN_ACK TIMEOUT`, netconsole stops there). The watchdog
+reclaimed it and it came back on its own in about a minute, healthy, at `#51`
+with 8 CPUs and cpufreq capped — a reset also restores VPROC2 and the isolation
+cell to their defaults, so the resting state is safe either way. But the
+cluster power-**down** path is not right yet and should not be trusted; prefer
+a reboot to undo an A72 experiment.
+
+---
+
+
 ### GEMIAN ANSWERS IT: no Linux on this device has ever run the A72s
 
 Booted the stock Gemian Reference kernel and asked it directly. **It brings up
