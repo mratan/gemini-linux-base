@@ -399,6 +399,26 @@ static int da9214_rmw(struct i2c_adapter *ad, u8 reg, u8 val, u8 mask, u8 shift)
 	return r;
 }
 
+/*
+ * VPROC2's own voltage. The DA9214 codes it as (mV - 300) / 10 in VBUCKB_A
+ * (0xD9), with bit 7 the "apply" flag, exactly as the vendor's
+ * DA9214_MV_TO_STEP(x) | 0x80 does.
+ *
+ * This is settable because of a suspicion the register map supports: Android
+ * runs the big cluster at Vproc 890 mV but its **Vsram at 1100-1200 mV**, and
+ * an LDO cannot step up. Our BUCKB sits at 1000 mV (VBUCKB_A = 0x46). If the
+ * big SRAM LDO is fed from VPROC2, it can never reach its programmed target
+ * and the SRAM never gets a supply — which is exactly the symptom.
+ */
+static int core_mode;
+module_param(core_mode, int, 0444);
+MODULE_PARM_DESC(core_mode,
+	"0 = ATF's power_on_big (SPMC owns the SRAM bits), 1 = the A53 table");
+
+static int vproc2_mv;
+module_param(vproc2_mv, int, 0444);
+MODULE_PARM_DESC(vproc2_mv, "VPROC2 target in mV (0 = leave as found)");
+
 static int enable_vproc2(void)
 {
 	struct i2c_adapter *ad = i2c_get_adapter(DA9214_I2C_ADAPTER);
@@ -409,6 +429,13 @@ static int enable_vproc2(void)
 		return -ENODEV;
 	}
 	r = da9214_rmw(ad, DA9214_PAGE_CON, 0x0, 0xf, 0);
+	if (r >= 0 && vproc2_mv) {
+		u8 step = (vproc2_mv - 300) / 10;
+
+		P("  setting VPROC2 to %d mV (VBUCKB_A = 0x%02x)", vproc2_mv,
+		  step | 0x80);
+		r = da9214_rmw(ad, 0xd9, step | 0x80, 0xff, 0);
+	}
 	if (r >= 0)
 		r = da9214_rmw(ad, DA9214_BUCKB_CONT, 0x1, 0x1, 0);
 	i2c_put_adapter(ad);
@@ -431,10 +458,18 @@ static void prerequisites(void)
 	P("step 2: dummy read 0x102224a0 = %08x (secure this time)",
 	  sread(0x102224a0));
 
+	/*
+	 * The vendor's udelay(1000) here is a hotplug-path delay: it assumes
+	 * BUCKB was on recently and is only being re-enabled. From cold this is
+	 * an external buck ramping from 0 to ~1.0 V, and 2 ms was measurably
+	 * not enough — the run that acked the SPMC immediately was one where a
+	 * previous module load had left VPROC2 on for ~40 s, and the run that
+	 * enabled it 15 ms earlier timed out. Give it real time.
+	 */
 	P("step 3: VPROC2 on");
 	if (enable_vproc2())
 		P("  VPROC2 ENABLE FAILED — continuing so the rest is readable");
-	mdelay(2);
+	mdelay(100);
 
 	mp2_block_probe("VPROC2 on, still isolated");
 
@@ -643,6 +678,7 @@ static bool cputop_power_up(void)
 {
 	void __iomem *r = spm + MP2_CPUSYS_PWR_CON;
 	bool hw_ack;
+	int i;
 
 	P("==== MP2 CPUTOP power-up ====");
 	writel(SPM_KEY, spm + SPM_POWERON_CONFIG_EN);
@@ -650,14 +686,83 @@ static bool cputop_power_up(void)
 	P("  before: MP2=%08x CPU_PWR_STATUS=%08x", readl(r),
 	  readl(spm + CPU_PWR_STATUS));
 
-	/* exactly what ATF does, but bounded */
-	writel(readl(r) | PWR_ON, r);
-	udelay(2);
-	hw_ack = wait_bit(spm + CPU_PWR_STATUS, MP2_CPUTOP_BIT, true, 2000,
-			  "SPMC ack (bit17)");
+	/*
+	 * The SRAM head switch, BEFORE anything else touches the domain.
+	 *
+	 * `big_spark2_setldo(a, b)` writes 0x10222700 = (b << 9) | (a << 6) |
+	 * 0x3f — ATF's log calls the field "sparkvretcntrl", the SRAM retention
+	 * voltage control, and the little clusters carry 0x3f3f3f3f in their
+	 * equivalents (0x10221c00 / 0x10223c00) put there at boot.
+	 *
+	 * On a cold cluster 0x10222700 reads 0x00000000. Every earlier run of
+	 * this tool saw 0x3f there and concluded "already set" — but only
+	 * because a previous run in the same boot had written it. ATF calls
+	 * this at the END of power_on_big, which is fine for it because it is
+	 * always re-powering a cluster something else initialised first.
+	 */
+	/*
+	 * The SPMC ack is INTERMITTENT. Measured across identical runs from
+	 * identical starting state (MP2 = 0x00010133, rail settled): sometimes
+	 * bit 17 asserts on the first read and 0x102222a0 goes 0x00400120 ->
+	 * 0x00ba0120; sometimes it never asserts and 0x102222a0 goes to
+	 * 0x042001xx and stays there. Same inputs, different outcome.
+	 *
+	 * ATF knows this. power_on_cl3()'s tail is a retry loop, and its
+	 * recovery is not just "assert PWR_ON again" — it drops PWR_ON, waits
+	 * for the domain to actually go down, then **cycles B_EXT_BUCK_ISO**
+	 * (assert, 100 us, deassert, 240 us) before trying again. That is the
+	 * escape from the stuck state, and it is why MediaTek wrote a retry
+	 * loop around a power-on at all.
+	 */
+	hw_ack = false;
+	for (i = 0; i < 8 && !hw_ack; i++) {
+		writel(readl(r) | PWR_ON, r);
+		udelay(2);
+		hw_ack = wait_bit(spm + CPU_PWR_STATUS, MP2_CPUTOP_BIT, true,
+				  20000, "SPMC ack (bit17)");
+		if (hw_ack)
+			break;
+
+		P("  attempt %d failed (0x102222a0=%08x) — ATF's retry: drop "
+		  "PWR_ON and cycle B_EXT_BUCK_ISO", i + 1, sread(0x102222a0));
+		writel(readl(r) & ~PWR_ON, r);
+		wait_bit(spm + CPU_PWR_STATUS, MP2_CPUTOP_BIT, false, 20000,
+			 "bit17 back to 0");
+		writel(readl(spm + CPU_EXT_BUCK_ISO) | 0x2u,
+		       spm + CPU_EXT_BUCK_ISO);
+		udelay(100);
+		writel(readl(spm + CPU_EXT_BUCK_ISO) & ~0x2u,
+		       spm + CPU_EXT_BUCK_ISO);
+		udelay(240);
+	}
+	P("  SPMC ack after %d attempt(s): %s", i + 1, hw_ack ? "YES" : "NO");
 	P("  MP2=%08x  MCUCFG 0x102222a0=%08x", readl(r), sread(0x102222a0));
 
 	mp2_block_probe("after PWR_ON");
+
+	/*
+	 * The SRAM head switch, as soon as the write can land.
+	 *
+	 * `big_spark2_setldo(a, b)` writes 0x10222700 = (b<<9) | (a<<6) | 0x3f;
+	 * ATF's log calls the field "sparkvretcntrl" — the SRAM **retention
+	 * voltage** control — and the little clusters carry 0x3f3f3f3f in their
+	 * equivalents (0x10221c00 / 0x10223c00), put there long before any core
+	 * of theirs is hotplugged.
+	 *
+	 * On MP2 it reads 0x00000000 from cold and, crucially, **only accepts a
+	 * write once the cluster domain is powered**. ATF gets away with calling
+	 * it at the very end of power_on_big because it is always re-powering a
+	 * cluster that something else initialised first; we are the first thing
+	 * ever to touch this cluster, so it has to happen here — before the SRAM
+	 * steps that depend on it, not after them.
+	 */
+	P("  spark: MP0 0x10221c00=%08x MP1 0x10223c00=%08x MP2 0x10222700=%08x",
+	  sread(0x10221c00), sread(0x10223c00), sread(0x10222700));
+	swrite(0x10222700, 0x3f);
+	P("  spark: MP2 0x10222700 <- 0x3f, reads %08x  %s", sread(0x10222700),
+	  sread(0x10222700) == 0x3f ? "*** STUCK, retention control is live ***"
+				    : "dropped");
+	udelay(100);
 
 	if (hw_ack)
 		P("  the hardware sequencer answered — the supply is up");
@@ -672,10 +777,13 @@ static bool cputop_power_up(void)
 	 * 0x0001004D. So the MTCMOS control bits still have to be walked in
 	 * software, exactly as spm_mtcmos_ctrl_cpusys0() does for MP0.
 	 */
-	P("  spark: MP0 0x10221c00=%08x  MP1 0x10223c00=%08x  MP2 0x10222700=%08x",
-	  sread(0x10221c00), sread(0x10223c00), sread(0x10222700));
-
-	atf_cluster_on(r, 2);
+	if (core_mode == 1) {
+		atf_cluster_on(r, 2);
+	} else {
+		P("  ATF leaves MP2's cluster SRAM/ISO bits to the SPMC too — "
+		  "not walking them");
+		P("  MP2 = %08x", readl(r));
+	}
 	mdelay(2);
 
 	P("  MP2=%08x (MP0 running = %08x)  %s", readl(r),
@@ -963,6 +1071,114 @@ static void idvfs_enable(void)
 	iounmap(apb);
 }
 
+/* ---- hunting the SRAM supply ----------------------------------------- */
+
+/*
+ * Everything about MP2 now matches a running cluster except one signal: the
+ * SRAM_PDN_ACK never follows SRAM_PDN, on the cluster or on either core. It is
+ * not a missing edge — driving 0 -> 1 from the powered state leaves the ack at
+ * 0 (`reg=0001012f`), while a powered-down A53 core sits at 0x00001332 with
+ * the ack SET. So MP2's SRAM controller has no supply or no clock.
+ *
+ * The SRAM voltage register is 0x102222b0 and ATF's setter only ever writes
+ * its bottom 12 bits: `(old & 0xFFFFF000) | 0x8f0 | vosel`. Everything above
+ * bit 11 it *preserves* — which means ATF assumes something else already put
+ * the right value there. On this system those bits are whatever reset left.
+ *
+ * So: flip each unknown bit, give the core's SRAM_PDN a real 0 -> 1 edge, and
+ * see whether the ack ever comes back. Bounded, quick, and it either finds an
+ * enable bit or rules the whole register out.
+ */
+static bool sram_ack_edge(void __iomem *r)
+{
+	int i;
+
+	writel(readl(r) & ~SRAM_PDN, r);
+	udelay(50);
+	writel(readl(r) | SRAM_PDN, r);
+	for (i = 0; i < 2000; i++) {
+		if (readl(r) & SRAM_PDN_ACK) {
+			writel(readl(r) & ~SRAM_PDN, r);
+			return true;
+		}
+		udelay(1);
+	}
+	writel(readl(r) & ~SRAM_PDN, r);
+	return false;
+}
+
+static void hunt_sram_supply(int cpu)
+{
+	/*
+	 * On the CLUSTER register, not a core: cputop_power_up() has just left
+	 * MP2_CPUSYS at 0x0001004d with the SPMC acking, so its SRAM controller
+	 * is the one that is definitely powered. A core still at 0x00010132 has
+	 * PWR_ON clear and could not ack whatever we do to the LDO.
+	 */
+	void __iomem *r = spm + MP2_CPUSYS_PWR_CON;
+	u32 base = sread(0x102222b0);
+	int bit;
+
+	P("==== hunting the MP2 SRAM supply ====");
+	P("  0x102222b0 = %08x, MP2_CPUSYS = %08x (cpu%d unused here)",
+	  base, readl(r), cpu);
+	P("  control: a powered-down A53 core reads 0x00001332 (ack SET)");
+	P("  baseline ack edge: %s", sram_ack_edge(r) ? "ACK!" : "no ack");
+
+	/*
+	 * Voltage first. The big SRAM LDO sits inside the MP2 domain and is fed
+	 * from VPROC2, and an LDO cannot output more than it is given: Android
+	 * runs Vsram at 1100-1200 mV, our BUCKB tops out at 1180. If the LDO is
+	 * simply in dropout, a LOW target will regulate cleanly and the SRAM
+	 * control logic will wake up — the array would be far too slow to run
+	 * code at 600 mV, but the ack is a logic signal and that is all this
+	 * asks. If no voltage in the whole legal range produces an ack, the
+	 * supply is not this LDO's output at all.
+	 */
+	{
+		static const unsigned int mv_x100[] = {
+			50000, 60000, 70000, 80000, 90000, 100000, 110000, 120000
+		};
+		struct arm_smccc_res res;
+		int k;
+
+		for (k = 0; k < ARRAY_SIZE(mv_x100); k++) {
+			arm_smccc_smc(SIP_IDVFS_SRAMLDOSET, mv_x100[k], 0, 0, 0,
+				      0, 0, 0, &res);
+			mdelay(2);
+			P("  SRAMLDOSET(%6u) -> %ld, 0x102222b0=%08x   %s",
+			  mv_x100[k], (long)res.a0, sread(0x102222b0),
+			  sram_ack_edge(r) ? "*** ACK ***" : "no ack");
+		}
+		arm_smccc_smc(SIP_IDVFS_SRAMLDOSET, 110000, 0, 0, 0, 0, 0, 0,
+			      &res);
+		base = sread(0x102222b0);
+	}
+
+	for (bit = 12; bit < 32; bit++) {
+		u32 v = base ^ BIT(bit);
+		bool ack;
+
+		swrite(0x102222b0, v);
+		udelay(200);
+		ack = sram_ack_edge(r);
+		P("  bit %-2d %s -> 0x102222b0 = %08x   %s", bit,
+		  (base & BIT(bit)) ? "clr" : "set", sread(0x102222b0),
+		  ack ? "*** ACK ***" : "no ack");
+		swrite(0x102222b0, base);
+		udelay(200);
+	}
+
+	/* and the whole upper half at once, in case it takes a combination */
+	swrite(0x102222b0, (base & 0xfff) | 0xfffff000);
+	udelay(500);
+	P("  all upper bits set (%08x): %s", sread(0x102222b0),
+	  sram_ack_edge(r) ? "*** ACK ***" : "no ack");
+	swrite(0x102222b0, base);
+	udelay(200);
+	P("  restored 0x102222b0 = %08x", sread(0x102222b0));
+}
+
 /* ---- the core itself ------------------------------------------------- */
 
 /*
@@ -1126,8 +1342,40 @@ static void release_core(int cpu)
 	  readl(spm + SPM_SLEEP_TIMER_STA),
 	  !!(readl(spm + SPM_SLEEP_TIMER_STA) & MP2_CPU0_WFI));
 
-	/* the last step of the table is PWR_RST_B = 1, i.e. the release */
-	atf_core_on(r, cpu);
+	/*
+	 * ATF's ACTUAL sequence for a big core — and note what is NOT in it.
+	 *
+	 *     *pwrcon &= ~PWR_RST_B ; *pwrcon |= PWR_ON
+	 *     while (!(CPU_PWR_STATUS & BIT(15 - cpu))) ;
+	 *     while (!(mcucfg(0x10222430 + idx*4) & BIT(17))) ;
+	 *     *pwrcon |= PWR_RST_B
+	 *
+	 * It never touches PWR_ISO, PWR_CLK_DIS, SRAM_PDN, SRAM_CKISO,
+	 * SRAM_ISOINT_B or SRAM_SLEEP_B — not for the cluster and not for the
+	 * core. Those are exactly the bits power_on_little() walks for an A53.
+	 * On MP2 the SPMC owns them, which is why the SRAM acks never move here
+	 * however they are driven: on this cluster they are not ours to drive,
+	 * and walking them by hand fights the sequencer instead of helping it.
+	 *
+	 * So do what ATF does, and nothing else.
+	 */
+	if (core_mode == 1) {
+		atf_core_on(r, cpu);
+	} else {
+		P("  ATF power_on_big() core sequence (SPMC owns the SRAM bits)");
+		writel(readl(r) & ~PWR_RST_B, r);
+		writel(readl(r) | PWR_ON, r);
+		udelay(2);
+		poll_bit_reg(spm + CPU_PWR_STATUS, 15 - cpu, true, 20000,
+			     "CPU_PWR_STATUS");
+		for (i = 0; i < 20000; i++) {
+			if (sread(spmc) & BIT(17))
+				break;
+			udelay(1);
+		}
+		P("    core SPMC 0x%08x = %08x after %d us", spmc, sread(spmc), i);
+		writel(readl(r) | PWR_RST_B, r);
+	}
 
 	P("  MP2_CPU%d=%08x  %s", idx, readl(r),
 	  readl(r) == readl(spm + 0x220) ? "*** IDENTICAL to a running core ***"
@@ -1254,6 +1502,11 @@ static int __init a72bu_init(void)
 
 	if (stage >= 6)
 		idvfs_enable();
+
+	if (stage == 9) {
+		hunt_sram_supply(cpu_target);
+		goto out;
+	}
 
 	if (make_mailbox_and_park()) {
 		P("could not build the instrument — refusing to report anything");

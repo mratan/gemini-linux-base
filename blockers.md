@@ -2651,6 +2651,89 @@ currently wrong in exactly this way, and nobody has looked.
 
 ## 🟡 B-40 — the two Cortex-A72 cores never come up, and there is no cpufreq at all
 
+### 2026-08-22 (FINAL): the A72 blocker is CPUHVFS, and this time it is measured
+
+**CSPM — the DVFS co-processor — is not running on our system at all.** Read
+directly, side by side with Android:
+
+| register | ours | Android |
+|---|---|---|
+| `PCM_TIMER_OUT` (0x11015150) | `0x00000000`, **not advancing** | `0x003637fc` |
+| `PCM_REG15` (0x1101513c) | `0x00000000` | `0x00000182` |
+| `PCM_FSM_STA` (0x11015178) | `0x00048490` | `0x00650640` |
+| `SW_RSV0..6` (0x11015608+) | all `0xBABEBABE` | `0x5ff0 0x2ff0 0x26f0 ...` |
+
+`0xBABEBABE` is the reset pattern — those words have never been written. **This
+directly contradicts the earlier entry's "CSPM runs correctly (`FSM_STA
+0x650640`, bit-identical to Android)".** It does not; ours is `0x00048490` and
+its timer is dead. Android's values came from
+`/sys/kernel/debug/cpuhvfs/dvfsp_reg` on a boot1 trip, ours from `devmem`.
+
+**Why that is the blocker, and why the ATF reading above was only half the
+story.** ATF's `power_on_cl3`/`power_on_big` really do only assert `PWR_ON` and
+poll — and that part *works*: with the prerequisites right, `CPU_PWR_STATUS`
+bit 17 asserts, `0x102222a0` goes to `0x00ba01xx`, the whole `0x102224xx` block
+comes alive, and all five of ATF's assertions match. But that is the **coarse**
+power switch only. Everything after it — clearing `PWR_ISO`, `PWR_CLK_DIS`,
+`SRAM_CKISO`, `SRAM_PDN`, and sequencing the SRAM — is the **PCM firmware's**
+job on this cluster, which is what Android's
+`[CPUHVFS] cluster2 on, swctrl = 0x25f0` is. With ATF's exact sequence and
+nothing else, `MP2_CPU0_PWR_CON` sits at `0x00010037`: powered, but still
+isolated, clock-disabled and SRAM down. A running A53 core reads `0x0001004d`.
+
+So **B-40's original CPUHVFS hypothesis was right**, and this session's
+"refutation" of it was drawn from ATF's code alone, which only ever shows the
+coarse half.
+
+#### What is now proven, and what it cost to prove
+
+* **The SRAM ack instrument is sound.** Validated on a known-good domain: with
+  cpu7 offlined, driving `MP1_CPU3_PWR_CON` SRAM_PDN 1->0 clears
+  `SRAM_PDN_ACK` in 0 polls and 0->1 sets it in 0 polls. On MP2 the same edge,
+  with the cluster powered and the SPMC acking, never produces an ack — at any
+  SRAM LDO voltage from 500 to 1200 mV, and with every single bit of
+  `0x102222b0[31:12]` flipped one at a time. **The SRAM LDO is not the gate.**
+* **VPROC2's voltage matters.** At the 1000 mV LK leaves, the SPMC ack is
+  *intermittent* — same inputs, different outcome, and a failure latches
+  (`0x102222a0` sticks at `0x042001xx` until a reboot; ATF's own retry, which
+  cycles `B_EXT_BUCK_ISO`, does not clear it). At **1180 mV it acked first try,
+  every time.** `vproc2_mv=` in `tools/a72-bringup` sets it.
+* **The rail needs to settle.** ~45 s between enabling VPROC2 and asserting
+  `PWR_ON` was the difference between acking and not, before the voltage fix.
+* **`0x10222700` (big spark / "sparkvretcntrl", the SRAM retention control)
+  reads 0 from cold and only accepts a write once the cluster is powered.**
+  Earlier runs saw `0x3f` there and concluded "already set" — only because a
+  previous run in the same boot had written it. It is now written as soon as
+  the write can land.
+* **Do not run the A53 MTCMOS tables on MP2.** ATF never touches MP2's
+  ISO/CLK/SRAM bits; on this cluster they belong to the SPMC, and driving them
+  by hand fights the sequencer. `core_mode=0` (the default) is ATF's sequence;
+  `core_mode=1` is the A53 table, kept only for comparison.
+* **ATF's `CPU_ON` is still unsafe**, and now by measurement rather than
+  suspicion: its frequency check reads abist source 37, and a full sweep of
+  sources 32-47 (with ATF's own `CLK_DBG_CFG` mask) shows 37 pinned at
+  `629992 kHz` along with 32/33/36/38/39/40/44 — it is not wired to the A72
+  clock here. 629992 satisfies neither the 742500+-15000 nor the 495000+-10000
+  window, so `power_on_cl3` would retry forever.
+
+#### The next step is the CPUHVFS port, and it is the last one
+
+`mt_cpufreq_hybrid.c` (2512 lines) plus `mt_cpufreq_hybrid_fw.h`
+(`dvfs_binary[]`) in `07-kernel/ubports-3.18/.../mt6797/`. The minimum is: map
+CSPM (0x11015000) and CSRAM (0x0012a000, 12K), reset the PCM, load the firmware
+image, kick it (`__cspm_kick_im_to_fetch()` hands the IM a **physical** address,
+so placement and EMI MPU permissions are part of the job), then drive the
+cluster-2 swctrl word.
+
+**The hazard has not changed and is now the main risk:** the vendor's i2c driver
+takes `cpuhvfs_get_dvfsp_semaphore(SEMA_I2C_DRV)` before every transfer on the
+`mediatek,appm_used` bus because the co-processor masters it too, and mainline's
+`i2c-mt65xx` knows nothing about that. i2c6 carries the CPU regulator and is in
+the path of **every** A53 DVFS transition since `#51`. Plan the semaphore before
+starting CSPM, not after.
+
+---
+
 ### 2026-08-22 (latest): ATF's real MTCMOS tables, and a self-inflicted stop
 
 Two findings and one mistake, all from continuing the session above.

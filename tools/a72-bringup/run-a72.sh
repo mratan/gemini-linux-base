@@ -15,10 +15,11 @@
 # NEVER reboot this device with anything but gemini-reboot. See B-40.
 set -eu
 DEV="${DEV:-root@10.15.19.82}"
+EXTRA="${EXTRA:-}"
 STAGE="${1:-5}"
 CPU="${2:-8}"
 SSH="ssh -o StrictHostKeyChecking=no -o ConnectTimeout=8"
 
 scp -o StrictHostKeyChecking=no gemini-a72-bringup.ko "$DEV":/tmp/
 # shellcheck disable=SC2029
-$SSH "$DEV" "dmesg -C; insmod /tmp/gemini-a72-bringup.ko stage=$STAGE cpu_target=$CPU; sleep 1; dmesg"
+$SSH "$DEV" "dmesg -C; insmod /tmp/gemini-a72-bringup.ko stage=$STAGE cpu_target=$CPU $EXTRA; sleep 1; dmesg"
