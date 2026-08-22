@@ -2651,6 +2651,84 @@ currently wrong in exactly this way, and nobody has looked.
 
 ## 🟡 B-40 — the two Cortex-A72 cores never come up, and there is no cpufreq at all
 
+### 2026-08-22 (FINAL+2): the unpause is fixed, and the PCM owns MP2's sequencer
+
+**The instant death was the seeding, and it is fixed.** Writing the real
+current state instead of `V_CURR(0)|VS_CURR(0)` makes the unpause survivable:
+
+```
+LL  hwsta = 0x000f4d00  (opp 15 -> fw 0, vproc 0x4d, vsram 0x0f)
+B   hwsta = 0x000b5800  (opp 15 -> fw 0, vproc 0x58, vsram 0x0b)
+...
++300 ms  MP2=0x00010133  B=0x000050f0  FSM=0x00648640
+final MP2_CPUSYS_PWR_CON = 0x00010133
+```
+
+Cluster B unpaused (`SW_PAUSE` clear, `CLUSTER_EN` set), firmware cycling, and
+**the machine lives**. The encodings were checked against live registers:
+`VOLT_TO_EXTBUCK_VAL` reproduces the DA9214 code we read, `VOLT_TO_PMIC_VAL`
+reproduces the on-die LDO vosel. `cspm-probe` now takes them as module params
+(`v_ll/v_l/v_b/v_cci`, `vs_*`, `f_*`) so they can be computed from the live
+rails and eyeballed before the co-processor is ever let go.
+
+**But unpausing does not power the cluster** — MP2 stays at `0x00010133`. The
+PCM participates in cluster power-on; it does not initiate it.
+
+#### And once the PCM runs, it owns the SPMC
+
+With the PCM running — **paused or unpaused, it makes no difference** — our
+manual `PWR_ON` is refused outright. `0x102222a0` reads `0x04200120` from the
+very first attempt and bit 17 never comes, through all 8 of ATF's
+isolation-cycling retries. Without the PCM the same sequence acks first try and
+takes the cluster to `0x0001004d`.
+
+So the two halves are mutually exclusive as currently driven:
+
+| | SPMC ack | SRAM/ISO sequenced | cores fetch |
+|---|---|---|---|
+| PCM dead, manual/ATF sequence | **yes** | no | no |
+| PCM running, manual sequence | **no** | — | no |
+
+That is not a contradiction, it is the interlock: on Android the kernel drives
+`cpu_power_on_buck()` → PSCI `CPU_ON` → ATF, and CPUHVFS is notified through
+`cpuhvfs_notify_cluster_on()` as part of the hotplug callbacks. Poking
+`CLUSTER_EN` in `SW_RSV2` is not that protocol.
+
+#### PSCI CPU_ON with the PCM running: still hangs
+
+Tried, because it is exactly Android's arrangement and the earlier "unsafe"
+call had been made with the PCM dead — which is the variable that ought to make
+ATF's frequency check pass. Prerequisites in place, PCM running with cluster B
+enabled and paused, `0x102222a0 = 0x00480100` (the good family), then
+`echo 1 > cpu8/online`. **The machine hung**, consistent with ATF's unbounded
+frequency-retry loop; the ATF ring is zeroed on the next boot so its own
+narration of the spin was not recoverable.
+
+#### The recovery is hands-free and reliable
+
+Every hang and every download-mode park this session was recovered with **no
+human**:
+
+    03-tools/uhubctl/uhubctl -l 1-10 -p 1 -a off
+    # hold down 60-90 s, across the watchdog reset
+    03-tools/uhubctl/uhubctl -l 1-10 -p 1 -a on
+
+Back in ~55 s with 8 CPUs, every time. `gemini-state.py` still claims
+DOWNLOAD_MODE "needs hands"; it does not. (This does **not** rescue a board
+that is actually powered off — nothing on the port at all is still the button.)
+
+#### What is left
+
+Port the real cluster-on protocol out of `mt_cpufreq_hybrid.c` —
+`cpuhvfs_notify_cluster_on()` / `cpuhvfs_notify_cluster_off()` and the
+semaphore interlock — and call it from the CPU hotplug path around PSCI
+`CPU_ON`, rather than writing `CLUSTER_EN` by hand. The i2c6 semaphore
+(`cspm_get_semaphore(SEMA_I2C_DRV)` = pause the PCM around every transfer on
+the `mediatek,appm_used` bus) has to go into `i2c-mt65xx` at the same time, or
+the CPU regulator and the co-processor will collide.
+
+---
+
 ### 2026-08-22 (FINAL+1): CPUHVFS RUNS. And unpausing it takes the machine down instantly.
 
 **The DVFS co-processor is running on Linux on this device for the first time.**

@@ -175,6 +175,23 @@
 #define OFFS_PAUSE_SRC		0x0330
 #define OFFS_FW_RSV3		0x02b0
 
+/*
+ * The live rail state, in the firmware's own encodings. Defaults are the
+ * values measured on this board; override per run if the rails have moved.
+ *   v_*  : DA9214 vosel, (mV*100 - 30000 + 999)/1000   -- 0x4d = 1070 mV
+ *   vs_* : SRAM LDO vosel, (mV*100 - 90000 + 2499)/2500 + 3 -- 0xf = 1200 mV
+ *   f_*  : SOFTWARE opp index, 0 = highest of the 16
+ */
+static int v_ll = 0x4d, v_l = 0x4d, v_cci = 0x4d, v_b = 0x58;
+static int vs_ll = 0xf, vs_l = 0xf, vs_cci = 0xf, vs_b = 0xb;
+static int f_ll = 15, f_l = 15, f_cci = 15, f_b = 15;
+module_param(v_ll, int, 0444);   module_param(v_l, int, 0444);
+module_param(v_cci, int, 0444);  module_param(v_b, int, 0444);
+module_param(vs_ll, int, 0444);  module_param(vs_l, int, 0444);
+module_param(vs_cci, int, 0444); module_param(vs_b, int, 0444);
+module_param(f_ll, int, 0444);   module_param(f_l, int, 0444);
+module_param(f_cci, int, 0444);  module_param(f_b, int, 0444);
+
 static int stage = 1;
 module_param(stage, int, 0444);
 MODULE_PARM_DESC(stage, "1 = load+verify only, 2 = also kick PCM, 3 = also enable cluster B");
@@ -371,9 +388,47 @@ static void kick_pcm_to_run(void)
 		P("  cluster%d swctrl = 0x%08x (SW_PAUSE set)", i, cr(SW_RSV(i)));
 	}
 
-	for (i = 0; i < NUM_CPU_CLUSTER; i++)
-		cw(SW_RSV(3 + i), F_CURR(opp_sw_to_fw(NUM_CPU_OPP - 1)) |
-				  V_CURR(0) | VS_CURR(0));
+	/*
+	 * THE CURRENT-STATE WORDS, AND THE BUG THAT KILLED THE MACHINE.
+	 *
+	 * This used to write V_CURR(0) | VS_CURR(0) — telling the firmware every
+	 * cluster is sitting at 0 V. An unpaused firmware that believes that will
+	 * drive the PMIC to "correct" it, and VPROC is BUCKA: LL, L and CCI, the
+	 * clusters this kernel is running on. Clearing SW_PAUSE with those words
+	 * in place killed the SoC instantly, three times out of three, with
+	 * netconsole cut off mid-printk — a rail event, not a hang.
+	 *
+	 * The vendor seeds the truth (mt_cpufreq.c __set_cpuhvfs_init_sta):
+	 *
+	 *   F_CURR(opp_sw_to_fw(sta->opp[i])) | V_CURR(sta->volt[i])
+	 *                                     | VS_CURR(sta->vsram[i])
+	 *
+	 * with volt = VOLT_TO_EXTBUCK_VAL()  = (mV*100 - 30000 + 999)/1000, the
+	 *                                      DA9214 vosel code, and
+	 *      vsram = VOLT_TO_PMIC_VAL()    = (mV*100 - 90000 + 2499)/2500 + 3,
+	 *                                      the SRAM LDO vosel.
+	 * Both were checked against live register reads: BUCKA at 1070 mV really
+	 * does read 0x4d, and the on-die VSRAM LDO at 1200 mV really does read
+	 * 0xf.
+	 *
+	 * These come in as module parameters rather than being read here, so the
+	 * values can be computed from the live rails and eyeballed before the
+	 * co-processor is ever unpaused.
+	 */
+	{
+		static const char *nm[NUM_CPU_CLUSTER] = { "LL", "L", "B", "CCI" };
+		u32 v[NUM_CPU_CLUSTER]  = { v_ll, v_l, v_b, v_cci };
+		u32 vs[NUM_CPU_CLUSTER] = { vs_ll, vs_l, vs_b, vs_cci };
+		u32 f[NUM_CPU_CLUSTER]  = { f_ll, f_l, f_b, f_cci };
+
+		for (i = 0; i < NUM_CPU_CLUSTER; i++) {
+			cw(SW_RSV(3 + i), F_CURR(opp_sw_to_fw(f[i])) |
+					  V_CURR(v[i]) | VS_CURR(vs[i]));
+			P("  %-3s hwsta = 0x%08x  (opp %u -> fw %u, vproc 0x%02x, vsram 0x%02x)",
+			  nm[i], cr(SW_RSV(3 + i)), f[i], opp_sw_to_fw(f[i]),
+			  v[i], vs[i]);
+		}
+	}
 
 	writel(BIT(0) /* PSF_PAUSE_INIT */, csram + OFFS_PAUSE_SRC);
 
