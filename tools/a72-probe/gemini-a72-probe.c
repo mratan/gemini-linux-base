@@ -69,6 +69,8 @@
 #include <linux/clk.h>
 #include <linux/of.h>
 #include <linux/clk-provider.h>
+#include <linux/dma-mapping.h>
+#include <linux/platform_device.h>
 #include <asm/cacheflush.h>
 
 #define CLK_INFRA_DEVICE_APC	47
@@ -107,6 +109,40 @@ static long do_smc(const char *what, u32 fn, u64 a1, u64 a2, u64 a3)
  */
 #define AARCH64_WFI		0xd503207fu
 #define AARCH64_B_BACK_ONE	0x17ffffffu
+
+/*
+ * A better park stub: announce, then park. Assembled with the cross toolchain
+ * and checked against objdump, not hand-encoded.
+ *
+ *     movz x0, #0x5644 ; movk x0, #0x1101, lsl #16   -> CSPM_SW_RSV15
+ *     movz w1, #0x72a7 ; movk w1, #0xa72a, lsl #16   -> 0xa72a72a7
+ *     str  w1, [x0] ; dsb sy ; 1: wfi ; b 1b
+ *
+ * The A72 comes out of CPU_ON with MMU and caches off, so a plain store to a
+ * known physical address is the one thing it can reliably do.
+ *
+ * THE MAILBOX HAS TO BE SOMETHING BOTH SIDES CAN ACTUALLY USE, and the first
+ * attempt was not: it targeted CSPM_SW_RSV15, which turns out to be
+ * unwritable — a kernel store of 0 left it reading 0xbabebabe. So the A72
+ * could not have written it either, and the resulting "A72 never executed"
+ * verdict was unsupported. A test whose two answers look identical is not a
+ * test.
+ *
+ * The mailbox is now a dma_alloc_coherent() buffer: uncached on this side, a
+ * plain physical address on the A72's side, and its address is patched into
+ * the MOVZ/MOVK pair at runtime. Before trusting any result, the probe writes
+ * and reads back the mailbox itself, so "the A72 did not write" can be
+ * distinguished from "nothing could have".
+ */
+static const u32 a72_announce_stub[] = {
+	0xd28ac880, 0xf2a22020, 0x528e54e1, 0x72b4e541,
+	0xb9000001, 0xd5033f9f, 0xd503207f, 0x17ffffff,
+};
+#define A72_MAGIC		0xa72a72a7u
+
+/* MOVZ Xd,#imm16 and MOVK Xd,#imm16,lsl#16 with Rd=0, as objdump confirmed */
+#define MOVZ_X0(imm)	(0xd2800000u | (((imm) & 0xffffu) << 5))
+#define MOVK_X0_16(imm)	(0xf2a00000u | (((imm) & 0xffffu) << 5))
 
 #define SPM_PHYS		0x10006000UL
 #define SPM_SIZE		0x1000
@@ -229,6 +265,9 @@ static void power_on_buck(void)
 }
 
 static phys_addr_t park_pa;
+static u32 *mbox;
+static dma_addr_t mbox_dma;
+static struct platform_device *mbox_pdev;
 
 static int cpu_on_thread(void *unused)
 {
@@ -244,7 +283,7 @@ static int cpu_on_thread(void *unused)
 
 static int make_park_page(void)
 {
-	u32 *park = (u32 *)__get_free_page(GFP_KERNEL);
+	u32 *park = (u32 *)__get_free_page(GFP_KERNEL | GFP_DMA32);
 	int w;
 
 	if (!park)
@@ -253,6 +292,10 @@ static int make_park_page(void)
 		park[w]     = AARCH64_WFI;
 		park[w + 1] = AARCH64_B_BACK_ONE;
 	}
+	/* the announce stub goes at the entry point, with the mailbox patched in */
+	memcpy(park, a72_announce_stub, sizeof(a72_announce_stub));
+	park[0] = MOVZ_X0((u32)mbox_dma);
+	park[1] = MOVK_X0_16((u32)mbox_dma >> 16);
 	caches_clean_inval_pou((unsigned long)park, (unsigned long)park + PAGE_SIZE);
 	park_pa = virt_to_phys(park);
 	P("park page at VA %px PA 0x%llx (wfi; b .-4), deliberately leaked",
@@ -468,6 +511,97 @@ static int __init a72_probe_init(void)
 	 * unlike MCUCFG we CAN write, and it currently selects 0 = CLKSQ.
 	 * Walk it through all four sources and watch the acks.
 	 */
+	/*
+	 * stage 10: power MP2 by hand, then ask ATF for cpu8, while polling a
+	 * scratch register the A72's entry stub writes.
+	 *
+	 * This exists because pre-powering the domain changed CPU_ON's failure
+	 * from "spins forever" to "resets the SoC in ~300 ms" -- a different
+	 * and more interesting failure, consistent with the core actually
+	 * starting. The magic in CSPM_SW_RSV15 settles whether it does.
+	 */
+	if (stage == 10) {
+		u32 seen = 0;
+
+		mbox_pdev = platform_device_register_simple("gemini-a72-probe",
+							   PLATFORM_DEVID_AUTO,
+							   NULL, 0);
+		if (IS_ERR(mbox_pdev)) {
+			P("no staging device for the mailbox");
+			goto out;
+		}
+		if (dma_coerce_mask_and_coherent(&mbox_pdev->dev, DMA_BIT_MASK(32))) {
+			P("no 32-bit DMA mask");
+			goto out;
+		}
+		mbox = dma_alloc_coherent(&mbox_pdev->dev, PAGE_SIZE, &mbox_dma,
+					  GFP_KERNEL);
+		if (!mbox) {
+			P("no mailbox");
+			goto out;
+		}
+
+		/* prove the mailbox works before believing anything it says */
+		*mbox = 0;
+		if (*mbox != 0) {
+			P("mailbox will not clear — aborting, it could not tell us anything");
+			goto out;
+		}
+		*mbox = 0x5a5a5a5a;
+		if (*mbox != 0x5a5a5a5a) {
+			P("mailbox will not hold a value — aborting");
+			goto out;
+		}
+		*mbox = 0;
+		P("mailbox at PA 0x%llx verified writable and readable, cleared to 0x%08x",
+		  (unsigned long long)mbox_dma, *mbox);
+
+		if (make_park_page()) {
+			P("no park page");
+			goto out;
+		}
+		P("stub patched: %08x %08x (mailbox 0x%llx)", ((u32 *)phys_to_virt(park_pa))[0],
+		  ((u32 *)phys_to_virt(park_pa))[1], (unsigned long long)mbox_dma);
+
+		/* hand power-up, same as stage 7 */
+		writel(readl(spm + MP2_PWR_CON) | PWR_ON, spm + MP2_PWR_CON);
+		udelay(50);
+		writel(readl(spm + MP2_PWR_CON) | PWR_ON_2ND, spm + MP2_PWR_CON);
+		mdelay(1);
+		writel(readl(spm + MP2_PWR_CON) & ~PWR_CLK_DIS, spm + MP2_PWR_CON);
+		writel(readl(spm + MP2_PWR_CON) & ~PWR_ISO, spm + MP2_PWR_CON);
+		writel(readl(spm + MP2_PWR_CON) & ~SRAM_PDN, spm + MP2_PWR_CON);
+		udelay(100);
+		writel(readl(spm + MP2_PWR_CON) | SRAM_ISOINT_B, spm + MP2_PWR_CON);
+		writel(readl(spm + MP2_PWR_CON) & ~SRAM_CKISO, spm + MP2_PWR_CON);
+		writel(readl(spm + MP2_PWR_CON) | SRAM_SLEEP_B, spm + MP2_PWR_CON);
+		writel(readl(spm + MP2_PWR_CON) | PWR_RST_B, spm + MP2_PWR_CON);
+		mdelay(2);
+		P("MP2 hand-powered to 0x%08x", readl(spm + MP2_PWR_CON));
+
+		P("asking ATF for cpu8, entry 0x%llx, polling the scratch reg",
+		  (unsigned long long)park_pa);
+		mdelay(50);
+		kthread_run(cpu_on_thread, NULL, "a72-cpuon");
+
+		for (i = 0; i < 60; i++) {
+			mdelay(10);
+			v = *mbox;
+			if (v == A72_MAGIC && !seen) {
+				seen = 1;
+				P("  *** +%d ms  MAILBOX = 0x%08x — THE A72 EXECUTED CODE ***",
+				  (i + 1) * 10, v);
+			}
+			if ((i % 10) == 9)
+				P("  +%3d ms mailbox=0x%08x MP2=0x%08x", (i + 1) * 10,
+				  v, readl(spm + MP2_PWR_CON));
+		}
+		P("final mailbox = 0x%08x  (%s)", *mbox,
+		  *mbox == A72_MAGIC ? "A72 RAN — the core fetched and executed"
+				     : "A72 did not write — and the mailbox was proven working");
+		goto out;
+	}
+
 	if (stage == 9) {
 		void __iomem *mcumixed = ioremap(0x1001a000, 0x1000);
 		static const char * const src[] = { "CLKSQ 26M", "ARMPLL",

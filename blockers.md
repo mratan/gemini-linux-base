@@ -2651,6 +2651,59 @@ currently wrong in exactly this way, and nobody has looked.
 
 ## 🟡 B-40 — the two Cortex-A72 cores never come up, and there is no cpufreq at all
 
+### FINAL for this session: the A72 core does not execute, and the diagnosis is coherent
+
+The last open question was whether the cores actually start once the domain
+looks powered. They do not, and this time the instrument was proven able to say
+otherwise before it was believed.
+
+The A72's entry point is a hand-assembled stub (checked against objdump) that
+writes a magic word to a mailbox and then parks:
+
+```
+movz x0,#lo ; movk x0,#hi,lsl#16 ; movz w1,#0x72a7 ; movk w1,#0xa72a,lsl#16
+str w1,[x0] ; dsb sy ; 1: wfi ; b 1b
+```
+
+With MP2 hand-powered to 0x0001004d, a park page at PA 0x44c01000 and a mailbox
+at PA 0x44c3e000: **the mailbox stayed 0x00000000 for 600 ms.** The A72 fetched
+and executed nothing.
+
+**Two instrument failures had to be fixed before that result meant anything,
+and both are the same mistake this project keeps making.**
+
+* The first mailbox was `CSPM_SW_RSV15`. A kernel store of 0 left it reading
+  `0xbabebabe` — it is not writable, so the A72 could not have written it
+  either, and the "never executed" verdict it produced said nothing. The probe
+  now writes and reads back the mailbox first and refuses to report if that
+  fails.
+* The park page was being allocated with plain `GFP_KERNEL` and landed at PA
+  `0x10a41c000`, **above 4 GB**, so the entry point itself was suspect. Now
+  `GFP_DMA32`.
+
+Worth noting the correlation that exposed the second one: the single run whose
+failure looked *different* — a hard reset in ~300 ms instead of the usual slow
+wedge — was the one run whose park page happened to land below 4 GB.
+
+**The coherent picture.** Every MTCMOS bit reaches the value a running cluster
+has except `SRAM_SLEEP_B_ACK`; neither SRAM ack ever responds in any state or
+at any clock source; and the cores do not execute. That is one fault, not
+three: **the MP2 SRAM has no supply**, so its control logic cannot acknowledge
+and its cores cannot run.
+
+The supply is set by `BigiDVFSSRAMLDOSet()` → `0x102222b0` in MCUCFG →
+unreachable from the non-secure world → SMC `0xC20003BF`, which **returns 0 and
+has no observable effect**.
+
+**So the whole A72 blocker now reduces to one sentence:** we cannot power the
+big cluster's SRAM, because the only interface to it is a secure call that
+silently does nothing on this firmware.
+
+Everything else on the path is solved and reproducible: the buck, the
+isolation, the MTCMOS sequence, and the SMCs that do work.
+
+---
+
 ### NARROWED TO ONE BIT, same evening: MP2 reaches 0x0001004d and only SRAM_SLEEP_B_ACK is missing
 
 Driving the whole cluster MTCMOS sequence by hand — with the buck

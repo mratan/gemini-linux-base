@@ -1408,6 +1408,22 @@ deps_/mercury/data/projects/gemini_linux/07-kernel/wt-main/tools/a72-probe/gemin
     $(wildcard include/config/HAVE_CLK) \
   include/linux/clk-provider.h \
   include/linux/of_clk.h \
+  include/linux/dma-mapping.h \
+    $(wildcard include/config/DMA_API_DEBUG) \
+    $(wildcard include/config/HAS_DMA) \
+    $(wildcard include/config/NEED_DMA_MAP_STATE) \
+  include/linux/scatterlist.h \
+    $(wildcard include/config/NEED_SG_DMA_LENGTH) \
+    $(wildcard include/config/NEED_SG_DMA_FLAGS) \
+    $(wildcard include/config/DEBUG_SG) \
+    $(wildcard include/config/SGL_ALLOC) \
+    $(wildcard include/config/ARCH_NO_SG_CHAIN) \
+    $(wildcard include/config/SG_POOL) \
+  include/linux/mem_encrypt.h \
+    $(wildcard include/config/ARCH_HAS_MEM_ENCRYPT) \
+  include/linux/platform_device.h \
+    $(wildcard include/config/HIBERNATE_CALLBACKS) \
+    $(wildcard include/config/SUPERH) \
 
 /mercury/data/projects/gemini_linux/07-kernel/wt-main/tools/a72-probe/gemini-a72-probe.o: $(deps_/mercury/data/projects/gemini_linux/07-kernel/wt-main/tools/a72-probe/gemini-a72-probe.o)
 
