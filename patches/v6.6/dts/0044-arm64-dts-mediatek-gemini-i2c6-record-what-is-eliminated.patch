@@ -51,9 +51,18 @@ i2c-mt65xx knows nothing about that property. If a hardware power-management
 engine also masters this bus, our transfers would be colliding with its.
 That is the next hypothesis and it is untested.
 
+
+UPDATE: the cause was found in the vendor driver, not in this node. MT6797's
+APPM controller packs both write-then-read lengths into TRANSFER_LEN, and
+mainline was writing the read length to TRANSFER_LEN_AUX, leaving it zero —
+address phase fine, data phase empty, every register 0x00. Fixed in
+i2c/0001. This node now also carries `mediatek,appm_used`, which is how the
+driver knows which controller that is; the vendor DTB carries it here and
+nowhere else.
+
 --- a/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
 +++ b/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
-@@ -750,35 +750,49 @@
+@@ -750,36 +750,60 @@
  &i2c6 {
  	pinctrl-names = "default";
  	pinctrl-0 = <&i2c6_pins_a>;
@@ -124,5 +133,16 @@ That is the next hypothesis and it is untested.
 +	clock-frequency = <400000>;
 +	/* Vendor DTB carries this on i2c@1100e000; one master, one slave. */
  	mediatek,use-push-pull;
++	/*
++	 * This is the APPM controller — the one the CPU DVFS co-processor
++	 * shares — and on MT6797 that changes how a write-then-read length is
++	 * programmed: both halves go in TRANSFER_LEN, not TRANSFER_LEN_AUX.
++	 * The vendor DTB carries this property here and nowhere else, and its
++	 * driver keys the packed-length path off exactly it. Without it every
++	 * register on this bus reads back 0x00 while the address phase works,
++	 * which is the whole of B-45.
++	 */
++	mediatek,appm_used;
  	status = "okay";
  };
+ 

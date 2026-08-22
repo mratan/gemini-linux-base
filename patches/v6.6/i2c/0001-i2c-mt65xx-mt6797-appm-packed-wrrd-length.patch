@@ -1,0 +1,130 @@
+i2c: mt65xx: mt6797's APPM controller packs both write-then-read lengths
+
+MT6797 has one I2C controller that the CPU DVFS co-processor shares, marked
+`mediatek,appm_used` in the device tree. On that controller a combined
+write-then-read takes BOTH lengths in TRANSFER_LEN — write length in bits
+[7:0], read length in bits [12:8] — while every other controller on the same
+SoC uses the separate TRANSFER_LEN_AUX register.
+
+Program it the ordinary way and the address phase completes normally while the
+read length stays zero, so the data phase transfers nothing: every register on
+the bus reads back 0x00 on hardware that is otherwise perfectly healthy.
+
+That is the entire content of gemini_linux issue #57 / B-45, which cost three
+sessions and eliminated, in turn, the pinmux (vendor and ours both have
+GPIO151/152 in mode 1), the clock divider (0x0a on both sides), the pull-ups
+(both pads read DIN = 1, idle-high), the bus speed (the vendor's 3.4 MHz makes
+it worse), and the chip's presence (it ACKs and accepts writes at 0x68-0x6b).
+None of those was ever the problem.
+
+Mainline already implements the packed form — it is the `aux_len_reg = 0`
+branch — but it is a per-SoC choice there, and on MT6797 it is a per-CONTROLLER
+one: i2c7 next door reads its RT5735 correctly with the AUX register. So this
+adds an `idvfs_i2c` flag and keys the packed path off `appm && idvfs_i2c`,
+which is exactly the condition the vendor 3.18 driver uses
+(drivers/i2c/busses/i2c-mtk.c, `mt6797_compat.idvfs_i2c = 1`; mt6735 and
+mt6757 have 0, so it is a property of this SoC rather than the generation).
+
+This also replaces the previous entry, which aliased mt6797 to mt8173_compat.
+That was right about the generation and wrong about this one field — the
+fourth register-level defect in this port to come from "modelled on another
+MediaTek SoC".
+
+--- a/drivers/i2c/busses/i2c-mt65xx.c
++++ b/drivers/i2c/busses/i2c-mt65xx.c
+@@ -267,6 +267,14 @@
+ 	unsigned char dma_sync: 1;
+ 	unsigned char ltiming_adjust: 1;
+ 	unsigned char apdma_sync: 1;
++	/*
++	 * On this SoC the controller that the CPU DVFS co-processor shares
++	 * ("mediatek,appm_used") packs BOTH halves of a write-then-read
++	 * length into TRANSFER_LEN instead of using TRANSFER_LEN_AUX, even
++	 * though every other controller on the same SoC uses the AUX
++	 * register. See the appm handling in mtk_i2c_do_transfer().
++	 */
++	unsigned char idvfs_i2c: 1;
+ 	unsigned char max_dma_support;
+ };
+ 
+@@ -295,6 +303,7 @@
+ 	struct clk_bulk_data clocks[I2C_MT65XX_CLK_MAX]; /* clocks for i2c */
+ 	bool have_pmic;			/* can use i2c pins from PMIC */
+ 	bool use_push_pull;		/* IO config push-pull mode */
++	bool appm;			/* shared with the CPU DVFS processor */
+ 
+ 	u16 irq_stat;			/* interrupt status */
+ 	unsigned int clk_src_div;
+@@ -454,6 +463,28 @@
+ 	.max_dma_support = 32,
+ };
+ 
++/*
++ * MT6797's I2C block is the MT8173 generation — v1 register layout, auto
++ * restart, WRRD via DIR_CHANGE, 33-bit DMA — with one documented exception:
++ * idvfs_i2c, which changes how a write-then-read length is programmed on the
++ * controller the CPU DVFS processor shares. The vendor 3.18 driver sets
++ * .idvfs_i2c = 1 for mt6797 and 0 for mt6735/mt6757, so it is a property of
++ * this SoC and not of the generation.
++ */
++static const struct mtk_i2c_compatible mt6797_compat = {
++	.regs = mt_i2c_regs_v1,
++	.pmic_i2c = 0,
++	.dcm = 1,
++	.auto_restart = 1,
++	.aux_len_reg = 1,
++	.timing_adjust = 0,
++	.dma_sync = 0,
++	.ltiming_adjust = 0,
++	.apdma_sync = 0,
++	.idvfs_i2c = 1,
++	.max_dma_support = 33,
++};
++
+ static const struct mtk_i2c_compatible mt8173_compat = {
+ 	.regs = mt_i2c_regs_v1,
+ 	.pmic_i2c = 0,
+@@ -525,6 +556,7 @@
+ 	{ .compatible = "mediatek,mt2712-i2c", .data = &mt2712_compat },
+ 	{ .compatible = "mediatek,mt6577-i2c", .data = &mt6577_compat },
+ 	{ .compatible = "mediatek,mt6589-i2c", .data = &mt6589_compat },
++	{ .compatible = "mediatek,mt6797-i2c", .data = &mt6797_compat },
+ 	{ .compatible = "mediatek,mt7622-i2c", .data = &mt7622_compat },
+ 	{ .compatible = "mediatek,mt7981-i2c", .data = &mt7981_compat },
+ 	{ .compatible = "mediatek,mt7986-i2c", .data = &mt7986_compat },
+@@ -1064,7 +1096,26 @@
+ 
+ 	/* Set transfer and transaction len */
+ 	if (i2c->op == I2C_MASTER_WRRD) {
+-		if (i2c->dev_comp->aux_len_reg) {
++		/*
++		 * The APPM controller is the exception on this SoC: it takes
++		 * both lengths in TRANSFER_LEN, write length in bits [7:0]
++		 * and read length in bits [12:8], while its siblings use the
++		 * separate AUX register. Writing the read length to AUX here
++		 * leaves the read length at zero, so the address phase
++		 * completes normally and the data phase transfers nothing —
++		 * every register reads back 0x00 on a bus that is otherwise
++		 * perfectly healthy. That is B-45 / gemini_linux#57, and it
++		 * cost three sessions.
++		 *
++		 * Condition and bit layout both taken from the vendor 3.18
++		 * driver, drivers/i2c/busses/i2c-mtk.c: it applies exactly
++		 * when (i2c->appm && dev_comp->idvfs_i2c).
++		 */
++		if (i2c->appm && i2c->dev_comp->idvfs_i2c) {
++			mtk_i2c_writew(i2c, (msgs->len & 0xff) |
++					    ((((msgs + 1)->len) << 8) & 0x1f00),
++					    OFFSET_TRANSFER_LEN);
++		} else if (i2c->dev_comp->aux_len_reg) {
+ 			mtk_i2c_writew(i2c, msgs->len, OFFSET_TRANSFER_LEN);
+ 			mtk_i2c_writew(i2c, (msgs + 1)->len,
+ 					    OFFSET_TRANSFER_LEN_AUX);
+@@ -1367,6 +1418,7 @@
+ 	i2c->have_pmic = of_property_read_bool(np, "mediatek,have-pmic");
+ 	i2c->use_push_pull =
+ 		of_property_read_bool(np, "mediatek,use-push-pull");
++	i2c->appm = of_property_read_bool(np, "mediatek,appm_used");
+ 
+ 	i2c_parse_fw_timings(i2c->dev, &i2c->timing_info, true);
+ 
