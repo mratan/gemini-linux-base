@@ -1959,6 +1959,112 @@ untouched throughout.
 
 ## 🔴 B-47 — eight cores at maximum takes the machine down, and the battery sags 620 mV first
 
+### ANSWERED 2026-08-22, same evening: it is a total-power limit, not a frequency limit
+
+Netconsole armed and proven to deliver first, every step announced to
+`/dev/kmsg` **before** it was taken, so the step that kills the machine still
+names itself. Two experiments, the second run twice.
+
+**Staircase** — all eight cores loaded, ceiling raised one OPP pair at a time,
+20 s per step:
+
+| LL / L | vbat | result |
+|---|---|---|
+| 624 / 650 MHz | 4.164 V | held |
+| 806 / 832 | 4.164 V | held |
+| 1014 / 1092 | 4.164 V | held |
+| 1222 / 1209 | 4.164 V | held |
+| **1391 / 1495** | **4.044 V** | **held — the highest proven all-core point** |
+| **1495 / 1755** | — | **DEAD, in under 20 s** |
+
+**Core count at the very top** — both clusters pinned at 1547/2002 MHz, cores
+added in cluster-balanced pairs. Run twice, same answer both times:
+
+| cores | vbat | result |
+|---|---|---|
+| 2 | 4.164 V (flat) | survived |
+| 4 | 4.144 V | survived |
+| 6 | 3.90 V / 3.80 V | **survived** |
+| 8 | — | not attempted; the staircase already showed 8 dies below this |
+
+**So maximum frequency is fine on up to six cores.** What kills this machine is
+all eight at once near the top of the tables. That is a total-power ceiling,
+and it means a flat frequency cap is the wrong shape of fix in principle —
+though it is the only one available in stock cpufreq, see below.
+
+**The death is silent, and that is the result.** netconsole's last line is the
+announcement of the fatal step and then nothing at all: no regulator
+complaint, no thermal event, no oops, no panic. B-47 asked for exactly this
+distinction and named the third case the signature of a supply collapse. A
+kernel that stops mid-instruction without a word did not have time to log.
+
+Two supporting observations point the same way. The charger thermal zone never
+moved off 38 °C through any of it, so nothing suggests heat. And the second
+death was reclaimed by the watchdog in ~30 s, where the first left the device
+parked in the preloader needing hands — consistent with how completely the rail
+collapsed each time, and a reminder that recovery is not guaranteed.
+
+### AND THE FIRST CAP WAS WRONG, for a reason worth keeping
+
+The obvious mitigation was to cap at 1391/1495 MHz — the highest point that had
+*survived* a 20 s hold. Installed, and then given the workload it exists to
+survive: eight cores for 120 s. **It died too, at ~110 s.** The battery trace is
+the whole explanation:
+
+```
+4.164 -> 4.004 -> 3.964 -> 3.924 -> 3.864 -> 3.764 -> dead
+```
+
+**This is an energy limit, not only an instantaneous one.** The pack drains
+faster than a 2.2 W hub port refills it (B-42), the voltage walks down under
+sustained load, and the rail lets go when it gets low enough. Frequency sets how
+fast that walk is, not whether it happens. "Survived 20 s" was never evidence of
+safety, and a test shorter than the depletion time could not have shown it.
+
+### The cap that holds, and the criterion that chose it
+
+Re-read the staircase with the right question. Through the first four steps the
+pack sat at **exactly 4.164 V — not one 20 mV ADC step of movement** — across
+624/650, 806/832, 1014/1092 and 1222/1209, some 80 s of cumulative eight-core
+load. The first movement of any kind was at 1391/1495. So the criterion is not
+"survived" but **"no measurable drain"**: below that line the charger keeps up
+and the load is sustainable rather than merely endurable.
+
+**Mitigation, installed and accepted:** `gemini-cpufreq-cap`
+(`device-config/sbin/`, plus a systemd unit) pins `scaling_max_freq` at
+**1222 MHz / 1209 MHz**. Acceptance test — eight cores for **240 s**, twice the
+duration that exposed the first cap's mistake:
+
+```
+t=30..150s   vbat 4124000, flat, not one ADC step
+t=180s       vbat 4164000     <- rising: net charging under full load
+t=240s       vbat 4124000
+SURVIVED. ended at 4.164 V, above the 4.144 V it started at
+```
+
+It is userspace, so lifting it for a burst on a few cores is two `echo`s and no
+reflash, and the kernel keeps the full capability it has demonstrably got — six
+cores at the very top of both tables is proven twice. It defaults on because
+`make -j8` is exactly the fatal shape.
+
+**The honest cost:** 1209 MHz on the big-little cluster is marginally *below*
+the 1274 MHz the bootloader used to leave it at. Under schedutil that ceiling
+only binds when all eight cores are genuinely busy, which is the case this
+exists to survive.
+
+**The lead worth chasing before accepting any of this as permanent.** The device
+is on an Anker hub port measured at **~445 mA**, about 2.2 W — `gemini-port.py`'s
+own header records that measurement — against a load of several watts. That the
+binding constraint turned out to be *depletion* rather than peak draw makes this
+far more likely to be the hub's ceiling than the phone's. **Retest on a proper
+charger before concluding the silicon cannot do it.** One physical change could
+return the whole top of both tables.
+
+Still open: per-cluster bisection (the staircase moved both clusters together,
+so it is not known which one's contribution mattered), and the absence of any
+CPU thermal sensor or throttling, which is a real gap whatever caused this.
+
+
 **Opened 2026-08-22, on `#51`, the first kernel with working CPU DVFS.**
 
 The DVFS itself is sound (B-40, and the whole of `04-docs/STATE-2026-08-22b.md`).
