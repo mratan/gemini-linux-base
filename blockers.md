@@ -2727,83 +2727,65 @@ and the `cpufreq` tree there answers "is this a hardware limit or are we simply
 not driving the hardware" in about a minute, for both gaps at once. That is the
 next step, and it is the owner's own suggestion.
 
-## 🔴 B-46 — sway renders a perfect desktop and none of it reaches the panel
+## ⚫ B-46 — RETRACTED THE SAME DAY: the camera was lying, not the display
 
-**Opened 2026-08-22, while switching the daily desktop to sway after #56 was
-fixed.** This is the reason the switch did not land.
+**Opened and withdrawn 2026-08-22.** I filed this as "sway renders a perfect
+desktop and none of it reaches the panel", with a black-versus-white photograph
+pair as proof. **The display was fine the whole time. The instrument was not.**
 
-**The compositor is fine.** sddm starts `gemini-session` as the `gemini` user,
-sway comes up on the active VT (tty1, `Active=yes`) holding DRM master on
-card0, `DSI-1` is `enabled` and `connected` at 1080x2160 with `transform 270`,
-swaybar and a `foot` terminal are running and `swaymsg -t get_tree` lists the
-window as visible. `grim` captures a **correct 2160x1080 desktop** — bar,
-workspace number, clock, terminal with a shell prompt.
+### What was actually wrong
 
-**The panel shows a uniform cyan rectangle.** Not the desktop, not black, not
-the console.
+`gemini-eyes.py` left the C920e in Aperture Priority. Pointed at a lit phone
+panel in a dark room the camera exposes for the *room*, runs
+`exposure_time_absolute` up to ~412, and blows the panel to a featureless pale
+cyan rectangle. A black screen and a white screen photograph **identically**
+that way — an LCD's black leakage is itself blue-cyan, and white saturates to
+the same wash. So the "test that can fail" could not, in fact, fail.
 
-**The test that settles it, because it can fail:**
+What survives auto-exposure is saturated *hue*. Re-run with a red background
+and the panel photographs red; with green, green. Pin the exposure to 320 and
+the whole desktop appears — swaybar, its clock, a `foot` window and its shell
+prompt, over the background colour actually set.
+
+Corroborating hardware evidence, taken before the photograph was re-shot:
 
 ```
-swaymsg output DSI-1 bg '#000000' solid_color   -> photograph
-swaymsg output DSI-1 bg '#ffffff' solid_color   -> photograph
+OVL0_EN        0 (X11)  ->  1 (sway)
+OVL0_SRC_CON   0        ->  1
+RDMA0_GLOBAL   0x100    ->  0x101
+OVL0 frame-done IRQs    ->  161 in 3 s  (~54 Hz)
+OVL0_L0_ADDR   alternates 0xFC000000 / 0xFD000000 — sway's two buffers
 ```
 
-The two photographs are the same cyan rectangle. A panel that is displaying
-would not survive that. Then `Session=lxqt.desktop` and a reboot, and the
-**LXQt desktop photographs perfectly** — icons, panel, wallpaper, battery
-readout. So the camera works, the panel works, and different content really
-does produce different photographs. It is sway's frames specifically that never
-arrive.
+Page flips were landing at frame rate the entire time this entry claimed they
+were not.
 
-### What this retroactively means
+### What is true, and worth keeping
 
-**B-38's sway measurements were never verified against the glass.** The only
-photographic evidence for "sway works on the internal panel" was the image
-retracted in `STATE-2026-08-21-night.md` as "a solid orange rectangle". That is
-the same failure as this one, in a different colour, and it was read at the
-time as a rotation bug. It was not a rotation bug.
+- **sway on the internal panel works**, both launched by hand and as the
+  sddm session. `rootfs-files/desktop/` is installed, not staged.
+- **X11 really does keep the DDP pipeline disabled**: `OVL0_EN = 0`,
+  `SRC_CON = 0`, `RDMA_ENGINE_EN` clear, zero frame-done interrupts, and yet a
+  visible desktop. That is `modesetting` with `AccelMethod "none"` writing into
+  an inherited scanout and never flipping, and it is worth remembering the next
+  time those registers are read as a health check — under X they are not one.
+- **B-38's sway results were still never verified against the glass.** That part
+  of this entry stands; the retracted "solid orange rectangle" was almost
+  certainly the same exposure fault, one session earlier.
 
-B-38's CPU-tick comparison (3 ticks against 1021) still stands as a statement
-about how much CPU each compositor burns. It is not evidence that sway can
-drive this display.
+### The lesson, which is the previous session's lesson pointed at myself
 
-### The hypothesis, from B-44's own analysis
+The last two entries here were about evidence that cannot carry the claim made
+of it. This one is the same failure committed by the person writing that
+sentence: I designed a discriminating test, got a null result, and filed a
+blocker and a tracker issue without ever asking whether the *instrument* could
+distinguish the two cases. It could not. A camera on auto-exposure answers "is
+the panel showing a saturated colour" while appearing to answer "is the panel
+showing the desktop".
 
-X on this machine runs `modesetting` with `AccelMethod "none"`, which memcpys
-damage into the existing scanout buffer and **essentially never page-flips** —
-B-39 measured zero display interrupts across 20 full-screen repaints. sway
-does the opposite: every frame is a new buffer and an atomic commit.
-
-B-44 established that this SoC has no CMDQ and `shadow_register = false`, so
-`mtk_crtc_ddp_config()` — which is what actually writes the new framebuffer
-address into the OVL — runs **only** from the frame-done interrupt. If that
-path does not re-arm for flips the way it does for the inherited scanout, the
-OVL keeps fetching the address it already had, forever, while every commit
-reports success. That matches exactly what is observed: no `flip_done`
-timeouts in dmesg, no errors anywhere, and a frozen image.
-
-If that is right this is **issue #20** (mediatek-drm atomic-KMS hardening),
-which is already open and already named as shared between the internal panel,
-Track 2 and Track 3.
-
-### What to do next
-
-1. Count real page flips while sway runs — vblank/frame-done interrupt counts
-   in `/proc/interrupts` and `/sys/kernel/debug/dri/0/`, against the same count
-   under X. A flip that "succeeds" without an interrupt is the answer.
-2. Read `OVL_L0_ADDR` while sway is running and see whether it ever changes.
-   B-44 left the tooling for exactly this.
-3. Only then decide whether the fix is in `mtk_crtc_ddp_config()`'s trigger or
-   in the plane update path.
-
-### Staged and not installed
-
-`rootfs-files/desktop/` holds the three files that make sway the autostarted
-session, with a README saying not to install them until this is fixed. One of
-them is worth having regardless: the sway config on the device contained
-**nothing but two `output` lines**, so the session had no keybindings at all —
-no terminal, no window controls, no bar.
+`gemini-eyes.py` now pins exposure by default and says why in the source.
+**Before believing a measurement, check that the instrument can tell the two
+answers apart** — not just that the experiment can.
 
 ## 🟢 B-39 — trigger 1 RESOLVED 2026-08-21: a GPU rate change was reprogramming the SoC's main PLL
 
