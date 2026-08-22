@@ -2470,6 +2470,100 @@ currently wrong in exactly this way, and nobody has looked.
 
 ## 🟡 B-40 — the two Cortex-A72 cores never come up, and there is no cpufreq at all
 
+### UPDATE 2026-08-22 (later): DIAGNOSED. ATF asserts PWR_ON for MP2 and the domain never acknowledges
+
+A formal diagnosis pass. The headline is that **the hang is not in Linux and not
+in the supply — it is inside ATF, in the MTCMOS power-up for cluster 2, and it
+is a spin with no timeout.**
+
+#### The instrument, which is most of the result
+
+Writing `cpu8/online` hard-locks the writing CPU and costs ~4 minutes of
+watchdog reset per attempt, with "the machine went away" as its entire output.
+Two replacements, both in `tools/psci-probe/`:
+
+* **`gemini-psci-probe.ko`** — PSCI calls that change nothing, each announced
+  to `/dev/kmsg` **before** it is issued. A call that never returns still names
+  itself, because netconsole emits synchronously.
+* **`cpuhp/fail`** — write a state number to
+  `/sys/devices/system/cpu/cpu8/hotplug/fail` and everything below it still
+  runs. Arbitrary `target` needs `CONFIG_CPU_HOTPLUG_STATE_CONTROL`, which we
+  do not have; `fail` bisects the hotplug path with no rebuild at all.
+
+#### What they establish
+
+| probe | result |
+|---|---|
+| `PSCI_VERSION` | **0.2** — so `PSCI_FEATURES` returning NOT_SUPPORTED is correct, not a fault |
+| `CPU_ON(cpu1, bogus entry)` | `-4 ALREADY_ON`, survives — the control |
+| `CPU_ON(cpu8, **bogus** entry)` | `-2 INVALID_PARAMS`, **survives** |
+| `CPU_ON(cpu8, **valid** entry)` | **HANGS** |
+| `cpu_up(8)` with `fail=93` | states 1-92 all pass, fails cleanly at `cpu:bringup`, **machine alive** |
+| `AFFINITY_INFO(0x000, 0)` | **hangs**, on a core that is demonstrably ON |
+
+Two things follow immediately. **The entire cpuhp prepare phase is innocent** —
+the hang is inside state 93, `cpu:bringup`. And the difference between a
+surviving CPU_ON and a fatal one is *only the entry point*, which means this
+firmware validates the address **before** the MPIDR: the `INVALID_PARAMS` was
+the address check, and the earlier reading of it as "firmware does not know
+cluster 2" was wrong.
+
+#### Where it hangs, watched live
+
+Polling the SPM from the other CPUs while one is stuck inside the SMC:
+
+```
+before        MP2_CPUSYS_PWR_CON = 0x00010132     (reset value)
+during, x50   MP2_CPUSYS_PWR_CON = 0x00010136     and never changes again
+```
+
+`0x132 -> 0x136` is bit 2, and `mt_spm_reg_mt6797.h` names it
+`MP2_CPUTOP_PWR_ON_LSB`. **ATF sets PWR_ON and then spins.** It never reaches
+`PWR_ON_2ND` (bit 3). It is waiting for a power-good that never asserts, in a
+loop with no timeout, at EL3 with interrupts masked — which is exactly a hard
+lockup on the calling CPU and every other CPU piling up behind
+`cpus_read_lock` afterwards.
+
+#### VPROC2 is definitively not the cause
+
+Repeated with BUCKB enabled at 1.000 V, and the trace is identical: `0x132 ->
+0x136`, stalled, SMC never returns. Two independent runs, now with a precise
+readout rather than "the machine died". Also eliminated: cluster-2 CCI
+coherency (`ACINACTM` clear on all three clusters, both CCI-400 ACE ports at
+`0xC0000003`) and the A72 PLL (`ARMCAXPLL2_CON0 = 0xF0000101`, enabled,
+programmed for ~630 MHz).
+
+#### Why the domain does not acknowledge
+
+The vendor's own Linux tree has `spm_mtcmos_ctrl_cpu0..cpu7`, `cpusys0` and
+`cpusys1` — and **no `cpusys2`**, confirmed again in
+`mt6797/mt_spm_mtcmos.c`. So the vendor kernel does not power MP2 either.
+Android does it through **CPUHVFS**, the DVFS co-processor running `dvfsp_fw`,
+which the vendor kernel loads and ours never does. Its log line
+`[CPUHVFS] cluster2 on, swctrl = 0x25f0` is that processor doing the work.
+
+The coherent reading is that MP2's power switch is owned by CPUHVFS on this
+SoC, and ATF's PWR_ON is a request that only completes when that processor is
+running. **That is a firmware dependency we do not have**, and it is the answer
+the handoff called "the honest risk".
+
+#### What would still be worth trying, in order
+
+1. **Drive the MTCMOS sequence by hand** (`tools/psci-probe/` has the script)
+   and watch `SRAM_PDN_ACK` (bit 16) after clearing `SRAM_PDN` (bit 8). If it
+   clears, the domain *can* be powered from the AP and ATF's spin is merely a
+   sequencing bug we could pre-empt by powering before CPU_ON. If it never
+   clears, the domain is not ours to power. **This was staged and not run — the
+   device became unavailable first.**
+2. If (1) works, pre-power MP2 and then call CPU_ON.
+3. If (1) fails, the A72s need `dvfsp_fw` and a CPUHVFS driver, and that should
+   be stated as the answer rather than ground against.
+
+**Gap 2 of this issue — cpufreq for the A53s, a measured 1.72x and 1.57x — does
+not depend on any of the above** and is now unblocked by the i2c6 fix.
+
+
+
 ### UPDATE 2026-08-22: VPROC2 is measured at last, and it is NOT the blocker
 
 The i2c6 fix (B-45) made the DA9214 readable, so the rail question is finally a

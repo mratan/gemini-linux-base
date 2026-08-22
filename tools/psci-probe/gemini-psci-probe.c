@@ -59,6 +59,8 @@
 #include <linux/psci.h>
 #include <uapi/linux/psci.h>
 #include <linux/delay.h>
+#include <linux/mm.h>
+#include <asm/cacheflush.h>
 
 static unsigned int tests = 0x03;	/* the two safe controls by default */
 module_param(tests, uint, 0444);
@@ -70,6 +72,23 @@ MODULE_PARM_DESC(tests, "bitmask of probes to run; see the file header");
  * on its own and cannot touch anything of ours.
  */
 #define BOGUS_ENTRY	0xdead000000000001ULL
+
+/*
+ * A *valid* entry point, for the probe that matters.
+ *
+ * CPU_ON(cpu8, BOGUS_ENTRY) returns INVALID_PARAMS, which says the firmware
+ * rejected the MPIDR. But Linux passes a real address and hard-locks instead,
+ * so either the firmware validates the entry point first and only reaches the
+ * MPIDR check on a good one, or the two paths differ some other way. This
+ * gives the firmware an address it cannot object to and sees which happens.
+ *
+ * The page contains `wfi; b .-4` — if a core really does start there it parks
+ * itself immediately, touches no memory, and cannot disturb anything. Cleaned
+ * to the point of unification because that core starts with its MMU and caches
+ * off and will fetch this straight from DRAM.
+ */
+#define AARCH64_WFI		0xd503207fu
+#define AARCH64_B_BACK_ONE	0x17ffffffu
 
 static const char *ret_str(long r)
 {
@@ -130,6 +149,41 @@ static int __init probe_init(void)
 	if (tests & 0x10)
 		smc("AFFINITY_INFO cpu0 (KNOWN TO HANG)",
 		    PSCI_0_2_FN64_AFFINITY_INFO, 0x000, 0, 0);
+
+	if (tests & 0x20) {
+		u32 *park = (u32 *)__get_free_page(GFP_KERNEL);
+		phys_addr_t pa;
+		int w;
+
+		if (!park) {
+			P("could not allocate the park page");
+			goto done;
+		}
+		for (w = 0; w < PAGE_SIZE / 4; w += 2) {
+			park[w]     = AARCH64_WFI;
+			park[w + 1] = AARCH64_B_BACK_ONE;
+		}
+		caches_clean_inval_pou((unsigned long)park,
+				       (unsigned long)park + PAGE_SIZE);
+		pa = virt_to_phys(park);
+		P("park page at VA %px PA 0x%llx (wfi; b .-4)",
+		  park, (unsigned long long)pa);
+		smc("CPU_ON cpu8 mpidr 0x200 VALID ENTRY",
+		    PSCI_0_2_FN64_CPU_ON, 0x200, pa, 0);
+		/* Deliberately leaked: if a core did start there, freeing the
+		 * page would let the allocator hand out memory a running CPU
+		 * is executing. One page is a cheap price for that. */
+	}
+
+	if (tests & 0x40)
+		smc("MIGRATE_INFO_TYPE (optional PSCI 0.2)",
+		    PSCI_0_2_FN_MIGRATE_INFO_TYPE, 0, 0, 0);
+
+	if (tests & 0x80)
+		smc("CPU_ON cpu1 mpidr 0x001 VALID-ish ENTRY (control)",
+		    PSCI_0_2_FN64_CPU_ON, 0x001, 0x40000000ULL, 0);
+
+done:
 
 	P("==== end, survived ====");
 	return -EINVAL;	/* one-shot report; never stay loaded */
