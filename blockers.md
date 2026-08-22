@@ -2651,6 +2651,75 @@ currently wrong in exactly this way, and nobody has looked.
 
 ## 🟡 B-40 — the two Cortex-A72 cores never come up, and there is no cpufreq at all
 
+### GEMIAN ANSWERS IT: no Linux on this device has ever run the A72s
+
+Booted the stock Gemian Reference kernel and asked it directly. **It brings up
+five CPUs and never touches the A72 cluster:**
+
+```
+Brought up 5 CPUs
+SMP: Total of 5 processors activated (130.00 BogoMIPS)
+[IRQ] @CPU8: smp affinity is set, but gic reg is not set
+[IRQ] @CPU9: smp affinity is set, but gic reg is not set
+```
+
+`online` = `4-7` (plus cpu0 as HPS cycles), **zero cores reporting `0xd08`**, and
+forcing `cpu8/online` returns rc=0 while the CPU stays offline — silently
+vetoed, and notably **without the hang our kernel gets**.
+
+**This settles the question that motivated the whole detour.** Gemian carries
+`cpu_power_on_buck()` byte-identical, with `CONFIG_CL2_BUCK_CTRL` hardcoded on
+and `CONFIG_NR_CPUS=10` — and it still does not bring the A72s up. So the buck
+and isolation work, which this session ported and proved, was never going to be
+sufficient on its own. **Android is the only system on this device that runs
+those cores.**
+
+**And our port already beats the Reference slot.** `#51` runs **8** CPUs;
+stock Gemian runs **5**.
+
+| system | kernel | CPUs online | A72s |
+|---|---|---|---|
+| Android (boot1) | 3.18.79 vendor | **10** | **2** |
+| Gemian (Reference) | 3.18.41 | 5 | 0 |
+| ours, `#51` | mainline 6.6 | **8** | 0 |
+
+So the bar was never "match Gemian". The A72s are an unsolved problem for Linux
+on this hardware generally, not a regression in this port — which also means
+there is no working Linux implementation to copy, and the EEM/PTP-and-iDVFS
+hypothesis is the remaining lead rather than one option among several.
+
+**One caveat on evidence quality:** Gemian's `/proc/config.gz` reports
+`# CONFIG_MTK_HYBRID_CPU_DVFS is not set` while `/sys/kernel/debug/cpuhvfs`
+exists on the running system. Those cannot both describe the same kernel, so
+that config is a generic stub and **nothing should be concluded from it**. The
+boot-log CPU count is the reliable measurement.
+
+### HOW TO BOOT GEMIAN WITHOUT THE KEY CHORD, and how to get back
+
+The silver chord is unreliable. It is not needed:
+
+1. Stage the current experimental image where Gemian can see it —
+   **`/dev/mmcblk1p29` is mounted at `/host` in our system and is Gemian's
+   root**, so `scp <img> root@device:/host/restore.img` lands at `/` under
+   Gemian.
+2. `gemini-slot.py flash recovery 01-backups/boot2-stock-gemian-*.img -y`
+3. Reboot. LK's BCB sends it to p1, which now holds Gemian.
+4. Reach it at **`ssh gemini@10.15.19.82`** — same gadget IP, and the host key
+   differs from ours so `-o StrictHostKeyChecking=no` is required. Under Gemian
+   the eMMC is **`mmcblk0`**, not `mmcblk1`.
+5. To return: `dd` the staged image back to `/dev/mmcblk0p1`, verify by
+   readback, reboot. The BCB is still armed, so it lands on the restored image
+   directly — no Android round trip.
+
+**The trap to plan for:** the BCB is sticky and Gemian has no
+`gemini-bcb-disarm`, so it loops back into Gemian on every boot. Staging the
+restore image in `/host` **before** flashing is what makes that safe. Gemian's
+`gemini` user is in `sudo` but the NOPASSWD drop-in recorded in
+`STATE-2026-08-17` has since been removed, so the account password is required
+— have it to hand before starting.
+
+---
+
 ### FINAL for this session: the A72 core does not execute, and the diagnosis is coherent
 
 The last open question was whether the cores actually start once the domain
