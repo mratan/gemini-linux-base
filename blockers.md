@@ -2470,6 +2470,69 @@ currently wrong in exactly this way, and nobody has looked.
 
 ## 🟡 B-40 — the two Cortex-A72 cores never come up, and there is no cpufreq at all
 
+### UPDATE 2026-08-22: VPROC2 is measured at last, and it is NOT the blocker
+
+The i2c6 fix (B-45) made the DA9214 readable, so the rail question is finally a
+measurement instead of an inference:
+
+```
+BUCKA_CONT 0x5D = 0x01   ENABLED,  VBUCKA_A 0xD7 = 0x46 -> 1000 mV
+BUCKB_CONT 0x5E = 0x00   DISABLED, VBUCKB_A 0xD9 = 0x46 -> 1000 mV
+```
+
+**BUCKA is the live CPU rail**, at exactly the 1.000 V our device tree asserts
+as a `regulator-fixed` fiction — so the A53 clusters run off BUCKA, and the
+RT5735 on i2c7 is not their supply. **BUCKB is VPROC2 and has never been
+switched on**, which matches the A72s being dark. Both identifications now rest
+on chip reads rather than on `DA9214_VPROC2 = 0xD9`.
+
+**But enabling it does not bring the A72 up, and I nearly reported that it
+did.** Writing `BUCKB_CONT = 0x01` brings VPROC2 up cleanly — BUCKA untouched,
+system healthy — and then `echo 1 > cpu8/online` hard-locks the writing CPU
+within a second, exactly as before.
+
+*The control that matters.* An RCU stall report during the attempt says
+`ncpus=9`, and I read that as the A72 having joined. **It is not evidence of
+anything.** Repeating the attempt with BUCKB deliberately left OFF produces
+`ncpus=9` too: the count is incremented while the *control* CPU prepares the
+hotplug, before the new core would ever run. With and without VPROC2 the
+failure is identical.
+
+### What is now eliminated
+
+| candidate | verdict | evidence |
+|---|---|---|
+| **VPROC2 missing** | **dead** | the rail comes up on command; cpu8 fails identically with it on and off |
+| **CCI snoop / ACINACTM for cluster 2** | **dead** | `MP0/MP1/MP2_AXI_CONFIG` (`0x1020002C/22C/42C`) all read `0x00000000`, so ACINACTM is clear for all three clusters; both CCI-400 ACE ports (`0x10394000`, `0x10395000`) read `0xC0000003` — SNOOP_REQ and DVM_MSG_REQ set; `CCI400_STATUS` = 0, nothing pending |
+| **the A72 PLL being off** | **dead** | `ARMCAXPLL2_CON0` (`0x1001a220`) = `0xF0000101`, enabled; `CON1` = `0xC10C1D89` → posdiv 1, pcw 0x0C1D89 → **~630 MHz**, already programmed |
+
+### What the failure actually looks like
+
+`MP2_CPUSYS_PWR_CON` (`0x10006218`) stays at its reset value `0x00010132`
+throughout — unpowered, isolated, in reset. **ATF never powers the cluster.**
+The calling CPU hard-locks immediately (no interrupts at all), and other CPUs
+pile up in `smp_call_function_many_cond`, waiting on a CPU that is in the
+online mask and will never answer.
+
+So the remaining candidate is the one B-40 named originally and is now the
+*only* one left: **the MP2 MTCMOS sequence is never executed**, by the kernel or
+by ATF. Under Android that work is done via CPUHVFS, the DVFS co-processor
+running `dvfsp_fw`, which our kernel never starts.
+
+### The next experiment, and it needs no kernel build
+
+Write the MTCMOS power-up sequence to `MP2_CPUSYS_PWR_CON` and
+`MP2_CPU0_PWR_CON` by hand with devmem and watch the register move from
+`0x00010132` towards MP0's `0x0009004D`. If the cluster can be powered from the
+AP side at all, that shows it without touching the kernel. Implement against
+`mt_spm_reg_mt6797.h` addresses only — `mt_spm_cpu.h` is stale (above).
+
+If it cannot, the A72s need firmware we do not have, and that is the answer.
+Note the fallback still stands and is now *unblocked*: the A53 cpufreq port
+needs BUCKA, which we can finally read and drive.
+
+
+
 ### UPDATE 2026-08-21 (evening): the boot1 trip happened, and it answers most of this
 
 Stock Android on p22, booted with `gemini-bootsel.py normal --reboot` and left
