@@ -1,0 +1,56 @@
+clk: mediatek: mt6797: stop the GPU mux reparenting onto the system PLLs
+
+CLK_TOP_MUX_MFG is declared with MUX_GATE(), which sets CLK_SET_RATE_PARENT
+and leaves reparenting enabled. Two of its four parents — syspll_d3 and
+univpll_d3 — are FACTOR() children of mainpll and univpll, and FACTOR() also
+carries CLK_SET_RATE_PARENT. clk_mux_determine_rate_flags() is therefore
+allowed to satisfy a GPU operating point by switching the GPU onto a system
+PLL branch and reprogramming that PLL, which on this SoC clocks the AXI bus,
+MSDC, I2C and the UARTs.
+
+Measured on a Gemini PDA (MT6797, Mali-T880, panfrost + devfreq): requesting
+the 610 MHz GPU OPP moved CLK_CFG_5[25:24] from 1 (mfgpll_ck) to 2 and left
+MFGPLL_CON0 = 0x0, i.e. the GPU PLL switched off and the GPU clocked from a
+system PLL branch — while devfreq and the clock framework both reported
+610 MHz. The next rate change from that state hard-locked CPUs and timed out
+every unrelated bus master on the die; only the watchdog recovered it. OPPs at
+or below 520 MHz keep the mux on mfgpll_ck and survived 60 consecutive
+transitions unharmed.
+
+CLK_SET_RATE_NO_REPARENT keeps the rate request on the current parent, so it
+propagates to MFGPLL — the only PLL a GPU operating point has any business
+moving.
+
+--- a/drivers/clk/mediatek/clk-mt6797.c
++++ b/drivers/clk/mediatek/clk-mt6797.c
+@@ -333,7 +333,29 @@
+ 	MUX_GATE(CLK_TOP_MUX_PWM, "pwm_sel", pwm_parents, 0x0050, 0, 3, 7),
+ 	MUX_GATE(CLK_TOP_MUX_VDEC, "vdec_sel", vdec_parents, 0x0050, 8, 3, 15),
+ 	MUX_GATE(CLK_TOP_MUX_VENC, "venc_sel", venc_parents, 0x0050, 16, 2, 23),
+-	MUX_GATE(CLK_TOP_MUX_MFG, "mfg_sel", mfg_parents, 0x0050, 24, 2, 31),
++	/*
++	 * The GPU's clock mux must never reparent. Two of its four parents,
++	 * syspll_d3 and univpll_d3, are FACTOR() children of mainpll and
++	 * univpll — the PLLs that clock the AXI bus, MSDC, I2C and the UARTs —
++	 * and FACTOR() carries CLK_SET_RATE_PARENT. So a GPU operating point
++	 * that the current MFGPLL rate cannot satisfy is served, entirely
++	 * legally, by switching the GPU onto a system PLL and reprogramming
++	 * that PLL for the whole SoC.
++	 *
++	 * Measured on a Gemini PDA (MT6797, Mali-T880): requesting the 610 MHz
++	 * GPU OPP moved CLK_CFG_5[25:24] from 1 (mfgpll_ck) to 2 and left
++	 * MFGPLL_CON0 = 0x0 — the GPU PLL switched off and the GPU clocked
++	 * from a system PLL branch, while devfreq and the clock framework both
++	 * reported 610 MHz. The next rate change from that state hard-locked
++	 * CPUs and timed out every unrelated bus master on the die (I2C, SDIO,
++	 * eMMC), reclaimed only by the watchdog. Operating points at or below
++	 * 520 MHz stay on MFGPLL and are stable across many transitions.
++	 *
++	 * CLK_SET_RATE_NO_REPARENT keeps a rate request on the current parent,
++	 * so it reaches MFGPLL — the only PLL a GPU operating point may move.
++	 */
++	MUX_GATE_FLAGS(CLK_TOP_MUX_MFG, "mfg_sel", mfg_parents, 0x0050, 24, 2,
++		       31, CLK_SET_RATE_PARENT | CLK_SET_RATE_NO_REPARENT),
+ 	MUX_GATE(CLK_TOP_MUX_CAMTG, "camtg_sel", camtg, 0x0060, 0, 2, 7),
+ 	MUX_GATE(CLK_TOP_MUX_UART, "uart_sel", uart_parents, 0x0060, 8, 1, 15),
+ 	MUX_GATE(CLK_TOP_MUX_SPI, "spi_sel", spi_parents, 0x0060, 16, 2, 23),
