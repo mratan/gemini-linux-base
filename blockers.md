@@ -2681,7 +2681,106 @@ and the `cpufreq` tree there answers "is this a hardware limit or are we simply
 not driving the hardware" in about a minute, for both gaps at once. That is the
 next step, and it is the owner's own suggestion.
 
-## 🔴 B-39 — TWO independent ways to hard-wedge the SoC
+## 🟢 B-39 — trigger 1 RESOLVED 2026-08-21: a GPU rate change was reprogramming the SoC's main PLL
+
+**Trigger 1 is closed on `#43`. Trigger 2 (the USB display) is untouched and
+stays with #27.** Every earlier attribution in this entry — including the
+night update's "the trigger is a new client surface arriving while the GPU is
+already rendering" — is **superseded**. That description was accurate as an
+observation and wrong as a cause.
+
+### What it actually was
+
+`CLK_TOP_MUX_MFG` is declared with `MUX_GATE()`, which sets
+`CLK_SET_RATE_PARENT` and leaves reparenting enabled. Two of its four parents,
+`syspll_d3` and `univpll_d3`, are `FACTOR()` children of **mainpll** and
+**univpll** — the PLLs behind the AXI bus, MSDC, I2C and the UARTs — and
+`FACTOR()` also carries `CLK_SET_RATE_PARENT`. So `clk_mux_determine_rate_flags()`
+is entitled to satisfy a GPU operating point by **switching the GPU onto a
+system PLL and reprogramming that PLL for the whole die**.
+
+Read from the hardware, not from the framework's bookkeeping — requesting the
+610 MHz GPU OPP on `#42`:
+
+```
+CLK_CFG_5 (0x10000050)  0x01818100 -> 0x02818100   mfg mux 1 (mfgpll_ck) -> 2
+MFGPLL_CON0 (0x1000c240) 0x00000101 -> 0x00000000  the GPU PLL switched OFF
+MFGPLL_CON1 (0x1000c244) unchanged at the 520 MHz value
+```
+
+while `devfreq/cur_freq` and `clk_summary` both reported 610 MHz. The next rate
+change from that state hard-locked CPUs and timed out every unrelated bus
+master in turn. That is the whole of trigger 1.
+
+### The experiments, in the order that mattered
+
+The reproducer is `tools/gpuwedge.c` — plain EGL/GBM clients on
+`/dev/dri/renderD128`, no compositor, no KMS, no `card0`. `scripts/gemini-gpuwedge.sh`
+runs one experiment from a fixed state and decides from netconsole.
+
+| # | what | result |
+|---|---|---|
+| A | steady hog + 208 new contexts, 90 s | **survived** |
+| A1 | 32 simultaneous contexts, round-robin, 25 s | **survived** |
+| A2 | bursty hog alone (domain cycling), 120 s | **survived** |
+| A3 | **bursty** hog + new contexts | **wedged at poke 5, and again at poke 18** |
+| C1 | A3 with the MFG domain pinned on (`power/control=on`) | **wedged** — `_set_opp_voltage … -110` |
+| D1 | A3 with devfreq pinned (no OPP transitions) | **survived 120 s, 394 pokes** |
+| F1 | OPP table swept from a shell, **GPU completely idle, no GL client** | **wedged** |
+| I1 | the whole OPP **voltage** range on the vgpu rail, clock pinned | **survived** — the rail is innocent |
+| K1 | 60 transitions between 238 and 365 MHz | **survived** — not the count |
+| L1 | climb reading the PLL **hardware** at each step | **named it** (table above) |
+
+F1 is the one that reframed everything: **the GPU need not be running at all.**
+Sweeping the OPP table by hand kills the machine, so trigger 1 was never a
+panfrost job-fault bug.
+
+### Three earlier readings, retracted
+
+1. **"a new client surface arriving while the GPU is already rendering".** Real,
+   reproducible, and not the cause. A new client raised GPU utilisation past
+   `simple_ondemand`'s 45% upthreshold, which produced an OPP change. `glxgears`
+   alone is vsync-limited and never crosses that threshold, which is why it
+   "ran 90 s at full load" harmlessly — it was not at full load.
+2. **`HW_ISSUE_9435` and the soft-stop path.** A good lead from the vendor's
+   workaround list, and unrelated. panfrost's reset path was never reached.
+3. **The `-110` regulator timeout, the touchscreen's I2C timeout, the msdc
+   timeouts, `DATA_INVALID_FAULT`.** All victims of the interconnect already
+   being wrecked. `DATA_INVALID_FAULT` is **not** independently explained and
+   has not been seen since the fix; it should not be treated as closed by this
+   entry.
+
+### The fix
+
+`patches/v6.6/gpu/0005-clk-mediatek-mt6797-mfg-mux-no-reparent.patch` —
+`CLK_SET_RATE_NO_REPARENT` on `mfg_sel`, so a rate request stays on the current
+parent and reaches MFGPLL, the only PLL a GPU OPP has any business moving.
+Upstreamable as-is; it is an SoC bug, not a board bug (relevant to #40).
+
+On `#43` the whole 238–780 MHz table now lands on MFGPLL, and the PCW the
+hardware ends up holding matches the value the OPP arithmetic predicts at every
+step (780 MHz → `CON1 = 0x810F0000` → exactly 780000000):
+
+- 2800 consecutive OPP transitions with the GPU idle: **clean**.
+- 180 s of the workload that used to kill the machine in 2–5 s: **clean**.
+- 20 qterminal open/close cycles under GPU-composited sway with glxgears
+  redrawing through Xwayland, GPU active 20/20 samples, devfreq reaching
+  **780 MHz** — **twice, each from a fresh boot**.
+
+### What this cost, and the lesson
+
+Every measurement in the night update was honest and none of it could reach the
+cause, because all of it was taken through a compositor. The first experiment
+that removed the compositor also removed the GPU, and that is what found it.
+**When a symptom has a long causal tail, instrument the earliest thing you can
+still make fail — not the thing that fails loudest.**
+
+A second lesson, cheaper: `clk_summary` reads every clock's hardware enable
+bit, including `mfg_bg3d`, which lives in the MFG power domain. Reading it with
+that domain asleep is the B-36 trap by another door, and it wedged the machine
+once during this session.
+
+## 🟡 B-39 (historical) — TWO independent ways to hard-wedge the SoC
 
 **Opened 2026-08-21 and rewritten three times the same day. Read the update
 first; the earlier attributions are retracted at the bottom.**
