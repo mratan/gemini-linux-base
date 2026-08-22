@@ -113,6 +113,23 @@ static long do_smc(const char *what, u32 fn, u64 a1, u64 a2, u64 a3)
 #define MP2_PWR_CON		0x218
 #define EXT_BUCK_ISO		0x290
 #define MP0_PWR_CON		0x210
+#define PWR_STATUS		0x180
+#define PWR_STATUS_2ND		0x184
+#define CPU_PWR_STATUS		0x188
+#define CPU_PWR_STATUS_2ND	0x18c
+
+/* MP2_CPUSYS_PWR_CON bits, from the vendor's mt_spm_reg_mt6797.h */
+#define PWR_RST_B		BIT(0)
+#define PWR_ISO			BIT(1)
+#define PWR_ON			BIT(2)
+#define PWR_ON_2ND		BIT(3)
+#define PWR_CLK_DIS		BIT(4)
+#define SRAM_CKISO		BIT(5)
+#define SRAM_ISOINT_B		BIT(6)
+#define SRAM_PDN		BIT(8)
+#define SRAM_PDN_ACK		BIT(12)
+#define SRAM_SLEEP_B		BIT(16)
+#define SRAM_SLEEP_B_ACK	BIT(19)
 #define MP1_PWR_CON		0x214
 
 #define MCUCFG2_PHYS		0x10222000UL
@@ -135,9 +152,12 @@ static void __iomem *mcucfg2;
 
 static void report(const char *when)
 {
-	P("%-22s MP2=0x%08x  EXT_BUCK_ISO=0x%08x  MP0=0x%08x  MP1=0x%08x", when,
+	P("%-22s MP2=0x%08x  ISO=0x%08x  MP0=0x%08x  MP1=0x%08x", when,
 	  readl(spm + MP2_PWR_CON), readl(spm + EXT_BUCK_ISO),
 	  readl(spm + MP0_PWR_CON), readl(spm + MP1_PWR_CON));
+	P("%-22s PWR_STATUS=0x%08x/0x%08x  CPU_PWR_STATUS=0x%08x/0x%08x", "",
+	  readl(spm + PWR_STATUS), readl(spm + PWR_STATUS_2ND),
+	  readl(spm + CPU_PWR_STATUS), readl(spm + CPU_PWR_STATUS_2ND));
 }
 
 /* mirrors da9214_config_interface(reg, val, mask, shift) */
@@ -204,7 +224,7 @@ static void power_on_buck(void)
 	writel(v & ~0x3u, spm + EXT_BUCK_ISO);
 	udelay(240);
 
-	P("       (skipping BigiDVFSSRAMLDOSet — this ATF has no iDVFS SIP)");
+	P("       (BigiDVFSSRAMLDOSet is issued below for stage >= 4)");
 	report("after power-on seq");
 }
 
@@ -329,7 +349,7 @@ static int __init a72_probe_init(void)
 
 	power_on_buck();
 
-	if (stage == 4 || stage == 5) {
+	if (stage >= 4) {
 		/*
 		 * Ask ATF to enable the big cluster's iDVFS, exactly as the
 		 * vendor does, with the control word Android reports. If this
@@ -352,6 +372,168 @@ static int __init a72_probe_init(void)
 
 	if (stage == 4) {
 		P("stage 4 — iDVFS asked, no CPU_ON.");
+		goto out;
+	}
+
+	/*
+	 * stage 6: assert PWR_ON OURSELVES and watch the ack, instead of asking
+	 * ATF to do it and losing the machine when it spins.
+	 *
+	 * This is the measurement that separates the two remaining stories. The
+	 * ack ATF polls lives in PWR_STATUS/CPU_PWR_STATUS (SPM+0x180/0x188),
+	 * not in PWR_CON. If a bit for MP2 appears there once PWR_ON is set,
+	 * the power switch works and the fault is later in the sequence. If
+	 * nothing moves, the domain is not getting its supply and no amount of
+	 * sequencing will help.
+	 *
+	 * Nothing here calls PSCI, so nothing can spin at EL3.
+	 */
+	/*
+	 * stage 7: drive the whole cluster MTCMOS sequence by hand, WITH the
+	 * buck prerequisites in place.
+	 *
+	 * B-40 already did this once and the domain never acknowledged -- but
+	 * that was before CPU_EXT_BUCK_ISO was known about, so it ran with the
+	 * A72 supply still isolated. Repeating it now that VPROC2 is on, the
+	 * isolation is cleared and the iDVFS SMCs have run is a different
+	 * experiment with the same shape.
+	 *
+	 * Every poll is bounded and nothing calls PSCI, so the worst case is a
+	 * report saying which step did not complete.
+	 */
+	if (stage == 7) {
+		u32 v;
+		int j;
+
+#define STEP(desc, expr) do {						\
+		P("  %-28s MP2=0x%08x PWRS=0x%08x/0x%08x CPUS=0x%08x",	\
+		  desc, readl(spm + MP2_PWR_CON), readl(spm + PWR_STATUS), \
+		  readl(spm + PWR_STATUS_2ND), readl(spm + CPU_PWR_STATUS)); \
+		expr;							\
+		udelay(50);						\
+	} while (0)
+
+		P("stage 7: hand-driven MP2 CPUTOP power-up (no PSCI)");
+		mdelay(20);
+
+		STEP("start", );
+		STEP("PWR_ON=1",     writel(readl(spm + MP2_PWR_CON) | PWR_ON, spm + MP2_PWR_CON));
+		STEP("PWR_ON_2ND=1", writel(readl(spm + MP2_PWR_CON) | PWR_ON_2ND, spm + MP2_PWR_CON));
+		mdelay(1);
+		STEP("PWR_CLK_DIS=0", writel(readl(spm + MP2_PWR_CON) & ~PWR_CLK_DIS, spm + MP2_PWR_CON));
+		STEP("PWR_ISO=0",     writel(readl(spm + MP2_PWR_CON) & ~PWR_ISO, spm + MP2_PWR_CON));
+		STEP("SRAM_PDN=0",    writel(readl(spm + MP2_PWR_CON) & ~SRAM_PDN, spm + MP2_PWR_CON));
+
+		for (j = 0; j < 1000; j++) {
+			if (!(readl(spm + MP2_PWR_CON) & SRAM_PDN_ACK))
+				break;
+			udelay(10);
+		}
+		P("  SRAM_PDN_ACK cleared after %d us (%s)", j * 10,
+		  j < 1000 ? "OK" : "TIMEOUT");
+
+		STEP("SRAM_ISOINT_B=1", writel(readl(spm + MP2_PWR_CON) | SRAM_ISOINT_B, spm + MP2_PWR_CON));
+		STEP("SRAM_CKISO=0",    writel(readl(spm + MP2_PWR_CON) & ~SRAM_CKISO, spm + MP2_PWR_CON));
+		STEP("SRAM_SLEEP_B=1",  writel(readl(spm + MP2_PWR_CON) | SRAM_SLEEP_B, spm + MP2_PWR_CON));
+		STEP("PWR_RST_B=1",     writel(readl(spm + MP2_PWR_CON) | PWR_RST_B, spm + MP2_PWR_CON));
+		mdelay(2);
+		STEP("settled", );
+
+		v = readl(spm + MP2_PWR_CON);
+		P("MP2 = 0x%08x   MP0 (a running cluster) = 0x%08x", v,
+		  readl(spm + MP0_PWR_CON));
+		P("verdict: SRAM_PDN_ACK=%d SRAM_SLEEP_B_ACK=%d ISO=%d RST_B=%d",
+		  !!(v & SRAM_PDN_ACK), !!(v & SRAM_SLEEP_B_ACK),
+		  !!(v & PWR_ISO), !!(v & PWR_RST_B));
+		P("the domain is %s",
+		  (v & SRAM_SLEEP_B_ACK) && !(v & SRAM_PDN_ACK) && !(v & PWR_ISO)
+			? "UP — this is what MP0 looks like"
+			: "NOT up");
+		goto out;
+#undef STEP
+	}
+
+	/*
+	 * stage 9: does the MP2 SRAM control respond at all, and does a clock
+	 * change it?
+	 *
+	 * Stage 7 got MP2 to 0x0001004d -- one bit off a running cluster, the
+	 * missing bit being SRAM_SLEEP_B_ACK. And at REST, MP2 sits with
+	 * SRAM_PDN=1 and SRAM_PDN_ACK=0: a genuinely powered-down SRAM should
+	 * be acknowledging that. Neither ack ever moves, which is the
+	 * signature of SRAM control logic with no clock rather than one that
+	 * disagrees with us.
+	 *
+	 * Cluster B's clock source is ARMPLLDIV_MUXSEL[1:0] in MCUMIXED, which
+	 * unlike MCUCFG we CAN write, and it currently selects 0 = CLKSQ.
+	 * Walk it through all four sources and watch the acks.
+	 */
+	if (stage == 9) {
+		void __iomem *mcumixed = ioremap(0x1001a000, 0x1000);
+		static const char * const src[] = { "CLKSQ 26M", "ARMPLL",
+						    "MAINPLL", "UNIVPLL" };
+		u32 mux, v;
+		int k;
+
+		if (!mcumixed) {
+			P("cannot map MCUMIXED");
+			goto out;
+		}
+
+		P("stage 9: walking cluster B's clock mux, watching the SRAM acks");
+		P("  MP2 = 0x%08x, MUXSEL = 0x%08x", readl(spm + MP2_PWR_CON),
+		  readl(mcumixed + 0x270));
+
+		for (k = 0; k < 4; k++) {
+			mux = readl(mcumixed + 0x270);
+			writel((mux & ~0x3u) | k, mcumixed + 0x270);
+			mdelay(5);
+			v = readl(spm + MP2_PWR_CON);
+			P("  B mux = %u (%-9s)  MUXSEL=0x%08x  MP2=0x%08x  PDN_ACK=%d SLEEP_B_ACK=%d",
+			  k, src[k], readl(mcumixed + 0x270), v,
+			  !!(v & SRAM_PDN_ACK), !!(v & SRAM_SLEEP_B_ACK));
+		}
+
+		/* put it back where the bootloader had it */
+		mux = readl(mcumixed + 0x270);
+		writel(mux & ~0x3u, mcumixed + 0x270);
+		P("  restored B mux to 0 (CLKSQ), MUXSEL = 0x%08x",
+		  readl(mcumixed + 0x270));
+		iounmap(mcumixed);
+		report("after mux walk");
+		goto out;
+	}
+
+	if (stage == 6) {
+		u32 s0 = readl(spm + PWR_STATUS), s1 = readl(spm + CPU_PWR_STATUS);
+
+		P("stage 6: asserting MP2 PWR_ON by hand, no PSCI involved");
+		P("  before: PWR_STATUS=0x%08x CPU_PWR_STATUS=0x%08x MP2=0x%08x",
+		  s0, s1, readl(spm + MP2_PWR_CON));
+		mdelay(20);
+
+		writel(readl(spm + MP2_PWR_CON) | BIT(2), spm + MP2_PWR_CON);
+
+		for (i = 0; i < 20; i++) {
+			u32 n0, n1;
+
+			mdelay(10);
+			n0 = readl(spm + PWR_STATUS);
+			n1 = readl(spm + CPU_PWR_STATUS);
+			P("  +%3d ms MP2=0x%08x PWR_STATUS=0x%08x(%s) CPU_PWR_STATUS=0x%08x(%s)",
+			  (i + 1) * 10, readl(spm + MP2_PWR_CON),
+			  n0, n0 != s0 ? "CHANGED" : "same",
+			  n1, n1 != s1 ? "CHANGED" : "same");
+		}
+
+		P("verdict: PWR_STATUS %s, CPU_PWR_STATUS %s after PWR_ON",
+		  readl(spm + PWR_STATUS) != s0 ? "MOVED — the switch acknowledges"
+					        : "did NOT move — no power-good",
+		  readl(spm + CPU_PWR_STATUS) != s1 ? "MOVED" : "did NOT move");
+
+		/* put it back so we leave nothing half-asserted */
+		writel(readl(spm + MP2_PWR_CON) & ~BIT(2), spm + MP2_PWR_CON);
+		report("after clearing PWR_ON");
 		goto out;
 	}
 

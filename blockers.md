@@ -2651,6 +2651,70 @@ currently wrong in exactly this way, and nobody has looked.
 
 ## 🟡 B-40 — the two Cortex-A72 cores never come up, and there is no cpufreq at all
 
+### NARROWED TO ONE BIT, same evening: MP2 reaches 0x0001004d and only SRAM_SLEEP_B_ACK is missing
+
+Driving the whole cluster MTCMOS sequence by hand — with the buck
+prerequisites in place this time, which is what B-40's earlier hand-drive
+lacked — gets MP2 one bit away from a running cluster:
+
+```
+MP2 after the hand sequence   0x0001004d
+MP0, a running cluster        0x0009004d
+                              ^^^^ the only difference is bit 19
+```
+
+Every step completes. PWR_ON, PWR_ON_2ND, PWR_CLK_DIS cleared, PWR_ISO
+cleared, SRAM_PDN cleared with **SRAM_PDN_ACK clearing in 0 us**, SRAM_ISOINT_B
+set, SRAM_CKISO cleared, SRAM_SLEEP_B set, PWR_RST_B released. This is much
+further than B-40 ever got, and it retires that entry's "the MP2 power switch
+does not acknowledge for anyone" — with the isolation cleared, it does.
+
+**What is left is `SRAM_SLEEP_B_ACK` (bit 19), and it never asserts.**
+
+**And the tell is that NEITHER SRAM ack ever moves, in any state.** At rest MP2
+sits with `SRAM_PDN = 1` and `SRAM_PDN_ACK = 0` — a genuinely powered-down SRAM
+should be acknowledging that. Both acks read 0 always. That is the signature of
+SRAM control logic with no supply, not of logic that disagrees with the request.
+
+**Not the clock.** Cluster B's source is `ARMPLLDIV_MUXSEL[1:0]` in MCUMIXED,
+which we *can* write. Walked through all four (CLKSQ / ARMPLL / MAINPLL /
+UNIVPLL): both acks stayed 0 at every one.
+
+**So the missing thing is the big cluster's SRAM rail**, which is exactly the
+one step of `cpu_power_on_buck()` we cannot perform: `BigiDVFSSRAMLDOSet(110000)`
+writes `0x102222b0`, in MCUCFG, which is unreachable from the non-secure world.
+The SMC that would do it, `0xC20003BF`, **returns 0 but has no observable
+effect** — the acks do not move whether it has been called or not.
+
+Two things that are NOT the problem, both measured:
+
+* The eFuse calibration is present and readable. `0x1020666C` reads
+  `0x0000998D` from Linux, **exactly** the `Big Vsram LDO_Cal/eFuse = 0x998d`
+  Android reports. Only MCUCFG (0x10200000 / 0x10222000) is blocked; the eFuse
+  block at 0x10206000 is fine.
+* The ack register hunt is settled. `PWR_STATUS`/`CPU_PWR_STATUS` are SPM+0x180
+  and +0x188, and the mt6797 CPU bit map is `MP0_CPU0..3` = bits 15..12,
+  `MP1_CPU0..3` = 11..8, **`MP2_CPU0..3` = 7..4**. MP2's four bits are zero in
+  every sample, which is consistent — we never got a core started, only the
+  cluster domain.
+
+**The next hypothesis, and it is concrete.** `BigiDVFSEnable_hp()` refuses to
+run unless `infoIdvfs == 0xff`, which the vendor comments as "true eFuse enable
+ptp" — i.e. **EEM/PTP must be initialised first**, and `mt_eem.c` is unported.
+If ATF's `BIGIDVFSSRAMLDOSET` depends on state that EEM sets up, that would
+explain a call that returns success and does nothing. That is the thread to
+pull next.
+
+**The cheaper alternative, if hands are available:** boot the Gemian Reference
+slot (boot2, needs the SILVER chord) and read `/sys/devices/system/cpu/online`.
+Gemian's `arch/arm64/kernel/psci.c` carries `cpu_power_on_buck()`
+byte-identical with `CONFIG_CL2_BUCK_CTRL` on and `CONFIG_NR_CPUS=10`. If
+Gemian shows 0-9, a stock Linux does this with our exact ATF and the diff is
+purely in kernel state; if it shows 0-7, then no Linux has ever done it here
+and Android's extra ingredient is the whole question.
+
+---
+
 ### CORRECTION, later the same evening: the iDVFS SMC service IS present. The SETTERS work; only the getters are missing.
 
 The section below concludes "there is no SMC shortcut" from four read-only
