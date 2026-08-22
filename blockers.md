@@ -2651,6 +2651,93 @@ currently wrong in exactly this way, and nobody has looked.
 
 ## 🟡 B-40 — the two Cortex-A72 cores never come up, and there is no cpufreq at all
 
+### 2026-08-22 (FINAL+1): CPUHVFS RUNS. And unpausing it takes the machine down instantly.
+
+**The DVFS co-processor is running on Linux on this device for the first time.**
+`tools/cspm-probe` was already a complete staged port from an earlier session;
+it was written, and then set aside on the wrong conclusion that CSPM was not
+the blocker. It is, and it works:
+
+```
+stage 1: IM fetch done after 749 us
+         IM VERIFY OK: all 2025 words read back correctly
+stage 2: after kick: FSM_STA=0x00650640 PCM_TIMER=0x0000092c
+         PCM_TIMER advancing 0x1175D -> 0x19865
+```
+
+`FSM_STA = 0x00650640` is **exactly Android's value**, and the PCM timer runs.
+The firmware is `pcm_dvfs_v0.1_160131_02`, 2025 words — the variant this
+blocker's earlier correction identified as the shipped one.
+
+**And the A53s survive it.** With every cluster kicked PAUSED, cpufreq still
+transitions (897000 -> 1014000 on request) and i2c6 is intact. So the
+co-processor can be loaded and started without disturbing the running system.
+
+#### Stage 3 is fine. Stage 4 is not.
+
+`stage=3` sets `CLUSTER_EN` on cluster B (`SW_RSV2` 0x30f0 -> 0x70f0) and
+nothing moves, correctly — the cluster is still `SW_PAUSE`d, and a paused
+cluster is one the firmware will not act on.
+
+`stage=4` clears the pause. **The machine dies instantly, three times out of
+three.** netconsole's last line is cut off mid-`printk`:
+
+```
+cspm-probe: about to CLEAR SW_PAUSE on cluster B only. LL/L stay paused.
+cspm-probe:   LL=0x000030f0 L=0x000030f0 B=0x000070f0
+cspm-probe:   <cut>
+```
+
+No oops, no call trace, no watchdog delay — the SoC stops between two printk
+calls. That is a rail event, not a software hang, and it is consistent with
+the co-processor taking over the CPU rails over i2c6 the moment it is unpaused.
+
+#### Why, and what has to be right before trying again
+
+Two things in the kick are wrong, and the second is the dangerous one.
+
+1. `writel(0, csram + OFFS_PAUSE_SRC)` clears the **global** pause source
+   (`PSF_PAUSE_INIT`), not just cluster B's. The vendor sets
+   `pause_src_map |= PSF_PAUSE_INIT` and clears bits individually.
+
+2. **The current-state words are seeded with a lie.** The probe writes
+   `hwsta_reg[i] = F_CURR(opp_sw_to_fw(NUM_CPU_OPP-1)) | V_CURR(0) | VS_CURR(0)`
+   — telling the firmware every cluster is **at 0 V**. The vendor writes the
+   real values:
+
+   ```c
+   cspm_write(hwsta_reg[i], F_CURR(opp_sw_to_fw(sta->opp[i])) |
+                            V_CURR(sta->volt[i]) | VS_CURR(sta->vsram[i]));
+   ```
+
+   An unpaused firmware that believes the current voltage is 0 will drive the
+   PMIC to "correct" it. `VPROC` is BUCKA — **LL, L and CCI, the clusters this
+   kernel is running on**.
+
+   The index direction is *not* the bug, checked: `opp_sw_to_fw(i) = 15 - i`
+   with software 0 = highest and firmware 0 = lowest, so the probe's
+   `SW_F_DES(opp_sw_to_fw(NUM_CPU_OPP-1))` is the lowest frequency, not the
+   highest.
+
+**Do not just retry stage 4.** The failure mode is a wrong voltage on the live
+CPU rail, written by a co-processor, straight to the DA9214 — around the
+kernel's regulator and its DT limits. Under-volting resets the box (seen);
+over-volting is a hardware risk that no amount of watchdog will undo. The next
+attempt needs `sta->opp/volt/vsram` seeded from what the rails actually are, a
+per-cluster pause map, and the i2c6 semaphore
+(`cpuhvfs_get_dvfsp_semaphore(SEMA_I2C_DRV)`) wired into `i2c-mt65xx` first.
+
+#### Lab: download mode has a software escape after all
+
+Two of the three stage-4 wedges came back **parked in download mode**
+(`0e8d:2000` preloader, then `0e8d:0003` BROM) — B-27's trap. `gemini-state.py`
+says this "needs hands". **It does not, at least not always:**
+`uhubctl -l 1-10 -p 1 -a off`, hold it down ~60-90 s across the reset, then
+`-a on`, and the device boots normally — the preloader never sees a host, so it
+never parks. That is worth having in the tooling.
+
+---
+
 ### 2026-08-22 (FINAL): the A72 blocker is CPUHVFS, and this time it is measured
 
 **CSPM — the DVFS co-processor — is not running on our system at all.** Read
