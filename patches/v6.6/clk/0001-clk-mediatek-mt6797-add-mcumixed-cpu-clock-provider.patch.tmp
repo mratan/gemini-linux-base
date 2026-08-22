@@ -1,0 +1,538 @@
+clk: mediatek: mt6797: model the MCUMIXED CPU clock tree
+
+MT6797 keeps its CPU clocks in a block at 0x1001a000 that mainline has never
+described, so the CPU clocks did not exist, mediatek-cpufreq had nothing to
+bind to, and the machine ran at whatever operating point LK left behind.
+Measured before this: 897 MHz on the little cluster against a rated 1547, and
+1274 MHz on the big-little cluster against a rated 2002.
+
+WHAT IS EXPOSED, AND WHAT DELIBERATELY IS NOT
+
+  ARMCAXPLL0  CON1 0x204   little cluster  (cpu0-3, "LL")   exposed
+  ARMCAXPLL1  CON1 0x214   big-little      (cpu4-7, "L")    exposed
+  ARMCAXPLL2  CON1 0x224   CCI                              NOT exposed
+  ARMCAXPLL3  CON1 0x234   spare                            NOT exposed
+
+ARMCAXPLL2 clocks the cache-coherent interconnect. It is live at ~630 MHz and
+load-bearing, and nothing here should be able to move it, so it is not
+modelled at all. The Cortex-A72 cluster has no entry because it has no PLL the
+kernel may drive: the vendor sets that cluster's armpll_addr to NULL and
+scales it through the iDVFS co-processor instead (mt_cpufreq.c,
+MT_CPU_DVFS_B). Note this corrects the handoff's table, which had ARMCAXPLL2
+down as the A72 cluster; the vendor's own per-cluster mapping says CCI.
+
+THE ARITHMETIC, AND THAT IT IS VALIDATED RATHER THAN ASSUMED
+
+    vco  = 26 MHz * pcw / 2^14        pcw    = CON1[20:0]
+    rate = vco / (1 << posdiv)        posdiv = CON1[26:24]
+
+Decoded from the running machine it gives 897 MHz and 1274 MHz from
+0xC1114000 and 0x400C4000, and 897 MHz is an exact entry in the vendor's OPP
+table for this die's speed bin. Driven the other way on #51 the hardware holds
+exactly the PCW the arithmetic predicts at every operating point tested --
+1547 MHz -> 0x400EE000, 2002 MHz -> 0x40134000, 1209 MHz -> 0xC00BA000.
+
+The postdiv rule is "smallest of 1, 2 or 4 that keeps the VCO at or above
+1050 MHz". That is not a guess either: it reproduces the vendor's own POS
+column for all 27 operating points of both A53 tables, including the two
+places where the vendor switches postdiv mid-table (LL 1118 -> 1014 and
+L 1092 -> 962).
+
+CUSTOM PLL OPS RATHER THAN mtk_clk_register_plls()
+
+These PLLs have no power register anywhere in the block, and the vendor never
+gates them -- it only ever writes CON1. Rather than invent a power sequence
+for the rail the running CPUs clock off, the ops here implement recalc/round/
+set_rate only; a clock with no enable op is permanently enabled, which is what
+the hardware is. The register write follows the vendor's adjust_armpll_dds()
+exactly: one store with PCW_CHG already set, preserving every undecoded bit.
+
+Each PLL also carries the rated maximum for its cluster and refuses anything
+above it. The OPP table is the real guard; this is the backstop for the day
+the OPP table is wrong, because what is on the far side of that is silicon
+running past its voltage.
+
+TWO GATES IN TOPCKGEN, AND WHY THEY MATTER
+
+CLK_MISC_CFG_0 bits 4 and 5 (armpll_divider_pll1_ck_en / pll2) gate the
+mainpll and univpll feeds into this block. They are the "intermediate" clock a
+cluster parks on while its ARMPLL relocks, and both read back 0 out of the
+bootloader -- so reparenting onto mainpll without enabling the gate first
+takes the clock away from a running cluster. Modelling them lets the clock
+framework enable them for us, in the right order.
+
+Every clock added here is declared so that a rate request cannot walk upwards:
+the muxes take CLK_SET_RATE_NO_REPARENT and no CLK_SET_RATE_PARENT, and the
+gates take no flags at all. mainpll clocks the AXI bus, MSDC, I2C and the
+UARTs, and issue #56 is what happens when a MediaTek mux is allowed to
+reprogram it -- there for the GPU, and the CPU muxes are the same shape.
+
+Verified on #48, which changed nothing: the new clocks read 897.000 MHz and
+1274.000 MHz, the muxes report parent index 1 (ARMPLL), and MUXSEL, CKDIV,
+CLK_MISC_CFG_0 and both CON1s are bit-for-bit what they were before the
+driver existed. Panel gate PASS 13/13.
+
+--- a/drivers/clk/mediatek/clk-mt6797-mcumixed.c
++++ b/drivers/clk/mediatek/clk-mt6797-mcumixed.c
+@@ -0,0 +1,375 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * MediaTek MT6797 MCUMIXED CPU clock provider.
++ *
++ * MT6797 keeps the CPU clock tree in its own block at 0x1001a000, entirely
++ * separate from topckgen and apmixedsys, and mainline has never modelled it.
++ * Without it the CPU clocks do not exist and mediatek-cpufreq has nothing to
++ * bind to, which is why this SoC has run at whatever operating point the
++ * bootloader happened to leave behind.
++ *
++ * The block holds four ARMCAXPLLs and one mux-select register:
++ *
++ *   ARMCAXPLL0  CON0 0x200  CON1 0x204   little cluster   (cpu0-3, LL)
++ *   ARMCAXPLL1  CON0 0x210  CON1 0x214   big-little       (cpu4-7, L)
++ *   ARMCAXPLL2  CON0 0x220  CON1 0x224   CCI
++ *   ARMCAXPLL3  CON0 0x230  CON1 0x234   spare
++ *   ARMPLLDIV_MUXSEL 0x270   ARMPLLDIV_CKDIV 0x274
++ *
++ * Only ARMCAXPLL0 and ARMCAXPLL1 are exposed. ARMCAXPLL2 clocks the CCI and
++ * is deliberately left alone -- it is live and load-bearing, and nothing here
++ * should be able to touch it. ARMCAXPLL3 is unused. The Cortex-A72 cluster
++ * does NOT have a PLL in this list: the vendor driver sets its armpll_addr to
++ * NULL and drives that cluster's frequency through the iDVFS co-processor
++ * instead (mt_cpufreq.c, MT_CPU_DVFS_B).
++ *
++ * MUXSEL is two bits per cluster -- LL [3:2], L [5:4], B [1:0], CCI [7:6] --
++ * selecting 0 = 26 MHz, 1 = the cluster's own ARMPLL, 2 = mainpll, 3 = univpll.
++ * The mainpll and univpll feeds are separately gated in topckgen's
++ * CLK_MISC_CFG_0, and are exposed there as armpll_div_pll1/armpll_div_pll2;
++ * cpufreq parks the CPU on one of those while its ARMPLL relocks.
++ *
++ * PLL arithmetic, taken from the vendor's _cpu_freq_calc()/_cpu_dds_calc():
++ *
++ *     vco  = 26 MHz * pcw / 2^14        pcw = CON1[20:0]
++ *     rate = vco / (1 << posdiv)        posdiv = CON1[26:24]
++ *
++ * Validated against this silicon in both directions: CON1 = 0xC1114000 decodes
++ * to 897 MHz and 0x400C4000 to 1274 MHz, which is where the bootloader leaves
++ * the two clusters, and 897 MHz is an exact entry in the vendor's OPP table for
++ * this speed bin.
++ *
++ * Copyright (c) 2026 Gemini PDA Linux port
++ */
++
++#include <linux/bitfield.h>
++#include <linux/bitops.h>
++#include <linux/clk-provider.h>
++#include <linux/delay.h>
++#include <linux/io.h>
++#include <linux/math64.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/spinlock.h>
++
++#include <dt-bindings/clock/mt6797-clk.h>
++
++#include "clk-mtk.h"
++
++#define ARMCAXPLL0_CON1		0x204
++#define ARMCAXPLL1_CON1		0x214
++#define ARMPLLDIV_MUXSEL	0x270
++#define ARMPLLDIV_CKDIV		0x274
++
++#define ARMPLL_PCW		GENMASK(20, 0)
++#define ARMPLL_POSDIV		GENMASK(26, 24)
++#define ARMPLL_POSDIV_SHIFT	24
++#define ARMPLL_PCW_CHG		BIT(31)
++
++/* pcw is a 7.14 fixed-point multiplier of the 26 MHz reference */
++#define ARMPLL_PCW_FBITS	14
++
++/* vendor PLL_SETTLE_TIME, mt_cpufreq.c */
++#define ARMPLL_SETTLE_US	20
++
++/*
++ * The postdiv the vendor picks for a given target is reproduced exactly by
++ * "smallest postdiv of 1, 2 or 4 that keeps the VCO at or above 1050 MHz".
++ * Checked against every entry of both A53 OPP tables for this speed bin: 27
++ * out of 27 agree, including the two places where the vendor switches postdiv
++ * mid-table (LL 1118 -> 1014, L 1092 -> 962).
++ */
++#define ARMPLL_VCO_MIN		1050000000UL
++
++/* MUXSEL encoding, shared by all four clusters */
++enum {
++	ARMPLL_MUX_CLKSQ	= 0,	/* 26 MHz */
++	ARMPLL_MUX_ARMPLL	= 1,
++	ARMPLL_MUX_MAINPLL	= 2,
++	ARMPLL_MUX_UNIVPLL	= 3,
++};
++
++struct mt6797_armpll {
++	struct clk_hw		hw;
++	void __iomem		*con1;
++	unsigned long		max_rate;
++};
++
++#define to_mt6797_armpll(_hw) container_of(_hw, struct mt6797_armpll, hw)
++
++static unsigned int armpll_postdiv(unsigned long rate)
++{
++	unsigned int pd;
++
++	for (pd = 1; pd < 4; pd <<= 1) {
++		if ((u64)rate * pd >= ARMPLL_VCO_MIN)
++			return pd;
++	}
++
++	return 4;
++}
++
++static u32 armpll_pcw(unsigned long vco, unsigned long fin)
++{
++	return div64_ul((u64)vco << ARMPLL_PCW_FBITS, fin);
++}
++
++static unsigned long armpll_rate(u32 pcw, unsigned int posdiv,
++				 unsigned long fin)
++{
++	return ((u64)fin * pcw >> ARMPLL_PCW_FBITS) >> posdiv;
++}
++
++static unsigned long mt6797_armpll_recalc_rate(struct clk_hw *hw,
++					       unsigned long parent_rate)
++{
++	struct mt6797_armpll *pll = to_mt6797_armpll(hw);
++	u32 con1 = readl(pll->con1);
++
++	return armpll_rate(FIELD_GET(ARMPLL_PCW, con1),
++			   FIELD_GET(ARMPLL_POSDIV, con1), parent_rate);
++}
++
++static long mt6797_armpll_round_rate(struct clk_hw *hw, unsigned long rate,
++				     unsigned long *parent_rate)
++{
++	struct mt6797_armpll *pll = to_mt6797_armpll(hw);
++	unsigned int pd;
++
++	rate = min(rate, pll->max_rate);
++
++	pd = armpll_postdiv(rate);
++
++	return armpll_rate(armpll_pcw(rate * pd, *parent_rate),
++			   ffs(pd) - 1, *parent_rate);
++}
++
++static int mt6797_armpll_set_rate(struct clk_hw *hw, unsigned long rate,
++				  unsigned long parent_rate)
++{
++	struct mt6797_armpll *pll = to_mt6797_armpll(hw);
++	unsigned int pd;
++	u32 con1;
++
++	/*
++	 * A rate above what this cluster is rated for must never reach the
++	 * hardware. The OPP table is the real guard; this is the backstop for
++	 * the day the OPP table is wrong, because the failure mode on the far
++	 * side of it is silicon running past its voltage.
++	 */
++	if (rate > pll->max_rate) {
++		pr_err("%s: refusing %lu Hz, rated maximum is %lu Hz\n",
++		       clk_hw_get_name(hw), rate, pll->max_rate);
++		return -EINVAL;
++	}
++
++	pd = armpll_postdiv(rate);
++
++	/*
++	 * Preserve every bit we have not decoded. Only postdiv and pcw are
++	 * ours; CON1 carries other vendor-defined fields whose reset values
++	 * differ between the two PLLs on this very board.
++	 *
++	 * The write matches the vendor's adjust_armpll_dds(): one store with
++	 * PCW_CHG already set, rather than mainline's store-then-set-CHG pair.
++	 * That is deliberate -- CON1 bit 31 reads back as 1 on ARMCAXPLL0 and 0
++	 * on ARMCAXPLL1 here, so it is plainly not a level the vendor bothers
++	 * to clear, and this is the sequence Android has driven these two PLLs
++	 * with on this silicon.
++	 *
++	 * No postdiv-before/after-pcw ordering dance either: the vendor needs
++	 * it because it reprograms the PLL the CPU is running on, and cpufreq
++	 * has already parked us on mainpll before calling this.
++	 */
++	con1 = readl(pll->con1);
++	con1 &= ~(ARMPLL_POSDIV | ARMPLL_PCW);
++	con1 |= FIELD_PREP(ARMPLL_POSDIV, ffs(pd) - 1);
++	con1 |= FIELD_PREP(ARMPLL_PCW, armpll_pcw(rate * pd, parent_rate));
++	writel(con1 | ARMPLL_PCW_CHG, pll->con1);
++
++	udelay(ARMPLL_SETTLE_US);
++
++	return 0;
++}
++
++/*
++ * No .enable/.disable/.prepare. These PLLs have no power register anywhere in
++ * this block, the vendor never gates them -- it only ever writes CON1 -- and a
++ * clock with no enable op is treated as permanently enabled. Inventing a
++ * power sequence for the rail the running CPUs clock off is not worth the
++ * symmetry.
++ */
++static const struct clk_ops mt6797_armpll_ops = {
++	.recalc_rate	= mt6797_armpll_recalc_rate,
++	.round_rate	= mt6797_armpll_round_rate,
++	.set_rate	= mt6797_armpll_set_rate,
++};
++
++static const char * const ll_parents[] = {
++	[ARMPLL_MUX_CLKSQ]	= "clk26m",
++	[ARMPLL_MUX_ARMPLL]	= "armcaxpll0",
++	[ARMPLL_MUX_MAINPLL]	= "armpll_div_pll1",
++	[ARMPLL_MUX_UNIVPLL]	= "armpll_div_pll2",
++};
++
++static const char * const l_parents[] = {
++	[ARMPLL_MUX_CLKSQ]	= "clk26m",
++	[ARMPLL_MUX_ARMPLL]	= "armcaxpll1",
++	[ARMPLL_MUX_MAINPLL]	= "armpll_div_pll1",
++	[ARMPLL_MUX_UNIVPLL]	= "armpll_div_pll2",
++};
++
++struct mt6797_armpll_desc {
++	unsigned int	id;
++	const char	*name;
++	u32		con1;
++	unsigned long	max_rate;
++};
++
++/*
++ * Rated maxima are the top entry of each cluster's OPP table for the speed
++ * bin this die reports (SB): LL 1547 MHz, L 2002 MHz.
++ */
++static const struct mt6797_armpll_desc mt6797_armplls[] = {
++	{ CLK_MCU_ARMCAXPLL0, "armcaxpll0", ARMCAXPLL0_CON1, 1547000000UL },
++	{ CLK_MCU_ARMCAXPLL1, "armcaxpll1", ARMCAXPLL1_CON1, 2002000000UL },
++};
++
++struct mt6797_cpumux_desc {
++	unsigned int		id;
++	const char		*name;
++	const char * const	*parents;
++	u8			shift;
++};
++
++static const struct mt6797_cpumux_desc mt6797_cpumuxes[] = {
++	{ CLK_MCU_LL_SEL, "mcu_ll_sel", ll_parents, 2 },
++	{ CLK_MCU_L_SEL,  "mcu_l_sel",  l_parents,  4 },
++};
++
++/* LL is CKDIV[9:5], L is CKDIV[14:10] */
++#define CKDIV_LL		GENMASK(9, 5)
++#define CKDIV_L			GENMASK(14, 10)
++
++static DEFINE_SPINLOCK(mt6797_mcumixed_lock);
++
++static int mt6797_mcumixed_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct clk_hw_onecell_data *clk_data;
++	void __iomem *base;
++	u32 ckdiv;
++	int i, ret;
++
++	base = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(base))
++		return PTR_ERR(base);
++
++	/*
++	 * ARMPLLDIV_CKDIV is a fractional post-divider the vendor uses only for
++	 * the handful of OPPs below what postdiv alone can reach. We model none
++	 * of it and the bootloader leaves it at zero. If it is ever not zero
++	 * then every rate this driver reports is wrong by an unknown fraction,
++	 * and wrong rates paired with real voltages is how CPUs die -- so
++	 * refuse to register rather than hand cpufreq a lie.
++	 */
++	ckdiv = readl(base + ARMPLLDIV_CKDIV);
++	if (ckdiv & (CKDIV_LL | CKDIV_L)) {
++		dev_err(dev, "ARMPLLDIV_CKDIV = %#x: an A53 cluster is running through the fractional divider, which this driver does not model\n",
++			ckdiv);
++		return -ENODEV;
++	}
++
++	clk_data = mtk_alloc_clk_data(CLK_MCU_NR);
++	if (!clk_data)
++		return -ENOMEM;
++
++	for (i = 0; i < ARRAY_SIZE(mt6797_armplls); i++) {
++		const struct mt6797_armpll_desc *d = &mt6797_armplls[i];
++		struct clk_init_data init = {};
++		struct mt6797_armpll *pll;
++
++		pll = devm_kzalloc(dev, sizeof(*pll), GFP_KERNEL);
++		if (!pll) {
++			ret = -ENOMEM;
++			goto err;
++		}
++
++		pll->con1 = base + d->con1;
++		pll->max_rate = d->max_rate;
++
++		init.name = d->name;
++		init.ops = &mt6797_armpll_ops;
++		init.parent_names = (const char *[]){ "clk26m" };
++		init.num_parents = 1;
++		pll->hw.init = &init;
++
++		ret = devm_clk_hw_register(dev, &pll->hw);
++		if (ret) {
++			dev_err(dev, "failed to register %s: %d\n",
++				d->name, ret);
++			goto err;
++		}
++
++		clk_data->hws[d->id] = &pll->hw;
++	}
++
++	for (i = 0; i < ARRAY_SIZE(mt6797_cpumuxes); i++) {
++		const struct mt6797_cpumux_desc *d = &mt6797_cpumuxes[i];
++		struct clk_hw *hw;
++
++		/*
++		 * CLK_SET_RATE_NO_REPARENT, and no CLK_SET_RATE_PARENT.
++		 *
++		 * cpufreq reparents this mux itself, deliberately, and sets the
++		 * rate on the ARMPLL it fetches with clk_get_parent(). What it
++		 * must never be able to do is serve a rate request by moving
++		 * onto mainpll or univpll and reprogramming one of them -- both
++		 * clock the whole die. That is not hypothetical: it is issue
++		 * #56 exactly, where CLK_TOP_MUX_MFG was allowed to do it for
++		 * the GPU and took every other bus master down with it.
++		 */
++		hw = devm_clk_hw_register_mux(dev, d->name, d->parents, 4,
++					      CLK_SET_RATE_NO_REPARENT,
++					      base + ARMPLLDIV_MUXSEL,
++					      d->shift, 2, 0,
++					      &mt6797_mcumixed_lock);
++		if (IS_ERR(hw)) {
++			dev_err(dev, "failed to register %s: %pe\n",
++				d->name, hw);
++			ret = PTR_ERR(hw);
++			goto err;
++		}
++
++		clk_data->hws[d->id] = hw;
++	}
++
++	ret = of_clk_add_hw_provider(dev->of_node, of_clk_hw_onecell_get,
++				     clk_data);
++	if (ret)
++		goto err;
++
++	platform_set_drvdata(pdev, clk_data);
++
++	return 0;
++
++err:
++	mtk_free_clk_data(clk_data);
++	return ret;
++}
++
++static const struct of_device_id of_match_clk_mt6797_mcumixed[] = {
++	{ .compatible = "mediatek,mt6797-mcumixed" },
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(of, of_match_clk_mt6797_mcumixed);
++
++static struct platform_driver clk_mt6797_mcumixed_drv = {
++	.probe = mt6797_mcumixed_probe,
++	.driver = {
++		.name = "clk-mt6797-mcumixed",
++		.of_match_table = of_match_clk_mt6797_mcumixed,
++	},
++};
++builtin_platform_driver(clk_mt6797_mcumixed_drv);
+--- a/drivers/clk/mediatek/Kconfig
++++ b/drivers/clk/mediatek/Kconfig
+@@ -343,6 +343,18 @@
+ 	help
+ 	  This driver supports MediaTek MT6797 vencsys clocks.
+ 
++config COMMON_CLK_MT6797_MCUMIXED
++	bool "Clock driver for MediaTek MT6797 mcumixed (CPU clocks)"
++	depends on COMMON_CLK_MT6797
++	default COMMON_CLK_MT6797
++	help
++	  This driver supports the MediaTek MT6797 MCUMIXED block, which holds
++	  the ARMCAXPLLs and the per-cluster CPU clock muxes. Without it the
++	  CPU clocks do not exist and mediatek-cpufreq cannot bind, so the CPUs
++	  run at whatever operating point the bootloader left behind.
++
++	  Built in rather than modular: cpufreq needs these clocks at boot.
++
+ config COMMON_CLK_MT7622
+ 	tristate "Clock driver for MediaTek MT7622"
+ 	depends on ARCH_MEDIATEK || COMPILE_TEST
+--- a/drivers/clk/mediatek/Makefile
++++ b/drivers/clk/mediatek/Makefile
+@@ -25,6 +25,7 @@
+ obj-$(CONFIG_COMMON_CLK_MT6795_VDECSYS) += clk-mt6795-vdecsys.o
+ obj-$(CONFIG_COMMON_CLK_MT6795_VENCSYS) += clk-mt6795-vencsys.o
+ obj-$(CONFIG_COMMON_CLK_MT6797) += clk-mt6797.o
++obj-$(CONFIG_COMMON_CLK_MT6797_MCUMIXED) += clk-mt6797-mcumixed.o
+ obj-$(CONFIG_COMMON_CLK_MT6797_IMGSYS) += clk-mt6797-img.o
+ obj-$(CONFIG_COMMON_CLK_MT6797_MFGCFG) += clk-mt6797-mfg.o
+ obj-$(CONFIG_COMMON_CLK_MT6797_MMSYS) += clk-mt6797-mm.o
+--- a/include/dt-bindings/clock/mt6797-clk.h
++++ b/include/dt-bindings/clock/mt6797-clk.h
+@@ -102,7 +102,21 @@
+ #define	CLK_TOP_MSDCPLL_D2			92
+ #define	CLK_TOP_MSDCPLL_D4			93
+ #define	CLK_TOP_MSDCPLL_D8			94
+-#define	CLK_TOP_NR				95
++/*
++ * The mainpll and univpll feeds into the MCUMIXED ARMPLL divider block,
++ * CLK_MISC_CFG_0 bits 4 and 5. cpufreq parks a CPU cluster on one of these
++ * while its own ARMPLL relocks.
++ */
++#define	CLK_TOP_ARMPLL_DIV_PLL1			95
++#define	CLK_TOP_ARMPLL_DIV_PLL2			96
++#define	CLK_TOP_NR				97
++
++/* MCUMIXED (mcumixed@1001a000) -- the CPU clock tree */
++#define CLK_MCU_ARMCAXPLL0			0
++#define CLK_MCU_ARMCAXPLL1			1
++#define CLK_MCU_LL_SEL				2
++#define CLK_MCU_L_SEL				3
++#define CLK_MCU_NR				4
+ 
+ /* APMIXED_SYS */
+ #define CLK_APMIXED_MAINPLL			1
+--- a/drivers/clk/mediatek/clk-mt6797.c
++++ b/drivers/clk/mediatek/clk-mt6797.c
+@@ -420,6 +420,27 @@
+ 				    ARRAY_SIZE(top_muxes), base,
+ 				    &mt6797_clk_lock, clk_data);
+ 
++	/*
++	 * CLK_MISC_CFG_0 bit 4 (armpll_divider_pll1_ck_en) and bit 5
++	 * (armpll_divider_pll2_ck_en) gate the mainpll and univpll feeds into
++	 * the MCUMIXED ARMPLL divider block. They are the "intermediate" clock
++	 * a CPU cluster parks on while its own ARMPLL relocks, and both read
++	 * back 0 out of the bootloader -- so a clk_set_parent onto mainpll
++	 * without enabling the gate first takes the clock away from a running
++	 * cluster. Modelling them here lets the clock framework enable them for
++	 * us, in the right order, when cpufreq prepares the intermediate clock.
++	 *
++	 * Plain gates, flags 0: no CLK_SET_RATE_PARENT. A rate request must
++	 * never be allowed to walk up from a CPU cluster into mainpll, which
++	 * clocks the AXI bus, MSDC, I2C and the UARTs (issue #56).
++	 */
++	clk_data->hws[CLK_TOP_ARMPLL_DIV_PLL1] =
++		clk_hw_register_gate(&pdev->dev, "armpll_div_pll1", "syspll_ck",
++				     0, base + 0x104, 4, 0, &mt6797_clk_lock);
++	clk_data->hws[CLK_TOP_ARMPLL_DIV_PLL2] =
++		clk_hw_register_gate(&pdev->dev, "armpll_div_pll2", "univpll_ck",
++				     0, base + 0x104, 5, 0, &mt6797_clk_lock);
++
+ 	return of_clk_add_hw_provider(node, of_clk_hw_onecell_get, clk_data);
+ }
+ 

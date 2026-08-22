@@ -1,0 +1,275 @@
+regulator: add the MT6797 CPU SRAM LDO (VSRAM)
+
+The A53 clusters' SRAM supply on this SoC is an array of eight on-die LDOs in
+INFRACFG_AO, not a PMIC rail:
+
+    CPULDO_CTRL_0  0xf98  bits [7:0]  one enable per LDO
+    CPULDO_CTRL_1  0xf9c  four lanes, 8 bits apart, 4-bit value in [3:0]
+    CPULDO_CTRL_2  0xfa0  the other four lanes
+
+The value encoding is the vendor's VOLT_TO_PMIC_VAL()/PMIC_VAL_TO_VOLT() pair
+from mt_cpufreq.c: 25 mV per step with selector 3 meaning 900 mV, so selector
+15 is 1200 mV -- MAX_VSRAM_VOLT, the ceiling the vendor's own code refuses to
+exceed.
+
+MEASURED FIRST. Before any of this existed the board held CTRL_0 = 0x000000FF
+(all eight enabled) and CTRL_1 = CTRL_2 = 0x0B0B0B0B, selector 11, which
+decodes to 1100 mV against the 1000 mV BUCKA was sitting at -- exactly the
+vendor's NORMAL_DIFF_VRSAM_VPROC of 100 mV. That cross-check is what says the
+decode is right. (It also corrects the handoff, which recorded VSRAM as
+1200 mV; it was 1100 mV.)
+
+WHY IT HAS TO MOVE. The vendor's constraint is Vsram >= Vproc, and no more
+than MAX_DIFF_VSRAM_VPROC (300 mV) above it -- not the 100-200 mV window
+mediatek-cpufreq's comment describes for other SoCs. cpufreq needs Vproc at
+1200 mV for the top operating point of either A53 cluster, and a VSRAM left at
+1100 mV breaks the first half of that rule from 1125 mV upwards.
+
+Pinning VSRAM at 1200 mV in the device tree makes the whole 1000-1200 mV Vproc
+range legal with one static setting. That is why this is a plain regulator
+with min == max and no consumer, rather than the CPUs' sram-supply:
+mediatek-cpufreq turns a present sram regulator into software voltage
+tracking, which would fight the pin and fail every transition -- and would put
+i2c6 traffic, the fragile part of this machine, in the middle of every CPU
+frequency change.
+
+Verified on #49: CTRL_1/2 went 0x0B0B0B0B -> 0x0F0F0F0F, the core logged
+"vsram_cpu: Bringing 1100000uV into 1200000-1200000uV", eight CPUs healthy,
+panel gate PASS 13/13.
+
+--- a/drivers/regulator/Kconfig
++++ b/drivers/regulator/Kconfig
+@@ -805,6 +805,19 @@
+ 	  This driver supports the control of different power rails of device
+ 	  through regulator interface.
+ 
++config REGULATOR_MT6797_CPU_SRAM
++	bool "MediaTek MT6797 CPU SRAM LDO (VSRAM)"
++	depends on MFD_SYSCON
++	depends on ARCH_MEDIATEK || COMPILE_TEST
++	help
++	  Say y here to expose the MT6797's on-die CPU SRAM LDO array, which
++	  lives in INFRACFG_AO rather than on the PMIC. Its voltage has to sit
++	  at or above Vproc, so it must be raised before cpufreq can take the
++	  CPU core rail to the top of either Cortex-A53 cluster's OPP table.
++
++	  Built in rather than modular: it has to be settled before cpufreq
++	  starts moving Vproc.
++
+ config REGULATOR_MT6315
+ 	tristate "MediaTek MT6315 PMIC"
+ 	depends on SPMI
+--- a/drivers/regulator/Makefile
++++ b/drivers/regulator/Makefile
+@@ -99,6 +99,7 @@
+ obj-$(CONFIG_REGULATOR_MT6311) += mt6311-regulator.o
+ obj-$(CONFIG_REGULATOR_MT6315) += mt6315-regulator.o
+ obj-$(CONFIG_REGULATOR_MT6323)	+= mt6323-regulator.o
++obj-$(CONFIG_REGULATOR_MT6797_CPU_SRAM) += mt6797-cpu-sram-ldo.o
+ obj-$(CONFIG_REGULATOR_MT6331)	+= mt6331-regulator.o
+ obj-$(CONFIG_REGULATOR_MT6332)	+= mt6332-regulator.o
+ obj-$(CONFIG_REGULATOR_MT6351)	+= mt6351-regulator.o
+--- a/drivers/regulator/mt6797-cpu-sram-ldo.c
++++ b/drivers/regulator/mt6797-cpu-sram-ldo.c
+@@ -0,0 +1,201 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * MediaTek MT6797 CPU SRAM LDO (VSRAM).
++ *
++ * The Cortex-A53 clusters' SRAM runs off an array of eight on-die LDOs in
++ * INFRACFG_AO, not off a PMIC rail. The vendor drives them from
++ * set_cur_volt_sram_l() in mt_cpufreq.c and holds them one step above Vproc:
++ *
++ *     CPULDO_CTRL_0  0xF98  bits [7:0]   one enable per LDO, all eight
++ *     CPULDO_CTRL_1  0xF9C  four lanes, 8 bits apart, 4-bit value in [3:0]
++ *     CPULDO_CTRL_2  0xFA0  the other four lanes, same shape
++ *
++ * The value encoding is the vendor's VOLT_TO_PMIC_VAL()/PMIC_VAL_TO_VOLT()
++ * pair: 25 mV per step with selector 3 meaning 900 mV, so selector 15 is
++ * 1200 mV -- MAX_VSRAM_VOLT, the ceiling the vendor itself will not exceed.
++ *
++ * Read from this board before any of this existed: CTRL_0 = 0x000000FF (all
++ * eight enabled) and CTRL_1 = CTRL_2 = 0x0B0B0B0B, selector 11, which decodes
++ * to 1100 mV against a Vproc of 1000 mV -- exactly the vendor's
++ * NORMAL_DIFF_VRSAM_VPROC of 100 mV.
++ *
++ * WHY THIS EXISTS. The vendor's constraint is Vsram >= Vproc, and no more than
++ * MAX_DIFF_VSRAM_VPROC (300 mV) above it. cpufreq needs Vproc to reach 1200 mV
++ * for the top operating point of either A53 cluster, and VSRAM sitting at
++ * 1100 mV would break the first half of that constraint well before then. The
++ * whole Vproc range this port uses, 1000-1200 mV, is legal against a VSRAM
++ * pinned at its 1200 mV maximum, so this driver exposes the rail and the
++ * device tree pins it there -- one static setting rather than tracking Vproc
++ * through every DVFS transition. That keeps the i2c6 bus, which is the fragile
++ * part of this machine, out of the middle of a CPU frequency change.
++ *
++ * Deliberately left without a consumer. It is NOT wired as the CPUs'
++ * sram-supply: mediatek-cpufreq turns a present sram regulator into software
++ * voltage tracking, which would try to move a rail this driver has pinned and
++ * fail every transition.
++ *
++ * Copyright (c) 2026 Gemini PDA Linux port
++ */
++
++#include <linux/bitfield.h>
++#include <linux/mfd/syscon.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/regmap.h>
++#include <linux/regulator/driver.h>
++#include <linux/regulator/of_regulator.h>
++
++#define CPULDO_CTRL_0		0xf98
++#define CPULDO_CTRL_1		0xf9c
++#define CPULDO_CTRL_2		0xfa0
++
++#define CPULDO_ALL_ENABLE	0xff
++
++/* four lanes per register, 8 bits apart, 4-bit value at the bottom of each */
++#define CPULDO_LANES		4
++#define CPULDO_LANE_SHIFT	8
++#define CPULDO_LANE_VAL		GENMASK(3, 0)
++#define CPULDO_LANE_MASK	0x0f0f0f0f
++
++/*
++ * The vendor's encoding, from PMIC_VAL_TO_VOLT(): selector 3 is 900 mV and
++ * every step is 25 mV, so selector 15 is 1200 mV. Selectors 0-2 are special
++ * cases in the vendor code for voltages far below anything usable here
++ * (0 = 1050 mV, 1 = 600 mV, 2 = 700 mV) and are simply not offered.
++ */
++#define CPULDO_MIN_SEL		3
++#define CPULDO_MIN_UV		900000
++#define CPULDO_STEP_UV		25000
++#define CPULDO_N_VOLTAGES	16
++
++/* MIN_VSRAM_VOLT / MAX_VSRAM_VOLT, mt_cpufreq.c */
++#define VSRAM_FLOOR_UV		1000000
++#define VSRAM_CEIL_UV		1200000
++
++struct mt6797_cpu_sram_ldo {
++	struct regmap *regmap;
++};
++
++static int mt6797_cpu_sram_get_voltage_sel(struct regulator_dev *rdev)
++{
++	struct mt6797_cpu_sram_ldo *ldo = rdev_get_drvdata(rdev);
++	unsigned int v1, v2;
++	int ret;
++
++	ret = regmap_read(ldo->regmap, CPULDO_CTRL_1, &v1);
++	if (ret)
++		return ret;
++
++	ret = regmap_read(ldo->regmap, CPULDO_CTRL_2, &v2);
++	if (ret)
++		return ret;
++
++	/*
++	 * All eight lanes must agree; the vendor BUG_ON()s when they do not,
++	 * because half the CPU SRAM at one voltage and half at another is not
++	 * a state worth reasoning about.
++	 */
++	if (v1 != v2 || (v1 & ~CPULDO_LANE_MASK)) {
++		dev_err(&rdev->dev, "CPULDO_CTRL_1/2 = %#x/%#x: lanes disagree\n",
++			v1, v2);
++		return -EIO;
++	}
++
++	return v1 & CPULDO_LANE_VAL;
++}
++
++static int mt6797_cpu_sram_set_voltage_sel(struct regulator_dev *rdev,
++					   unsigned int sel)
++{
++	struct mt6797_cpu_sram_ldo *ldo = rdev_get_drvdata(rdev);
++	unsigned int val = 0;
++	int uV, ret, i;
++
++	uV = regulator_list_voltage_linear(rdev, sel);
++	if (uV < VSRAM_FLOOR_UV || uV > VSRAM_CEIL_UV) {
++		dev_err(&rdev->dev, "refusing %d uV, VSRAM range is %d-%d uV\n",
++			uV, VSRAM_FLOOR_UV, VSRAM_CEIL_UV);
++		return -EINVAL;
++	}
++
++	/* every LDO enabled, exactly as the vendor does before each write */
++	ret = regmap_update_bits(ldo->regmap, CPULDO_CTRL_0,
++				 CPULDO_ALL_ENABLE, CPULDO_ALL_ENABLE);
++	if (ret)
++		return ret;
++
++	for (i = 0; i < CPULDO_LANES; i++)
++		val |= sel << (i * CPULDO_LANE_SHIFT);
++
++	ret = regmap_write(ldo->regmap, CPULDO_CTRL_1, val);
++	if (ret)
++		return ret;
++
++	return regmap_write(ldo->regmap, CPULDO_CTRL_2, val);
++}
++
++static const struct regulator_ops mt6797_cpu_sram_ops = {
++	.list_voltage		= regulator_list_voltage_linear,
++	.map_voltage		= regulator_map_voltage_linear,
++	.get_voltage_sel	= mt6797_cpu_sram_get_voltage_sel,
++	.set_voltage_sel	= mt6797_cpu_sram_set_voltage_sel,
++};
++
++static const struct regulator_desc mt6797_cpu_sram_desc = {
++	.name		= "vsram_cpu",
++	.ops		= &mt6797_cpu_sram_ops,
++	.type		= REGULATOR_VOLTAGE,
++	.owner		= THIS_MODULE,
++	.n_voltages	= CPULDO_N_VOLTAGES,
++	.min_uV		= CPULDO_MIN_UV,
++	.uV_step	= CPULDO_STEP_UV,
++	.linear_min_sel	= CPULDO_MIN_SEL,
++};
++
++static int mt6797_cpu_sram_ldo_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct mt6797_cpu_sram_ldo *ldo;
++	struct regulator_config cfg = {};
++	struct regulator_dev *rdev;
++
++	ldo = devm_kzalloc(dev, sizeof(*ldo), GFP_KERNEL);
++	if (!ldo)
++		return -ENOMEM;
++
++	ldo->regmap = syscon_regmap_lookup_by_phandle(dev->of_node,
++						      "mediatek,infracfg");
++	if (IS_ERR(ldo->regmap))
++		return dev_err_probe(dev, PTR_ERR(ldo->regmap),
++				     "no infracfg regmap\n");
++
++	cfg.dev = dev;
++	cfg.of_node = dev->of_node;
++	cfg.init_data = of_get_regulator_init_data(dev, dev->of_node,
++						   &mt6797_cpu_sram_desc);
++	cfg.driver_data = ldo;
++	cfg.regmap = ldo->regmap;
++
++	rdev = devm_regulator_register(dev, &mt6797_cpu_sram_desc, &cfg);
++	if (IS_ERR(rdev))
++		return dev_err_probe(dev, PTR_ERR(rdev),
++				     "failed to register vsram_cpu\n");
++
++	return 0;
++}
++
++static const struct of_device_id mt6797_cpu_sram_ldo_of_match[] = {
++	{ .compatible = "mediatek,mt6797-cpu-sram-ldo" },
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(of, mt6797_cpu_sram_ldo_of_match);
++
++static struct platform_driver mt6797_cpu_sram_ldo_driver = {
++	.probe = mt6797_cpu_sram_ldo_probe,
++	.driver = {
++		.name = "mt6797-cpu-sram-ldo",
++		.of_match_table = mt6797_cpu_sram_ldo_of_match,
++	},
++};
++builtin_platform_driver(mt6797_cpu_sram_ldo_driver);

@@ -1957,6 +1957,81 @@ required booting boot1 Android and restoring `boot-gpustack4.img`
 other known-good.** Android on boot1 remains the deep fallback and was
 untouched throughout.
 
+## 🔴 B-47 — eight cores at maximum takes the machine down, and the battery sags 620 mV first
+
+**Opened 2026-08-22, on `#51`, the first kernel with working CPU DVFS.**
+
+The DVFS itself is sound (B-40, and the whole of `04-docs/STATE-2026-08-22b.md`).
+This is about what happens at the top of the table under real load.
+
+**The experiment.** Two phases on `#51`:
+
+| phase | what | result |
+|---|---|---|
+| 1 | ~1040 LL + ~1120 L OPP transitions, both clusters, CPUs otherwise idle | **clean**, PLLs correct afterwards |
+| 2 | all eight cores pinned at 1547 / 2002 MHz, Vproc 1.20 V | **died between 15 s and 30 s** |
+
+Phase 1 matters as much as phase 2: **over two thousand frequency transitions
+with no fault**, which is what says the clock/regulator path is not the
+problem.
+
+**What was seen before it went.** At t=15 s, the one sample that got out:
+
+```
+temp = 38000 mC        (charger sensor -- NOT a die sensor, see below)
+vbat = 3524000 uV      down from 4144000 uV, "Full", before the load
+LLclk = 1547000000     Lclk = 2002000000        both correct
+```
+
+A **620 mV sag in under fifteen seconds**, and then the machine was gone. It
+did not reboot: it was found parked in the MediaTek preloader (`0e8d:2008`),
+which is where this device lands after a power-loss reset with a host
+attached, and it needed the physical Esc+silver+power recovery.
+
+**The hypothesis, stated as a hypothesis.** This looks like power delivery, not
+DVFS logic: eight A53s at 1.55/2.0 GHz and 1.20 V is by a wide margin the
+largest current this machine has ever been asked for, the charger supplies
+roughly 2.2 W against a load of several, and B-42 already records that this
+device draws faster than it charges. But **it is not proven**, and the reason
+it is not proven is a plain instrumentation failure on my part: netconsole was
+not armed for the run. The handoff said in as many words to decide these
+questions from netconsole, and I ran the single riskiest experiment of the
+session without it.
+
+**What is NOT eliminated.** A die thermal shutdown. There is no CPU
+temperature sensor on this machine at all -- the only thermal zone is
+`bq25890-charger-0` and the only cooling device is the GPU's devfreq -- so
+`CPUFREQ_IS_COOLING_DEV` registers a cooling device that nothing will ever
+bind to a trip point. MT6797 has an on-die thermal controller and mainline's
+`mtk_thermal` has no entry for it. **This SoC currently has no CPU thermal
+throttling of any kind**, which is a gap worth closing regardless of what
+killed it here.
+
+Also not eliminated: the CCI. It is still at the ~630 MHz the bootloader chose
+while the CPUs run at three times that, and it shares VPROC1 with them.
+
+**What unblocks it.**
+
+1. Arm netconsole, then repeat. The distinction that matters is whether the
+   last thing the kernel says is a regulator/PMIC complaint, a thermal event,
+   or nothing at all -- the third being the signature of a supply collapse.
+2. A staircase rather than a step: all eight cores loaded, `scaling_max_freq`
+   raised one OPP at a time, watching `voltage_now`. That finds the actual
+   limit instead of asserting one.
+3. Until then, **cap `scaling_max_freq` in userspace**, not in the OPP table.
+   The kernel should keep the full capability it has demonstrably got; a
+   frequency ceiling is policy and belongs where policy can be changed without
+   a reflash. Each occurrence of this fault costs a physical key-combination
+   recovery, which is the real reason to default it safe.
+
+**Do not read this as "the OPP tables are too aggressive."** Every voltage in
+them is the vendor's own static, pre-EEM figure for this speed bin -- i.e. the
+conservative ones, higher than the values Android actually runs after
+calibration. If 1547/2002 MHz is not sustainable on this hardware, the reason
+is the battery or the case, not the table.
+
+---
+
 ## 🔴 B-45 — i2c6's address phase works and its data phase does not, which is why the DA9214 "isn't there"
 
 ### UPDATE 2026-08-21 (late): both candidates are dead, and so is a third
@@ -2469,6 +2544,59 @@ script may do.
 currently wrong in exactly this way, and nobody has looked.
 
 ## 🟡 B-40 — the two Cortex-A72 cores never come up, and there is no cpufreq at all
+
+### RESOLVED 2026-08-22, the cpufreq half: DVFS is live and worth the measured 1.72x / 1.57x
+
+`#51`. Two policies, `policy0` = cpu0-3 on the little cluster's table and
+`policy4` = cpu4-7 on the big-little cluster's, driver `mtk-cpufreq`,
+governor schedutil. The A72 half of this blocker is untouched and stays open.
+
+Measured with a fixed integer loop, the same instrument that established the
+897/1274 MHz baseline:
+
+| cluster | from | to | Miter/s | measured | clock ratio |
+|---|---|---|---|---|---|
+| LL (cpu0) | 897 MHz | 1547 MHz | 286.1 -> 502.2 | **1.755x** | 1.725x |
+| L (cpu4) | 1209 MHz | 2002 MHz | 402.1 -> 666.2 | **1.657x** | 1.656x |
+| L vs the 1274 MHz LK left | | | | **1.572x** | 1.571x |
+
+**The PCW the hardware holds matches what the OPP arithmetic predicts at every
+point tested** — 1547 MHz -> `0x400EE000`, 2002 MHz -> `0x40134000`,
+1209 MHz -> `0xC00BA000`, 897 MHz -> `0xC1114000` — which is the same standard
+of proof the GPU clock fix (#56) was held to.
+
+What it took, in five patches:
+
+* `clk/0001` — the MCUMIXED provider. The block at `0x1001a000` was never
+  modelled, which is the whole reason there were no CPU clocks. Note it
+  **corrects this blocker's own table**: ARMCAXPLL2 is the CCI, not the A72
+  cluster. The vendor's per-cluster mapping is explicit — LL/L/CCI get
+  ARMCAXPLL0/1/2 and `MT_CPU_DVFS_B` gets `NULL`, because that cluster's
+  frequency belongs to the iDVFS co-processor.
+* `regulator/0003` — VSRAM, an array of eight on-die LDOs in INFRACFG_AO.
+  Measured at 1100 mV, not the 1200 mV the handoff recorded; pinned to 1200 mV
+  so the whole 1000-1200 mV Vproc range satisfies the vendor's Vsram >= Vproc.
+* `opp/0001` — a CPU with no OPP table shares nothing. Without this the two
+  bare A72 nodes made `dev_pm_opp_of_get_sharing_cpus()` return -ENOENT for
+  cpu0 and cost all eight A53s their cpufreq.
+* `cpufreq/0001` — mt6797 platform data, skip CPUs with no OPP table, and
+  blocklist mt6797 in `cpufreq-dt-platdev` (without which cpufreq-dt claimed
+  all ten CPUs under one policy carrying the wrong table).
+* `dts/0046` — clocks, OPP tables, VSRAM pin, and BUCKA widened to
+  [1000000, 1200000] uV.
+
+**Two deliberate narrowings of the OPP tables, both costing only idle power.**
+The bottom of each is cut where the vendor starts using the `ARMPLLDIV_CKDIV`
+fractional divider (LL below 624 MHz, L below 650 MHz), which nothing here
+models. And voltages are floored at 1000 mV, because **BUCKA is not the little
+cluster's rail alone** — the vendor puts LL, L *and CCI* on VPROC1, this port
+scales only the A53s, and the CCI sits at ~630 MHz where 1000 mV is a
+measured-safe floor. Lowering it is what a CCI policy would earn.
+
+**Read B-47 before enabling this for daily use.** Eight cores at the top of
+these tables took the machine down after ~15-30 s, with the battery sagging
+620 mV first.
+
 
 ### CORRECTION 2026-08-22 (same evening): the firmware is NOT missing
 

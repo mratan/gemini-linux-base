@@ -1,0 +1,72 @@
+opp: of: a CPU with no OPP table shares nothing, it is not an error
+
+dev_pm_opp_of_get_sharing_cpus() walks every possible CPU and fails the whole
+query with -ENOENT if any one of them has no OPP descriptor node. On a
+heterogeneous SoC where only some clusters can do DVFS, that means one
+undescribed cluster costs every other cluster its cpufreq.
+
+MT6797 is exactly that case, and this was not theoretical -- it is what
+happened on #50. The two Cortex-A72s are described in the device tree (they
+are real, and PSCI declares them) but their frequency is owned by an on-die
+co-processor rather than by Linux, so they carry no operating-points-v2. The
+result:
+
+    of: /cpus/cpu@200: Couldn't find opp node
+    cpu cpu0: cpu0: failed to get OPP-sharing information
+    mtk-cpufreq mtk-cpufreq: failed to initialize dvfs info for cpu0
+    mtk-cpufreq: probe of mtk-cpufreq failed with error -2
+
+and the eight Cortex-A53s got no DVFS at all. Worse, cpufreq-dt reads the same
+-ENOENT as "this platform has no operating-points-v2, assume all CPUs share
+one table" and claimed all ten CPUs under a single policy carrying the little
+cluster's frequency table.
+
+A CPU with no OPP table demonstrably does not share this one. Skipping it is
+the answer to the question actually being asked.
+
+The all-CPUs-share fallback that cpufreq-dt keys off -ENOENT is untouched:
+that is for operating-points-v1 platforms, where the *caller's* own descriptor
+node is missing and this function has already returned before the loop.
+
+With this and the cpufreq change, #51 comes up with policy0 = cpu0-3 and
+policy4 = cpu4-7, which is correct.
+
+--- a/drivers/opp/of.c
++++ b/drivers/opp/of.c
+@@ -1334,14 +1334,30 @@
+ 			goto put_cpu_node;
+ 		}
+ 
+-		/* Get OPP descriptor node */
++		/*
++		 * Get OPP descriptor node.
++		 *
++		 * A CPU with no OPP table of its own demonstrably does not
++		 * share this one, so it is not an error -- it just is not a
++		 * member of the set being computed. Failing the whole query
++		 * over it breaks every OTHER cluster on a heterogeneous SoC
++		 * where only some clusters can do DVFS.
++		 *
++		 * MT6797 is exactly that: tri-cluster, with two Cortex-A72s
++		 * whose frequency is owned by an on-die co-processor rather
++		 * than by Linux. Before this, their bare cpu nodes made this
++		 * function return -ENOENT for cpu0, which cost the eight
++		 * Cortex-A53s their cpufreq entirely.
++		 *
++		 * The all-CPUs-share fallback that cpufreq-dt keys off -ENOENT
++		 * is unaffected: it is for operating-points-v1 platforms, where
++		 * the caller's own descriptor node is missing and this function
++		 * has already returned above.
++		 */
+ 		tmp_np = _opp_of_get_opp_desc_node(cpu_np, 0);
+ 		of_node_put(cpu_np);
+-		if (!tmp_np) {
+-			pr_err("%pOF: Couldn't find opp node\n", cpu_np);
+-			ret = -ENOENT;
+-			goto put_cpu_node;
+-		}
++		if (!tmp_np)
++			continue;
+ 
+ 		/* CPUs are sharing opp node */
+ 		if (np == tmp_np)

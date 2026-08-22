@@ -1,0 +1,131 @@
+cpufreq: mediatek: support MT6797, and do not let one cluster sink the rest
+
+Three changes, all of which #50 proved were needed.
+
+1. PLATFORM DATA AND A MACHINE ENTRY.
+
+MT6797's Vproc/Vsram rule is not the 100-200 mV window the other SoCs here
+use. The vendor requires only Vsram >= Vproc and at most
+MAX_DIFF_VSRAM_VPROC (300 mV) above it, with NORMAL_DIFF_VRSAM_VPROC of
+100 mV as the target; proc_max_volt is the vendor's MAX_VPROC_VOLT of
+1200 mV. The shifts are carried for completeness only -- this board has no
+sram regulator wired to the CPUs (VSRAM is an on-die LDO array pinned at its
+1200 mV maximum, which covers the whole Vproc range in use), so software
+voltage tracking never runs and only proc_max_volt is consulted.
+
+2. SKIP CPUs THIS DRIVER CANNOT MANAGE.
+
+The probe loop runs over every possible CPU and treats any failure as fatal.
+MT6797 is tri-cluster: its two Cortex-A72s are described in the device tree
+but have no clock the kernel may drive -- the vendor sets that cluster's
+armpll_addr to NULL and scales it through the iDVFS co-processor -- and no OPP
+table here. Without this, clk_get(cpu8, "cpu") fails and the eight Cortex-A53s
+lose their DVFS along with it, which is the entire problem this driver is
+being enabled to fix.
+
+A CPU with no operating-points-v2 is not this driver's to manage. On #51 that
+reads:
+
+    mtk-cpufreq mtk-cpufreq: cpu8: no operating-points-v2, not managing it
+    mtk-cpufreq mtk-cpufreq: cpu9: no operating-points-v2, not managing it
+
+3. BLOCKLIST mt6797 IN cpufreq-dt-platdev.
+
+cpufreq-dt-platdev creates a generic cpufreq device for any SoC not on its
+blocklist whose CPU nodes carry operating-points-v2. Adding OPP tables for the
+A53s therefore handed the CPUs to cpufreq-dt instead of to this driver -- and
+cpufreq-dt got it wrong, publishing one policy over all ten CPUs (the A72s
+included) carrying the little cluster's frequency table. Every other MediaTek
+SoC with a mediatek-cpufreq entry is already on that blocklist; mt6797 was
+only absent because it had never had OPP tables before.
+
+Measured on #51 with all three in place: policy0 = cpu0-3 with the LL table,
+policy4 = cpu4-7 with the L table, driver mtk-cpufreq, and the PCW the
+hardware holds matches the OPP arithmetic at every point tested. A fixed
+integer loop gives 286 -> 502 Miter/s on the little cluster (1.755x against a
+1.725x clock ratio) and 402 -> 666 Miter/s on the big-little cluster (1.657x
+against 1.656x) -- the 1.72x and 1.57x this was predicted to be worth.
+
+--- a/drivers/cpufreq/mediatek-cpufreq.c
++++ b/drivers/cpufreq/mediatek-cpufreq.c
+@@ -636,10 +636,35 @@
+ 	}
+ 
+ 	for_each_possible_cpu(cpu) {
++		struct device *cpu_dev;
++
+ 		info = mtk_cpu_dvfs_info_lookup(cpu);
+ 		if (info)
+ 			continue;
+ 
++		/*
++		 * A CPU with no operating-points-v2 is not this driver's to
++		 * manage, and must not take the CPUs that are down with it.
++		 *
++		 * MT6797 is tri-cluster. Its two Cortex-A72s are described in
++		 * the device tree and are therefore "possible", but they have
++		 * no ARMPLL the kernel may drive -- the vendor sets that
++		 * cluster's armpll_addr to NULL and scales it through the
++		 * iDVFS co-processor instead -- and no OPP table here. Failing
++		 * the whole probe over them would leave the eight A53s pinned
++		 * at whatever the bootloader chose, which is the entire
++		 * problem this driver is being enabled to fix.
++		 */
++		cpu_dev = get_cpu_device(cpu);
++		if (cpu_dev && cpu_dev->of_node &&
++		    !of_find_property(cpu_dev->of_node, "operating-points-v2",
++				      NULL)) {
++			dev_info(&pdev->dev,
++				 "cpu%d: no operating-points-v2, not managing it\n",
++				 cpu);
++			continue;
++		}
++
+ 		info = devm_kzalloc(&pdev->dev, sizeof(*info), GFP_KERNEL);
+ 		if (!info) {
+ 			ret = -ENOMEM;
+@@ -682,6 +707,26 @@
+ 	.probe		= mtk_cpufreq_probe,
+ };
+ 
++/*
++ * MT6797's Vproc/Vsram rules differ from the 100-200 mV window most of these
++ * SoCs use: the vendor requires only Vsram >= Vproc, and at most
++ * MAX_DIFF_VSRAM_VPROC (300 mV) above it, with NORMAL_DIFF_VRSAM_VPROC of
++ * 100 mV as the target. proc_max_volt is the vendor's MAX_VPROC_VOLT.
++ *
++ * The shifts are carried for completeness only. This board has no sram
++ * regulator wired to the CPUs -- VSRAM is an on-die LDO array pinned at its
++ * 1200 mV maximum, which covers the whole Vproc range in use -- so software
++ * voltage tracking never runs and only proc_max_volt is consulted.
++ */
++static const struct mtk_cpufreq_platform_data mt6797_platform_data = {
++	.min_volt_shift = 100000,
++	.max_volt_shift = 300000,
++	.proc_max_volt = 1200000,
++	.sram_min_volt = 1000000,
++	.sram_max_volt = 1200000,
++	.ccifreq_supported = false,
++};
++
+ static const struct mtk_cpufreq_platform_data mt2701_platform_data = {
+ 	.min_volt_shift = 100000,
+ 	.max_volt_shift = 200000,
+@@ -738,6 +783,7 @@
+ static const struct of_device_id mtk_cpufreq_machines[] __initconst = {
+ 	{ .compatible = "mediatek,mt2701", .data = &mt2701_platform_data },
+ 	{ .compatible = "mediatek,mt2712", .data = &mt2701_platform_data },
++	{ .compatible = "mediatek,mt6797", .data = &mt6797_platform_data },
+ 	{ .compatible = "mediatek,mt7622", .data = &mt7622_platform_data },
+ 	{ .compatible = "mediatek,mt7623", .data = &mt7623_platform_data },
+ 	{ .compatible = "mediatek,mt8167", .data = &mt8516_platform_data },
+--- a/drivers/cpufreq/cpufreq-dt-platdev.c
++++ b/drivers/cpufreq/cpufreq-dt-platdev.c
+@@ -124,6 +124,7 @@
+ 
+ 	{ .compatible = "mediatek,mt2701", },
+ 	{ .compatible = "mediatek,mt2712", },
++	{ .compatible = "mediatek,mt6797", },
+ 	{ .compatible = "mediatek,mt7622", },
+ 	{ .compatible = "mediatek,mt7623", },
+ 	{ .compatible = "mediatek,mt8167", },
