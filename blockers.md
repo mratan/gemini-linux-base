@@ -2651,6 +2651,78 @@ currently wrong in exactly this way, and nobody has looked.
 
 ## 🟡 B-40 — the two Cortex-A72 cores never come up, and there is no cpufreq at all
 
+### 2026-08-22 (evening): there is NO SMC shortcut to the A72s. Measured, and it cost 15 minutes.
+
+Before porting 2500 lines of CSPM, a cheaper hypothesis was worth eliminating,
+and reading `mt_idvfs.c` had made it look very promising:
+
+```c
+int BigiDVFSEnable_hp(void)   /* for cpu hot plug call */   <- the vendor's own comment
+        ...
+        SEC_BIGIDVFSENABLE(idvfs_init_opt.idvfs_ctrl_reg, cur_vproc, cur_vsram);
+        /* = smc(MTK_SIP_KERNEL_IDVFS_BIGIDVFSENABLE = 0xC20003B0, ...) */
+```
+
+The Big cluster's enable is **a secure monitor call to ATF**, not a register
+sequence, and there is a whole SIP family 0xC20003B0..0xC20003C1 plus a
+register read/write pair. There is also a second hardware block for it —
+`dvfs_proc2@11016000`, distinct from CSPM at 0x11015000. If our ATF carried
+that service, the A72 route would have been a few SMCs.
+
+**It does not.** Extended `tools/psci-probe` with the four read-only getters
+and, crucially, a deliberately-bogus SIP id as the control:
+
+| call | returns |
+|---|---|
+| `BIGIDVFSPLLGETFREQ` 0xC20003BA | `0xFFFFFFFF` SMC_UNK |
+| `BIGIDVFSPLLGETPOSDIV` 0xC20003BC | `0xFFFFFFFF` SMC_UNK |
+| `BIGIDVFSPLLGETPCW` 0xC20003BE | `0xFFFFFFFF` SMC_UNK |
+| `BIGIDVFSSRAMLDOGET` 0xC20003C0 | `0xFFFFFFFF` SMC_UNK |
+| **bogus id 0xC20003FE (control)** | **`0xFFFFFFFF` SMC_UNK** |
+
+The control is the whole point: this firmware *does* reject ids it does not
+know, so SMC_UNK from the getters means absent rather than meaningless.
+
+`IDVFS_READ` (0xC200035F) is the one id that does **not** return SMC_UNK — but
+it returns 0 for every address tried, including `0x10006218` where devmem reads
+`0x00010132` and `0x1001a204` where devmem reads `0xC00BC000`. Whatever answers
+at that id is not reading registers. It is not the iDVFS service.
+
+**So the route is the CSPM port after all**, which is what Android's own log
+said all along (`[CPUHVFS] cluster2 on, swctrl = 0x25f0`), and `cspm_probe()`
+confirms the mechanism: `swctrl_reg[CPU_CLUSTER_B] = CSPM_SW_RSV2`, a software
+reserved register the PCM firmware polls. iDVFS is about the big cluster's
+*frequency* once it is already powered, and this ATF cannot do that either.
+
+**Two corrections to the port plan while here.**
+
+1. **The firmware to load is the 2025-word one, not the 1969-word one.**
+   `CPUHVFS_HW_GOVERNOR` is commented out in the vendor's own header
+   (`base/power/include/mt_cpufreq_hybrid.h:30`), so the shipped build takes the
+   `#else` branch: `pcm_dvfs_v0.1_160131_02`, size **2025**. The 1969-word
+   `v0.2` quoted in the handoff and in this blocker's earlier correction is the
+   hardware-governor variant that Android does not run.
+
+2. **CSPM needs the i2c6 clock, and the DT node says so.** The vendor node is
+
+   ```
+   compatible = "mediatek,mt6797-dvfsp";
+   reg = <0x11015000 0x1000>, <0x0012a000 0x3000>;   /* CSPM regs, CSRAM 12K */
+   interrupts = <GIC_SPI 161 IRQ_TYPE_LEVEL_LOW>;
+   clocks = <&infrasys INFRA_I2C_APPM>;  clock-names = "i2c";
+   ```
+
+   `INFRA_I2C_APPM` is `CLK_INFRA_I2C_APPM` (54) in mainline's binding — the
+   *same* controller cpufreq's regulator now sits behind. B-45's warning is no
+   longer about observation: i2c6 is in the path of **every DVFS transition**
+   since #51. Plan the semaphore or the pause before starting CSPM, not after.
+
+   Also note `__cspm_kick_im_to_fetch()` hands CSPM a **physical address**
+   (`base_va_to_pa`) and the IM fetches the PCM image from DRAM over EMI — so
+   the firmware array's placement and any EMI MPU permissions are a real part
+   of the port, not a detail.
+
+
 ### RESOLVED 2026-08-22, the cpufreq half: DVFS is live and worth the measured 1.72x / 1.57x
 
 `#51`. Two policies, `policy0` = cpu0-3 on the little cluster's table and
