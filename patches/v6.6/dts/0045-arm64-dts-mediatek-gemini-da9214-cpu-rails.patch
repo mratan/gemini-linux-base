@@ -1,0 +1,113 @@
+arm64: dts: mediatek: gemini: declare the DA9214's two CPU rails
+
+Which of the DA9214's bucks is which is now a MEASUREMENT, which is exactly
+what enabling this bus (dts/0041) was for. Read from the chip on #46, once
+i2c/0001 made its data phase work:
+
+  BUCKA_CONT 0x5D = 0x01   ENABLED,  VBUCKA_A 0xD7 = 0x46 -> 1000 mV
+  BUCKB_CONT 0x5E = 0x00   DISABLED, VBUCKB_A 0xD9 = 0x46 -> 1000 mV
+
+BUCKA is the live CPU rail, and its 1000 mV is exactly the figure `vproc_fixed`
+asserts as a regulator-fixed fiction — so the A53 clusters run off BUCKA, not
+off the RT5735 on i2c7 that B-43 supposed. BUCKB is VPROC2, the Cortex-A72
+cluster's supply, and it has never been switched on.
+
+Two facts about identity, both measured rather than assumed:
+
+ - DEVICE_ID (mainline's 0x201 = PAGE_CON 0x04, register 0x01) reads 0x24,
+   which mainline calls DA9215 and accepts. The vendor names the part DA9214
+   and binds its own da9214 driver to it under Android. Both are true: the
+   compatible names the part, and the driver takes chip_id from the silicon.
+ - mainline's paged regmap shifts the page by one (PAGE_CON = page << 1) where
+   the vendor writes the raw field value. Mainline's is the encoding that
+   reads a sane DEVICE_ID here, so its regmap is right and the vendor's
+   convention is simply different.
+
+BUCKA is pinned min == max and always-on deliberately. This node exists so the
+rail can be OBSERVED through the regulator framework; moving it is cpufreq's
+job, and cpufreq cannot bind yet because mt6797's clock driver models no
+ARMPLL and the CPU clocks therefore do not exist. Until that lands, nothing
+should be able to change the voltage the running CPUs depend on. Widen the
+range in the same change that adds the OPP tables, not before.
+
+BUCKB is declared and deliberately not always-on. It is off, and B-40 has since
+shown that turning it on does not bring the A72s up — ATF stalls in the MP2
+power sequence with the rail up or down.
+
+CONFIG_REGULATOR_DA9211 stays =m so nothing binds until `modprobe da9211`,
+after the disable-unused sweep has already run.
+
+--- a/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
++++ b/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
+@@ -805,6 +805,71 @@
+ 	 */
+ 	mediatek,appm_used;
+ 	status = "okay";
++
++	/*
++	 * The DA9214 dual buck: the two CPU core rails, identified by
++	 * MEASUREMENT rather than inference, which is what enabling this bus
++	 * (dts/0041) was for.
++	 *
++	 * Read from the chip on #46, once i2c/0001 made its data phase work:
++	 *
++	 *   BUCKA_CONT 0x5D = 0x01   ENABLED,  VBUCKA_A 0xD7 = 0x46 -> 1000 mV
++	 *   BUCKB_CONT 0x5E = 0x00   DISABLED, VBUCKB_A 0xD9 = 0x46 -> 1000 mV
++	 *
++	 * BUCKA is the live CPU rail. Its 1000 mV is exactly the figure
++	 * `vproc_fixed` above asserts as a regulator-fixed fiction, so the A53
++	 * clusters run off BUCKA — not off the RT5735 on i2c7, which B-43 had
++	 * supposed. BUCKB is VPROC2, the Cortex-A72 cluster's supply, and it
++	 * has never been switched on (B-40).
++	 *
++	 * Two notes on identity, both measured:
++	 *
++	 *  - DEVICE_ID (mainline's 0x201 = PAGE_CON 0x04, register 0x01) reads
++	 *    0x24, which mainline calls DA9215 and accepts. The vendor names
++	 *    the part DA9214 and binds its own `da9214` driver to it under
++	 *    Android. Both are true: `dlg,da9214` is the part, and the driver
++	 *    takes its chip_id from the silicon, not from this compatible.
++	 *  - mainline's paged regmap shifts the page by one (PAGE_CON = page
++	 *    << 1) where the vendor writes the raw field. Mainline's is the
++	 *    one that reads a sane DEVICE_ID here, so its regmap is right.
++	 *
++	 * WHY BUCKA IS PINNED AND ALWAYS-ON. This node exists so the rail can
++	 * be *observed* through the regulator framework; moving it is cpufreq's
++	 * job and cpufreq cannot bind yet (mt6797's clock driver models no
++	 * ARMPLL, so the CPU clocks do not exist). Until then min == max makes
++	 * it impossible for anything to change the voltage the running CPUs
++	 * depend on, and regulator-always-on keeps the disable-unused sweep
++	 * away from it. Widen the range in the same change that lands the OPP
++	 * tables, not before.
++	 *
++	 * BUCKB is declared and deliberately NOT always-on: it is off, and
++	 * B-40 has now shown that turning it on does not bring the A72s up —
++	 * ATF stalls in the MP2 power sequence regardless.
++	 *
++	 * CONFIG_REGULATOR_DA9211 stays =m (configs/gemini-cpu-regulator.config)
++	 * so nothing binds until `modprobe da9211`, after the disable-unused
++	 * sweep has already run.
++	 */
++	da9214: regulator@68 {
++		compatible = "dlg,da9214";
++		reg = <0x68>;
++
++		regulators {
++			da9214_vproc: BUCKA {
++				regulator-name = "da9214_vproc";
++				regulator-min-microvolt = <1000000>;
++				regulator-max-microvolt = <1000000>;
++				regulator-always-on;
++				regulator-boot-on;
++			};
++
++			da9214_vproc2: BUCKB {
++				regulator-name = "da9214_vproc2";
++				regulator-min-microvolt = <800000>;
++				regulator-max-microvolt = <1180000>;
++			};
++		};
++	};
+ };
+ 
+ /* --- Pinctrl --- */
