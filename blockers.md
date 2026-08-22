@@ -2651,6 +2651,106 @@ currently wrong in exactly this way, and nobody has looked.
 
 ## 🟡 B-40 — the two Cortex-A72 cores never come up, and there is no cpufreq at all
 
+### 2026-08-22 (latest): ATF's real MTCMOS tables, and a self-inflicted stop
+
+Two findings and one mistake, all from continuing the session above.
+
+#### ATF's power-on is table-driven, and it is not the sequence we copied
+
+`power_on_little_cl()` and `power_on_little()` in `plat/mt6797/power.c` are
+lists of single-bit writes to one PWR_CON register, with polls and delays hung
+off particular step indices. Both tables are now extracted from the running
+firmware -- the cluster one is built inline on the stack at 0x3f74, the core
+one is a 2x14-word rodata table at file offset **0x123b0**. (Note: the
+adrp+add rodata correction for *this* build is **+0xA40**; the -0x5C0 recorded
+below is the older `trustzone.bin`'s constant. Solve it per binary.)
+
+**Cluster** (`power_on_little_cl`, on `SPM+0x210 + cluster*4`):
+
+```
+PWR_RST_B=0 ; PWR_CLK_DIS=1
+PWR_ON=1        udelay(1)
+PWR_ON_2ND=1    wait PWR_ON && PWR_ON_2ND read back ; udelay(100)
+PWR_ISO=0
+SRAM_PDN=0      wait SRAM_PDN_ACK == 0 ; udelay(500)
+SRAM_ISOINT_B=1 udelay(1)
+SRAM_CKISO=0 ; PWR_CLK_DIS=0 ; PWR_RST_B=1
+```
+
+**Core** (`power_on_little`, on `SPM+0x220 + cpu*4`):
+
+```
+SRAM_SLEEP_B=0 ; PWR_RST_B=0 ; PWR_CLK_DIS=1
+SRAM_PDN=1      wait SRAM_PDN_ACK == 1     <-- the SRAM is cycled DOWN first
+PD_SLPB_CLAMP=0
+SRAM_PDN=0      wait SRAM_PDN_ACK == 0
+PWR_ON=1        udelay(1); wait CPU_PWR_STATUS bit(15-cpu)
+PWR_ON_2ND=1    udelay(1); wait CPU_PWR_STATUS_2ND bit(15-cpu)
+SRAM_SLEEP_B=1 ; SRAM_ISOINT_B=1 ; PWR_ISO=0 ; udelay(1)
+SRAM_CKISO=0 ; PWR_CLK_DIS=0 ; PWR_RST_B=1
+```
+
+then `little_spark2_setldo(cpu)` and a per-core enable bit.
+
+Two things this changes:
+
+1. **The core sequence drives `SRAM_PDN` high first and waits for the ack to
+   become 1**, then low and waits for 0. This port has been going straight to
+   0, which gives the SRAM controller no edge -- so every "SRAM_PDN_ACK
+   cleared after 0 us" this blocker has recorded measured nothing.
+2. **The cluster sequence never touches `SRAM_SLEEP_B` at all.** The missing
+   bit 19 that the section below calls a remaining anomaly is not part of
+   powering a cluster on. MP0 has it set because whoever brought MP0 up did
+   something else. **That lead is dead too.**
+
+#### Do not assert PWR_RST_B on MP2
+
+Measured: running the cluster table's step 0 (`PWR_RST_B = 0`) on MP2
+**permanently kills the 0x102224xx sub-block** -- the big cluster's PLL and
+iDVFS registers read `0x00000000` afterwards and stop accepting writes, and
+they do not come back when reset is released. `BIGIDVFSENABLE` still returns 0
+into the void. The little clusters survive it, so whatever ATF re-initialises
+for them lives somewhere we have not found.
+
+`cpu_power_on_buck()` has already taken MP2 out of reset, so
+`tools/a72-bringup`'s `atf_cluster_on()` starts at step 2 and never re-asserts
+it. **Recovering from this needs a reboot.**
+
+#### The MP2 MISC block is a different register map, so the boot address is right
+
+MP0's is at 0x10220000, MP1's at 0x10220200, MP2's at 0x10222200 (ATF's own
+`enable_scu()` switch picks 0x1022002c / 0x1022022c / 0x1022222c). But the
+blocks are not parallel: MP0/MP1 carry `0a0a0a0a`-style A53 config words at
++0x04..+0x28 that MP2 does not, and MP2's +0x20..+0x3c reads `0xFFFFFFFF` and
+**refuses a distinctive write**. Those offsets are simply unimplemented for an
+A72 cluster. So `0x10222238` is *not* an A72 boot-address register despite
+MP0's +0x038 being one, and ATF's `0x10222290 + idx*8` is correct.
+
+#### The mistake: `reboot -f` cost the device
+
+To get a clean state after the PWR_RST_B damage I ran `reboot -f`. The device
+has not enumerated since. This is a **known, documented trap** and the warning
+is in this repo, at the top of
+`release/headless-overlay/usr/local/sbin/gemini-reboot`:
+
+> `systemctl reboot` does not [come back]. Measured repeatedly on 2026-08-20:
+> every attempt left the machine indistinguishable from dead -- no USB, no
+> network, dark panel -- **recoverable only with the power button.**
+
+`gemini-reboot` exists precisely because of this: it syncs, remounts read-only,
+sets `WDT_MODE = 0x22000011` (enabled, **EXRST_EN clear**, because that bit
+routes the reset to the PMIC which powers the board off instead of restarting
+it) and then hits `WDT_SWRST`.
+
+`gemini-state.py` says `STATE: ABSENT`. `uhubctl` cannot help: the hub
+advertises per-port power switching but **does not switch VBUS** (B-27), so a
+port cycle is a data replug, not a power cycle.
+
+**RULE: on this device the only reboot is `gemini-reboot`.** Never `reboot`,
+`reboot -f`, `systemctl reboot`, or `shutdown -r`.
+
+---
+
 ### 2026-08-22 (late): the ATF was disassembled, and it moves the blocker
 
 **The two A72 cores are still not online.** But four of the previous entry's
