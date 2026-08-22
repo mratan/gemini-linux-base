@@ -1,0 +1,35 @@
+#!/bin/sh
+# gemini-session — the GPU-composited Wayland session, as sddm starts it.
+#
+# This is the daily desktop as of 2026-08-22. It replaced LXQt-on-X once #56
+# was fixed: until then a GPU-composited compositor wedged the SoC roughly one
+# run in three, because a GPU operating-point change could reprogram mainpll.
+#
+# It is deliberately NOT gemini-dock. gemini-dock is the manual-start version
+# and it stops sddm before running, which is exactly wrong here: sddm is our
+# parent. The differences are that and the seat backend.
+#
+# THE ONE ENVIRONMENT VARIABLE THAT MATTERS
+#
+# wlroots looks for a render node on the KMS device. card0 is mediatek-drm and
+# has no render node; card1 (panfrost) has renderD128 and no CRTC. Left to
+# itself wlroots finds nothing and falls back to the pixman SOFTWARE renderer
+# — silently, with an identical-looking screen. Naming both the render device
+# and the renderer turns that into a startup failure instead of a regression
+# nobody can see.
+export WLR_RENDER_DRM_DEVICE=/dev/dri/renderD128
+export WLR_RENDERER=gles2
+
+# logind, not the builtin backend: sddm has already created a real seat
+# session for this user, and going through it is what keeps VT switching
+# working — the root shell on Ctrl-Alt-F3 has to stay reachable.
+export XDG_SESSION_TYPE=wayland
+export XDG_CURRENT_DESKTOP=sway
+
+# Qt and GTK apps should speak Wayland natively rather than going through
+# Xwayland; Xwayland stays available (lazily) for everything that cannot.
+export QT_QPA_PLATFORM="wayland;xcb"
+export MOZ_ENABLE_WAYLAND=1
+export _JAVA_AWT_WM_NONREPARENTING=1
+
+exec sway -c /etc/gemini/sway-docked.conf

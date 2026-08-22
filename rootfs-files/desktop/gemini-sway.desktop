@@ -1,0 +1,6 @@
+[Desktop Entry]
+Name=Gemini (sway, GPU-composited)
+Comment=The Gemini's daily desktop: sway on panfrost via renderD128
+Exec=/usr/local/bin/gemini-session
+Type=Application
+DesktopNames=sway

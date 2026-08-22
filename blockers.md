@@ -2727,6 +2727,84 @@ and the `cpufreq` tree there answers "is this a hardware limit or are we simply
 not driving the hardware" in about a minute, for both gaps at once. That is the
 next step, and it is the owner's own suggestion.
 
+## 🔴 B-46 — sway renders a perfect desktop and none of it reaches the panel
+
+**Opened 2026-08-22, while switching the daily desktop to sway after #56 was
+fixed.** This is the reason the switch did not land.
+
+**The compositor is fine.** sddm starts `gemini-session` as the `gemini` user,
+sway comes up on the active VT (tty1, `Active=yes`) holding DRM master on
+card0, `DSI-1` is `enabled` and `connected` at 1080x2160 with `transform 270`,
+swaybar and a `foot` terminal are running and `swaymsg -t get_tree` lists the
+window as visible. `grim` captures a **correct 2160x1080 desktop** — bar,
+workspace number, clock, terminal with a shell prompt.
+
+**The panel shows a uniform cyan rectangle.** Not the desktop, not black, not
+the console.
+
+**The test that settles it, because it can fail:**
+
+```
+swaymsg output DSI-1 bg '#000000' solid_color   -> photograph
+swaymsg output DSI-1 bg '#ffffff' solid_color   -> photograph
+```
+
+The two photographs are the same cyan rectangle. A panel that is displaying
+would not survive that. Then `Session=lxqt.desktop` and a reboot, and the
+**LXQt desktop photographs perfectly** — icons, panel, wallpaper, battery
+readout. So the camera works, the panel works, and different content really
+does produce different photographs. It is sway's frames specifically that never
+arrive.
+
+### What this retroactively means
+
+**B-38's sway measurements were never verified against the glass.** The only
+photographic evidence for "sway works on the internal panel" was the image
+retracted in `STATE-2026-08-21-night.md` as "a solid orange rectangle". That is
+the same failure as this one, in a different colour, and it was read at the
+time as a rotation bug. It was not a rotation bug.
+
+B-38's CPU-tick comparison (3 ticks against 1021) still stands as a statement
+about how much CPU each compositor burns. It is not evidence that sway can
+drive this display.
+
+### The hypothesis, from B-44's own analysis
+
+X on this machine runs `modesetting` with `AccelMethod "none"`, which memcpys
+damage into the existing scanout buffer and **essentially never page-flips** —
+B-39 measured zero display interrupts across 20 full-screen repaints. sway
+does the opposite: every frame is a new buffer and an atomic commit.
+
+B-44 established that this SoC has no CMDQ and `shadow_register = false`, so
+`mtk_crtc_ddp_config()` — which is what actually writes the new framebuffer
+address into the OVL — runs **only** from the frame-done interrupt. If that
+path does not re-arm for flips the way it does for the inherited scanout, the
+OVL keeps fetching the address it already had, forever, while every commit
+reports success. That matches exactly what is observed: no `flip_done`
+timeouts in dmesg, no errors anywhere, and a frozen image.
+
+If that is right this is **issue #20** (mediatek-drm atomic-KMS hardening),
+which is already open and already named as shared between the internal panel,
+Track 2 and Track 3.
+
+### What to do next
+
+1. Count real page flips while sway runs — vblank/frame-done interrupt counts
+   in `/proc/interrupts` and `/sys/kernel/debug/dri/0/`, against the same count
+   under X. A flip that "succeeds" without an interrupt is the answer.
+2. Read `OVL_L0_ADDR` while sway is running and see whether it ever changes.
+   B-44 left the tooling for exactly this.
+3. Only then decide whether the fix is in `mtk_crtc_ddp_config()`'s trigger or
+   in the plane update path.
+
+### Staged and not installed
+
+`rootfs-files/desktop/` holds the three files that make sway the autostarted
+session, with a README saying not to install them until this is fixed. One of
+them is worth having regardless: the sway config on the device contained
+**nothing but two `output` lines**, so the session had no keybindings at all —
+no terminal, no window controls, no bar.
+
 ## 🟢 B-39 — trigger 1 RESOLVED 2026-08-21: a GPU rate change was reprogramming the SoC's main PLL
 
 **Trigger 1 is closed on `#43`. Trigger 2 (the USB display) is untouched and
