@@ -1,0 +1,113 @@
+arm64: dts: mediatek: gemini: run i2c6 at the vendor's 3.4 MHz
+
+i2c6's address phase works and its data phase does not (B-45, #57), and that
+bus stands between this machine and its own clock speed: the DA9214's bucks
+cannot be identified until it works, the CPU regulator cannot be declared
+until they are, and cpufreq cannot bind until the regulator exists.
+
+Measured afresh on #43 before this change, and it is sharper than B-45 had it:
+every address on the bus NACKs correctly — 0x08, 0x20, 0x40, 0x50, 0x55,
+0x60, 0x67, 0x6c, 0x77 all fail — except 0x68-0x6b, which ACK *and accept byte
+writes*. So a slave really is there and the master really is working. What
+fails is only the read data phase, which returns a constant 0x00 at all four
+addresses, forty reads out of forty.
+
+A trip to stock Android on boot1 read the vendor's own device tree and live
+pin state, and eliminated both candidates #57 named, plus the explanation that
+used to sit in dts/0043's comment:
+
+  * clock-div. The vendor's i2c@1100e000 has clock-div = <0x0a>, and so does
+    every other i2c controller in its DTB. So do we. #57's second candidate
+    is dead.
+  * pinmux. The vendor has GPIO151 and GPIO152 in mode 1, which is
+    SCL6_0/SDA6_0 — exactly what i2c6_pins_a selects. Our own mode registers
+    (0x10005420 bits[31:28], 0x10005430 bits[3:0]) read 0x1 for both pins and
+    pinmux-pins shows them claimed by 1100e000.i2c with function func1. #57's
+    first candidate is dead.
+  * "open-drain on a bus with no pull-ups", which dts/0043 offered as the
+    reason every register reads 0x00. Both pads read DIN = 1 on our kernel
+    (GPIO DI at 0x10005240, bits 23 and 24) — idle-high, exactly like the
+    working i2c7 pads immediately beside them. There are pull-ups and the bus
+    is not stuck low. That explanation is retracted here.
+  * the controller's timing configuration in general. i2c7 has the same
+    driver data, the same clock-div and the same 156 MHz source clock, and it
+    reads its RT5735 ten times out of ten.
+
+What is left is the bus speed. The vendor's clock-frequency for this
+controller is 3400000 (0x0033E140 in its DTB) — high-speed mode, matching
+I2C_HS_FLAG and timing = 3400 in the vendor's own
+drivers/misc/mediatek/power/mt6797/da9214.c. Ours was 400000, inherited as a
+default and never chosen. In the vendor DTB every bus is 400 kHz except
+i2c@1100e000 and i2c@11010000, which are both 3.4 MHz — and i2c@11010000 is
+the one bus of ours that already works.
+
+`mediatek,use-push-pull` stays. The vendor carries it, and MediaTek's
+push-pull drive on this bus is qualified for high-speed mode; dts/0043 landed
+it alone and recorded that it did not change the symptom.
+
+--- a/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
++++ b/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
+@@ -750,35 +750,40 @@
+ &i2c6 {
+ 	pinctrl-names = "default";
+ 	pinctrl-0 = <&i2c6_pins_a>;
+-	clock-frequency = <400000>;
+ 	/*
+-	 * This bus is push-pull on this board, and without saying so every
+-	 * register on the DA9214 reads back 0x00.
++	 * 3.4 MHz, not 400 kHz, because that is what the vendor runs this bus
++	 * at and it is now the ONLY configuration difference left between the
++	 * vendor's working i2c6 and our broken one.
+ 	 *
+-	 * The symptom is worth describing because it looks exactly like an
+-	 * absent or dead chip and was read as one: i2cdetect finds 0x68-0x6b
+-	 * (the DA9214's four addresses) and every one of them ACKs, but data
+-	 * reads return 0x00, or intermittently fail outright with ENXIO. That
+-	 * is what open-drain on a bus with no pull-ups does — the slave can
+-	 * still pull the line low to ACK, so addressing works, while the data
+-	 * phase never gets a clean high and every bit reads back as zero.
++	 * The symptom (B-45, #57): every address on this bus NACKs correctly
++	 * except 0x68-0x6b, which ACK and accept byte writes — so a slave IS
++	 * there — yet every register read returns 0x00 at all four addresses.
++	 * The address phase works and the data phase does not.
+ 	 *
+-	 * It is also what made B-43 conclude "there is NO DA9214 on this
+-	 * board", from mainline da9211 reading DEVICE_ID as 0x0. Stock Android
+-	 * on boot1 has the part bound to its own `da9214` driver on this exact
+-	 * bus and address, and its device tree carries
+-	 * `mediatek,use-push-pull` on i2c@1100e000. We did not.
++	 * What the boot1 Android trip on 2026-08-21 eliminated, by reading the
++	 * vendor's own device tree and pin state:
+ 	 *
+-	 * Mainline i2c-mt65xx honours the property (it writes
+-	 * I2C_IO_CONFIG_PUSH_PULL to OFFSET_IO_CONFIG at bus init), so this is
+-	 * a one-property fix, and it is safe here: i2c6 has exactly one slave
+-	 * and one master.
++	 *   * clock-div. Vendor i2c@1100e000 has clock-div = <0x0a>. So do we.
++	 *   * pinmux. The vendor has GPIO151/GPIO152 in mode 1, which is
++	 *     SCL6_0/SDA6_0 — exactly what i2c6_pins_a selects, and our own
++	 *     mode register reads 0x1 for both pins.
++	 *   * pull-ups / a stuck bus. Both pads read DIN = 1 on our kernel
++	 *     (GPIO DI 0x10005240 bits 23,24), idle-high like the working
++	 *     i2c7 pads next to them. This also retires the reasoning that
++	 *     used to sit in this comment, which explained the 0x00 reads as
++	 *     "open-drain on a bus with no pull-ups". There are pull-ups.
++	 *   * controller timing generally. i2c7 has the same driver data, the
++	 *     same clock-div, and the same 156 MHz source clock, and it reads
++	 *     its RT5735 perfectly.
+ 	 *
+-	 * The vendor additionally drives this part in high-speed mode at
+-	 * 3.4 MHz (`I2C_HS_FLAG`, `timing = 3400` in
+-	 * drivers/misc/mediatek/power/mt6797/da9214.c). 400 kHz is kept until
+-	 * there is a reason to need more; register access does not.
++	 * What is left: the vendor's clock-frequency is 3400000
++	 * (0x0033E140 in its DTB — high-speed mode, matching I2C_HS_FLAG and
++	 * timing = 3400 in drivers/misc/mediatek/power/mt6797/da9214.c),
++	 * against the 400000 we had inherited as a default. MediaTek's
++	 * push-pull drive on this bus is qualified for that mode.
+ 	 */
++	clock-frequency = <3400000>;
++	/* Vendor DTB carries this on i2c@1100e000; one master, one slave. */
+ 	mediatek,use-push-pull;
+ 	status = "okay";
+ };

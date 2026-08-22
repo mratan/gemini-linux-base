@@ -1,0 +1,128 @@
+arm64: dts: mediatek: gemini: record what i2c6's failure is NOT
+
+i2c6's address phase works and its data phase does not (B-45, #57), and that
+bus stands between this machine and its own clock speed: the DA9214's bucks
+cannot be identified until it works, the CPU regulator cannot be declared
+until they are, and cpufreq cannot bind until the regulator exists.
+
+This patch changes no setting. It records eliminations, because #57's two
+named candidates are now both dead and the entry should not send the next
+session down them again.
+
+Measured afresh on #43, and it is sharper than B-45 had it: every address on
+the bus NACKs correctly — 0x08, 0x20, 0x40, 0x50, 0x55, 0x60, 0x67, 0x6c,
+0x77 all fail — except 0x68-0x6b, which ACK *and accept byte writes*. So a
+slave really is there and the master really is working. What fails is only the
+read data phase: a constant 0x00 at all four addresses, forty reads out of
+forty.
+
+A trip to stock Android on boot1 read the vendor's own device tree and live
+pin state:
+
+  * clock-div — DEAD. The vendor's i2c@1100e000 has clock-div = <0x0a>, and
+    so does every other i2c controller in its DTB. So do we.
+  * pinmux — DEAD. The vendor has GPIO151 and GPIO152 both in mode 1, which
+    is SCL6_0/SDA6_0, exactly what i2c6_pins_a selects. Our own mode
+    registers (0x10005420 bits[31:28], 0x10005430 bits[3:0]) read 0x1 for
+    both pins and pinmux-pins shows them claimed by 1100e000.i2c, func1.
+  * "open-drain on a bus with no pull-ups", which is what dts/0043's comment
+    offered as the reason every register reads 0x00 — RETRACTED. Both pads
+    read DIN = 1 on our kernel (GPIO DI at 0x10005240, bits 23 and 24):
+    idle-high, exactly like the working i2c7 pads beside them. There are
+    pull-ups and the bus is not stuck low.
+  * the controller's timing configuration generally — DEAD. i2c7 has the
+    same driver data, the same clock-div and the same 156 MHz source clock,
+    and reads its RT5735 ten times out of ten.
+  * the bus speed — TRIED ON #44 AND RETRACTED. The vendor runs this
+    controller at 3400000 (0x0033E140, high-speed mode, matching I2C_HS_FLAG
+    and timing = 3400 in the vendor's own
+    drivers/misc/mediatek/power/mt6797/da9214.c) against our inherited
+    400000, and it was the last configuration difference left. It does not
+    fix it, and it makes it slightly worse: at 3.4 MHz the reads that used to
+    return 0x00 mostly fail outright instead. 400 kHz is kept for that
+    reason, not because it is known to be right.
+
+What is left is not a setting we have found. The live clue is that reads are
+not uniformly dead: 0x00 nearly always, but occasionally a real-looking byte
+(0x0b and 0xd6 on #42, 0x05 on #44). A bus that loses most bits but not all
+is not an unpowered slave and not a wrong mux; it looks like contention. This
+controller is the one the vendor marks `mediatek,appm_used`, and mainline
+i2c-mt65xx knows nothing about that property. If a hardware power-management
+engine also masters this bus, our transfers would be colliding with its.
+That is the next hypothesis and it is untested.
+
+--- a/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
++++ b/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
+@@ -750,35 +750,49 @@
+ &i2c6 {
+ 	pinctrl-names = "default";
+ 	pinctrl-0 = <&i2c6_pins_a>;
+-	clock-frequency = <400000>;
+ 	/*
+-	 * This bus is push-pull on this board, and without saying so every
+-	 * register on the DA9214 reads back 0x00.
++	 * The symptom (B-45, #57): every address on this bus NACKs correctly
++	 * except 0x68-0x6b, which ACK and accept byte writes — so a slave IS
++	 * there — yet every register read returns 0x00 at all four addresses.
++	 * The address phase works and the data phase does not.
+ 	 *
+-	 * The symptom is worth describing because it looks exactly like an
+-	 * absent or dead chip and was read as one: i2cdetect finds 0x68-0x6b
+-	 * (the DA9214's four addresses) and every one of them ACKs, but data
+-	 * reads return 0x00, or intermittently fail outright with ENXIO. That
+-	 * is what open-drain on a bus with no pull-ups does — the slave can
+-	 * still pull the line low to ACK, so addressing works, while the data
+-	 * phase never gets a clean high and every bit reads back as zero.
++	 * What the boot1 Android trip on 2026-08-21 eliminated, by reading the
++	 * vendor's own device tree and pin state:
+ 	 *
+-	 * It is also what made B-43 conclude "there is NO DA9214 on this
+-	 * board", from mainline da9211 reading DEVICE_ID as 0x0. Stock Android
+-	 * on boot1 has the part bound to its own `da9214` driver on this exact
+-	 * bus and address, and its device tree carries
+-	 * `mediatek,use-push-pull` on i2c@1100e000. We did not.
++	 *   * clock-div. Vendor i2c@1100e000 has clock-div = <0x0a>. So do we.
++	 *   * pinmux. The vendor has GPIO151/GPIO152 in mode 1, which is
++	 *     SCL6_0/SDA6_0 — exactly what i2c6_pins_a selects, and our own
++	 *     mode register reads 0x1 for both pins.
++	 *   * pull-ups / a stuck bus. Both pads read DIN = 1 on our kernel
++	 *     (GPIO DI 0x10005240 bits 23,24), idle-high like the working
++	 *     i2c7 pads next to them. This also retires the reasoning that
++	 *     used to sit in this comment, which explained the 0x00 reads as
++	 *     "open-drain on a bus with no pull-ups". There are pull-ups.
++	 *   * controller timing generally. i2c7 has the same driver data, the
++	 *     same clock-div, and the same 156 MHz source clock, and it reads
++	 *     its RT5735 perfectly.
+ 	 *
+-	 * Mainline i2c-mt65xx honours the property (it writes
+-	 * I2C_IO_CONFIG_PUSH_PULL to OFFSET_IO_CONFIG at bus init), so this is
+-	 * a one-property fix, and it is safe here: i2c6 has exactly one slave
+-	 * and one master.
++	 *   * the bus speed, tried on #44 and RETRACTED. The vendor's
++	 *     clock-frequency here is 3400000 (0x0033E140 — high-speed mode,
++	 *     matching I2C_HS_FLAG and timing = 3400 in the vendor's
++	 *     drivers/misc/mediatek/power/mt6797/da9214.c) against our
++	 *     inherited 400000, and it was the last configuration difference
++	 *     left. It does not fix it and it makes it slightly worse: at
++	 *     3.4 MHz the reads that used to return 0x00 mostly fail outright.
++	 *     400 kHz is kept for that reason, not because it is right.
+ 	 *
+-	 * The vendor additionally drives this part in high-speed mode at
+-	 * 3.4 MHz (`I2C_HS_FLAG`, `timing = 3400` in
+-	 * drivers/misc/mediatek/power/mt6797/da9214.c). 400 kHz is kept until
+-	 * there is a reason to need more; register access does not.
++	 * What is left is not a setting we have found. The live clue is that
++	 * reads are not uniformly dead — 0x00 nearly always, but occasionally
++	 * a real-looking byte (0x0b, 0xd6 on #42; 0x05 on #44). A bus that
++	 * loses most bits but not all is not an unpowered slave and not a
++	 * wrong mux; it looks like contention. Note this controller is the
++	 * one the vendor marks `mediatek,appm_used`, and mainline i2c-mt65xx
++	 * knows nothing about that property — if a hardware power-management
++	 * engine also masters this bus, our transfers would be colliding with
++	 * its. That is the next hypothesis to test and it is untested.
+ 	 */
++	clock-frequency = <400000>;
++	/* Vendor DTB carries this on i2c@1100e000; one master, one slave. */
+ 	mediatek,use-push-pull;
+ 	status = "okay";
+ };

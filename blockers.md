@@ -1959,6 +1959,52 @@ untouched throughout.
 
 ## 🔴 B-45 — i2c6's address phase works and its data phase does not, which is why the DA9214 "isn't there"
 
+### UPDATE 2026-08-21 (late): both candidates are dead, and so is a third
+
+A boot1 Android trip read the vendor's own device tree and live pin state, and
+the symptom was re-measured more carefully on `#43`/`#44`. **Do not spend
+another session on the two candidates below — they are eliminated.**
+
+*The symptom, sharper than it was.* Every address on this bus NACKs correctly —
+0x08, 0x20, 0x40, 0x50, 0x55, 0x60, 0x67, 0x6c, 0x77 all fail — **except
+0x68-0x6b, which ACK and also accept byte writes.** So a slave really is there
+and our master really is working; what fails is only the read data phase, which
+returns a constant 0x00 at all four addresses, forty reads out of forty.
+
+One caution about the instrument: `i2cdetect -q` (SMBus quick write) finds
+*nothing at all* on this bus. That looks like proof of an empty bus and is not —
+plain byte writes to 0x68-0x6b succeed. A zero-length write is simply a
+transfer type this path does not do. It is the same trap as B-43's, in the
+opposite direction.
+
+*Eliminated:*
+
+| candidate | verdict | evidence |
+|---|---|---|
+| **clock-div** (#57's second) | **dead** | vendor's `i2c@1100e000` has `clock-div = <0x0a>`, same as ours; so does every other i2c node in the vendor DTB |
+| **pinmux** (#57's first) | **dead** | vendor has GPIO151/152 in **mode 1** = SCL6_0/SDA6_0, exactly what `i2c6_pins_a` selects; our own mode registers read `0x1` for both |
+| **no pull-ups / open-drain** (dts/0043's stated reason) | **retracted** | both pads read **DIN = 1** on our kernel (GPIO DI `0x10005240` bits 23, 24) — idle-high, like the working i2c7 pads beside them |
+| **controller timing generally** | **dead** | i2c7 has the same driver data, same `clock-div`, same 156 MHz source clock, and reads its RT5735 ten times out of ten |
+| **bus speed** (new, from the trip) | **tried on `#44`, retracted** | vendor runs this controller at **3400000** (0x0033E140, HS mode; `I2C_HS_FLAG`, `timing = 3400` in the vendor `da9214.c`) against our inherited 400000. It does not fix it and makes it *worse* — at 3.4 MHz the reads that returned 0x00 mostly fail outright. Reverted on `#45`. |
+
+*The clue that is left, and the next hypothesis.* Reads are **not uniformly
+dead**: 0x00 nearly always, but occasionally a real-looking byte — `0x0b` and
+`0xd6` on `#42`, `0x05` on `#44`. A bus that loses most bits but not all is not
+an unpowered slave and not a wrong mux. It looks like **contention**.
+
+And there is a specific reason to suspect it here: this is the one controller
+the vendor DTB marks **`mediatek,appm_used`**, and mainline `i2c-mt65xx` knows
+nothing about that property. If a hardware power-management engine also masters
+this bus — and this SoC demonstrably runs a DVFS co-processor that owns CPU
+rails (B-40's CPUHVFS) — then our transfers are colliding with its. **That is
+untested.** What would test it: instrument the controller's arbitration-lost
+and NACK status bits on a failed read, rather than only observing the byte.
+
+*One more thing the A72 work should not wait on.* #55's cpufreq half needs this
+bus. Its **A72 half does not** — whether cluster 2 can be brought up at all is a
+CPUHVFS/firmware question (B-40), and nothing here changes it.
+
+
 **Opened 2026-08-21.** This bus is what stands between the machine and its own
 clock speed, so it is worth more attention than an I2C bug usually gets.
 
