@@ -1,21 +1,46 @@
-# The GPU-composited session — staged, and BLOCKED
+# The GPU-composited session — INSTALLED, 2026-08-22
 
-These are the three files that make sway the autostarted desktop. They work:
-sddm reads `gemini-sway.desktop`, runs `gemini-session`, sway comes up as the
-`gemini` user on the active VT with DRM master, swaybar and a terminal run, and
-`grim` captures a perfect 2160x1080 desktop.
+These three files make sway the autostarted desktop, replacing LXQt-on-X. They
+are live on the device.
 
-**They are not installed, because the frames never reach the glass.** See B-46.
-The panel keeps showing a stale buffer while the compositor renders correctly.
-Setting the background to `#000000` and then `#ffffff` produces two photographs
-that are pixel-for-pixel the same cyan rectangle.
+- `gemini-sway.desktop` -> `/usr/share/wayland-sessions/`
+- `gemini-session`      -> `/usr/local/bin/`  (sets WLR_RENDERER=gles2 and
+                            WLR_RENDER_DRM_DEVICE; NOT gemini-dock, which stops
+                            sddm and is the manual-start version)
+- `sway-docked.conf`    -> `/etc/gemini/`
 
-Do not install these until B-46 is fixed. Reverting is
-`Session=lxqt.desktop` in `/etc/sddm.conf.d/10-gemini.conf` **and** in
-`/var/lib/sddm/state.conf` — sddm reads every file in `sddm.conf.d`, including
-one called `10-gemini.conf.lxqt-backup`, so do not leave backups in there.
+Point sddm at it in **two** places, because it reads both:
 
-`sway-docked.conf` here is worth keeping regardless: the version on the device
-contained nothing but two `output` lines, which means the session had no
-keybindings at all — no terminal, no window controls, no bar. This one includes
-`/etc/sway/config` first.
+    /etc/sddm.conf.d/10-gemini.conf   Session=gemini-sway.desktop
+    /var/lib/sddm/state.conf          Session=/usr/share/wayland-sessions/gemini-sway.desktop
+
+Two traps, both of which cost time on the day this landed:
+
+1. **sddm reads every file in `/etc/sddm.conf.d/`, whatever it is called.** A
+   backup left there as `10-gemini.conf.lxqt-backup` sorts *after*
+   `10-gemini.conf` and silently overrode it, so sddm kept starting LXQt while
+   the config said sway. Keep backups somewhere else.
+2. **`sway-docked.conf` used to contain nothing but two `output` lines.** Sway
+   replaces its whole default config when given `-c`, so that session had no
+   keybindings at all — no terminal, no window controls, no bar. This version
+   `include`s `/etc/sway/config` first and then overrides.
+
+Reverting is the same two `Session=` lines set back to `lxqt.desktop` and
+`/usr/share/xsessions/lxqt.desktop`.
+
+## Verifying it, without fooling yourself
+
+`grim` proves only that the compositor rendered. Photograph the panel — and
+**pin the camera exposure**, which `gemini-eyes.py` now does by default. On
+auto-exposure this camera blows a lit panel in a dark room to a uniform pale
+cyan, and a black screen and a white screen come out identical. That is how a
+perfectly working sway desktop was recorded as a frozen panel for an hour
+(B-46, issue #58, both retracted).
+
+Known gaps, neither blocking:
+
+- `$mod+d` does nothing: the stock config's `$menu` is `wmenu-run`, which is
+  not installed. `$mod+Return` gives a terminal.
+- The LXQt panel cannot run natively — `qt6-wayland` is not installed and the
+  device needs to be online to get it. LXQt *applications* run fine through
+  Xwayland and get Mali-T880 (Panfrost), not llvmpipe.
