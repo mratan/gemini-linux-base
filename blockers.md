@@ -2470,6 +2470,41 @@ currently wrong in exactly this way, and nobody has looked.
 
 ## 🟡 B-40 — the two Cortex-A72 cores never come up, and there is no cpufreq at all
 
+### CORRECTION 2026-08-22 (same evening): the firmware is NOT missing
+
+The update below ends with "the A72s need firmware we do not have". **That is
+wrong.** The CPUHVFS PCM image is a GPL-licensed C array in the vendor tree we
+already have locally:
+
+```
+07-kernel/ubports-3.18/drivers/misc/mediatek/base/power/mt6797/
+    mt_cpufreq_hybrid_fw.h   static const u32 dvfs_binary[]
+                             struct pcm_desc dvfs_pcm = {
+                                 .version = "pcm_dvfs_v0.2_160125_02",
+                                 .size    = 1969,   /* words */
+                             };   /* two variants, #ifdef CPUHVFS_HW_GOVERNOR */
+    mt_cpufreq_hybrid.c      2512 lines — the CSPM driver that loads it,
+                             CSPM base 0x11015000
+```
+
+So this is **an unported driver, not absent firmware** — a materially easier
+problem, and the same shape as the connectivity and panel ports this project
+has already done. `cspm_module_init()` (line 1993),
+`__cspm_kick_im_to_fetch()` (951) and `cpuhvfs_kick_dvfsp_to_run()` (2456) are
+the entry points.
+
+The failure mechanism recorded below stands unchanged; only the conclusion
+about reachability was wrong. I recorded an absence of evidence as a
+conclusion, in a blocker, an issue and a state document, before looking in the
+tree for the thing I said we did not have.
+
+**One interaction to plan for before starting CSPM:** i2c6 works today
+*because* the DVFS processor is not running. The vendor's i2c driver takes
+`cpuhvfs_get_dvfsp_semaphore(SEMA_I2C_DRV)` before every transfer on the
+`mediatek,appm_used` bus because the co-processor masters it too, and mainline's
+`i2c-mt65xx` knows nothing about that. Starting CSPM is the most likely way to
+break the bus that the CPU regulator sits on (B-45).
+
 ### UPDATE 2026-08-22 (later): DIAGNOSED. ATF asserts PWR_ON for MP2 and the domain never acknowledges
 
 A formal diagnosis pass. The headline is that **the hang is not in Linux and not
