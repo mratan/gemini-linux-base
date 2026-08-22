@@ -482,6 +482,163 @@ static bool wait_bit(void __iomem *r, u32 mask, bool set, int us, const char *wh
 	return false;
 }
 
+/* ---- ATF's own MTCMOS step tables, read out of the binary ------------- */
+
+/*
+ * `power_on_little_cl()` and `power_on_little()` in plat/mt6797/power.c are
+ * table-driven: a list of (bit, value) single-bit writes to one PWR_CON
+ * register, with polls and delays hung off particular step indices. Both
+ * tables were extracted from the running ATF (`tee.img`) — the cluster one is
+ * built inline on the stack at 0x3f74, the core one is a 2x14-word rodata
+ * table at file offset 0x123b0.
+ *
+ * These matter because they are **not** the sequence
+ * `spm_mtcmos_ctrl_cpu0()`/`_cpusys0()` in the vendor 3.18 tree, which is what
+ * this port has been copying. Two differences decide the outcome:
+ *
+ *   - The core sequence drives SRAM_PDN **high first and waits for
+ *     SRAM_PDN_ACK to go 1**, then low and waits for 0. Going straight to 0
+ *     (what we were doing) gives the SRAM controller no edge, and the "ack
+ *     cleared after 0 us" it produces is not a measurement of anything.
+ *   - The cluster sequence never touches SRAM_SLEEP_B at all. B-40's missing
+ *     bit 19 is not part of powering a cluster on; MP0 has it set because
+ *     whoever brought MP0 up did something else.
+ *
+ * These run on MP2 because the SPMC demonstrably does *not* do the SRAM and
+ * isolation sequencing for us: with its ack asserted, MP2_CPUSYS_PWR_CON still
+ * read 0x00010127.
+ */
+struct pstep { u8 bit; u8 val; };
+
+static const struct pstep cl_on[] = {
+	{ 0, 0 },	/* PWR_RST_B    = 0 */
+	{ 4, 1 },	/* PWR_CLK_DIS  = 1 */
+	{ 2, 1 },	/* PWR_ON       = 1   ; udelay(1) */
+	{ 3, 1 },	/* PWR_ON_2ND   = 1   ; wait PWR_ON&PWR_ON_2ND ; udelay(100) */
+	{ 1, 0 },	/* PWR_ISO      = 0 */
+	{ 8, 0 },	/* SRAM_PDN     = 0   ; wait SRAM_PDN_ACK==0 ; udelay(500) */
+	{ 6, 1 },	/* SRAM_ISOINT_B= 1   ; udelay(1) */
+	{ 5, 0 },	/* SRAM_CKISO   = 0 */
+	{ 4, 0 },	/* PWR_CLK_DIS  = 0 */
+	{ 0, 1 },	/* PWR_RST_B    = 1 */
+};
+
+static const struct pstep core_on[] = {
+	{ 16, 0 },	/* SRAM_SLEEP_B  = 0 */
+	{  0, 0 },	/* PWR_RST_B     = 0 */
+	{  4, 1 },	/* PWR_CLK_DIS   = 1 */
+	{  8, 1 },	/* SRAM_PDN      = 1  ; wait SRAM_PDN_ACK==1 */
+	{  9, 0 },	/* PD_SLPB_CLAMP = 0 */
+	{  8, 0 },	/* SRAM_PDN      = 0  ; wait SRAM_PDN_ACK==0 */
+	{  2, 1 },	/* PWR_ON        = 1  ; udelay(1); wait CPU_PWR_STATUS */
+	{  3, 1 },	/* PWR_ON_2ND    = 1  ; udelay(1); wait CPU_PWR_STATUS_2ND */
+	{ 16, 1 },	/* SRAM_SLEEP_B  = 1 */
+	{  6, 1 },	/* SRAM_ISOINT_B = 1 */
+	{  1, 0 },	/* PWR_ISO       = 0  ; udelay(1) */
+	{  5, 0 },	/* SRAM_CKISO    = 0 */
+	{  4, 0 },	/* PWR_CLK_DIS   = 0 */
+	{  0, 1 },	/* PWR_RST_B     = 1 */
+};
+
+static void set_bit_reg(void __iomem *r, u8 bit, u8 val)
+{
+	u32 v = readl(r);
+
+	writel(val ? (v | BIT(bit)) : (v & ~BIT(bit)), r);
+}
+
+static bool poll_bit_reg(void __iomem *r, u8 bit, bool want, int us,
+			 const char *what)
+{
+	int i;
+
+	for (i = 0; i < us; i++) {
+		if (!!(readl(r) & BIT(bit)) == want) {
+			if (i)
+				P("    %-26s took %d us", what, i);
+			return true;
+		}
+		udelay(1);
+	}
+	P("    %-26s TIMEOUT %d us (reg=%08x)", what, us, readl(r));
+	return false;
+}
+
+/*
+ * ATF power_on_little_cl(), applied to whichever CPUSYS_PWR_CON we point it at.
+ *
+ * `from` exists because of a measured regression: running step 0
+ * (PWR_RST_B = 0) on MP2 **permanently kills the 0x102224xx sub-block** — the
+ * big cluster's PLL and iDVFS registers read 0x00000000 afterwards and stop
+ * accepting writes, and they do not come back when reset is released. The
+ * little clusters survive it because whatever ATF re-initialises for them
+ * lives elsewhere. `cpu_power_on_buck()` has already taken MP2 out of reset by
+ * this point, so start at step 2 and never re-assert it.
+ */
+static void atf_cluster_on(void __iomem *r, int from)
+{
+	int i;
+
+	P("  ATF power_on_little_cl() sequence, steps %d..%d", from,
+	  (int)ARRAY_SIZE(cl_on) - 1);
+	for (i = from; i < ARRAY_SIZE(cl_on); i++) {
+		set_bit_reg(r, cl_on[i].bit, cl_on[i].val);
+
+		switch (i) {
+		case 2:
+			udelay(1);
+			break;
+		case 3:
+			poll_bit_reg(r, 3, true, 2000, "PWR_ON_2ND readback");
+			udelay(100);
+			break;
+		case 5:
+			poll_bit_reg(r, 12, false, 2000, "SRAM_PDN_ACK -> 0");
+			udelay(500);
+			break;
+		case 6:
+			udelay(1);
+			break;
+		}
+	}
+	P("  cluster now %08x", readl(r));
+}
+
+/* ATF power_on_little(cpu), applied to a MP2 core */
+static void atf_core_on(void __iomem *r, int cpu)
+{
+	int i;
+
+	P("  ATF power_on_little() sequence, 14 steps, cpu%d bit%d", cpu,
+	  15 - cpu);
+	for (i = 0; i < ARRAY_SIZE(core_on); i++) {
+		set_bit_reg(r, core_on[i].bit, core_on[i].val);
+
+		switch (i) {
+		case 3:
+			poll_bit_reg(r, 12, true, 2000, "SRAM_PDN_ACK -> 1");
+			break;
+		case 5:
+			poll_bit_reg(r, 12, false, 2000, "SRAM_PDN_ACK -> 0");
+			break;
+		case 6:
+			udelay(1);
+			poll_bit_reg(spm + CPU_PWR_STATUS, 15 - cpu, true,
+				     2000, "CPU_PWR_STATUS");
+			break;
+		case 7:
+			udelay(1);
+			poll_bit_reg(spm + CPU_PWR_STATUS_2ND, 15 - cpu, true,
+				     2000, "CPU_PWR_STATUS_2ND");
+			break;
+		case 10:
+			udelay(1);
+			break;
+		}
+	}
+	P("  core now %08x", readl(r));
+}
+
 static bool cputop_power_up(void)
 {
 	void __iomem *r = spm + MP2_CPUSYS_PWR_CON;
@@ -515,52 +672,10 @@ static bool cputop_power_up(void)
 	 * 0x0001004D. So the MTCMOS control bits still have to be walked in
 	 * software, exactly as spm_mtcmos_ctrl_cpusys0() does for MP0.
 	 */
-	P("  walking the MTCMOS sequence (target 0x0009004d, MP0 = %08x)",
-	  readl(spm + MP0_CPUSYS_PWR_CON));
-	writel(readl(r) | PWR_ON_2ND, r);
-	udelay(50);
-	wait_bit(spm + CPU_PWR_STATUS, MP2_CPUTOP_BIT, true, 2000,
-		 "bit17 after PWR_ON_2ND");
-
-	/*
-	 * The SRAM head switch ("spark"). MediaTek gates each cluster's SRAM
-	 * array behind a fine-grained switch programmed in MCUCFG:
-	 * little_spark2_setldo() writes 0x3f into a per-core field of
-	 * 0x10221c00 (MP0) / 0x10223c00 (MP1), and big_spark2_setldo(a, b)
-	 * writes 0x10222700 = (b << 9) | (a << 6) | 0x3f.
-	 *
-	 * ATF calls the big one at the END of power_on_big, which is fine for
-	 * it because it is re-powering a cluster something else already
-	 * initialised. On a cold cluster it has never been written, and an SRAM
-	 * array with no head switch is exactly a domain whose SRAM_SLEEP_B_ACK
-	 * never comes back.
-	 */
 	P("  spark: MP0 0x10221c00=%08x  MP1 0x10223c00=%08x  MP2 0x10222700=%08x",
 	  sread(0x10221c00), sread(0x10223c00), sread(0x10222700));
-	swrite(0x10222700, 0x3f);
-	P("  spark: MP2 0x10222700 <- 0x3f, reads %08x", sread(0x10222700));
 
-	writel(readl(r) & ~(PWR_ISO | PD_SLPB_CLAMP), r);
-	writel(readl(r) & ~SRAM_PDN, r);
-	wait_bit(r, SRAM_PDN_ACK, false, 2000, "SRAM_PDN_ACK clear");
-	udelay(1);
-	writel(readl(r) | SRAM_ISOINT_B, r);
-	udelay(1);
-	writel(readl(r) & ~SRAM_CKISO, r);
-
-	/*
-	 * SRAM_SLEEP_B is already 1 in the reset value (0x00010132), so simply
-	 * setting it again is a no-op and the SRAM controller never sees an
-	 * edge to acknowledge. Give it one.
-	 */
-	P("  SRAM_SLEEP_B is %d at this point; toggling it for an edge",
-	  !!(readl(r) & SRAM_SLEEP_B));
-	writel(readl(r) & ~SRAM_SLEEP_B, r);
-	udelay(10);
-	writel(readl(r) | SRAM_SLEEP_B, r);
-	wait_bit(r, SRAM_SLEEP_B_ACK, true, 2000, "SRAM_SLEEP_B_ACK");
-	writel(readl(r) & ~PWR_CLK_DIS, r);
-	writel(readl(r) | PWR_RST_B, r);
+	atf_cluster_on(r, 2);
 	mdelay(2);
 
 	P("  MP2=%08x (MP0 running = %08x)  %s", readl(r),
@@ -712,6 +827,62 @@ static void cluster_clock_up(void)
 	}
 	P("  MP2=%08x CPU_PWR_STATUS=%08x SPMC top=%08x", readl(r),
 	  readl(spm + CPU_PWR_STATUS), sread(0x102222a0));
+}
+
+/* ---- the per-cluster MISC block --------------------------------------- */
+
+/*
+ * The three clusters have parallel MISC blocks in MCUCFG:
+ *   MP0 at 0x10220000, MP1 at 0x10220200, MP2 at 0x10222200.
+ * ATF's own enable_scu() switch confirms the mapping — it picks
+ * 0x1022002c / 0x1022022c / 0x1022222c for the three AXI_CONFIGs.
+ *
+ * With the cluster powered, MP2's +0x20..+0x3c reads 0xFFFFFFFF while MP0's
+ * and MP1's read real values (AXI_CONFIG 0x0000000b, boot address 0x0010103c,
+ * +0x3c 0x000ff000). Either those offsets are unimplemented for an A72
+ * cluster, or they are simply unconfigured. A write with a distinctive value
+ * settles which, and it is safe: MP2 is not running.
+ */
+static void misc_block_diff(void)
+{
+	static const u32 base[3] = { 0x10220000, 0x10220200, 0x10222200 };
+	static const char *nm[3] = { "MP0", "MP1", "MP2" };
+	u32 o;
+	int c;
+
+	P("---- cluster MISC blocks (MP0 up / MP1 up / MP2) ----");
+	for (o = 0; o < 0x80; o += 4) {
+		u32 v[3];
+		bool differs;
+
+		for (c = 0; c < 3; c++)
+			v[c] = sread(base[c] + o);
+		differs = (v[0] == v[1]) && (v[1] != v[2]);
+		if (!v[0] && !v[1] && !v[2])
+			continue;
+		P("  +%03x  %08x %08x %08x %s", o, v[0], v[1], v[2],
+		  differs ? "<<<" : "");
+	}
+
+	P("  write test on MP2's MISC block (MP2 is not running):");
+	for (c = 0; c < 3; c++) {
+		static const u32 offs[] = { 0x02c, 0x038, 0x03c };
+		u32 a = 0x10222200 + offs[c], was = sread(a), rb;
+
+		swrite(a, 0x5a5a5a5a);
+		rb = sread(a);
+		P("    0x%08x was %08x, wrote 5a5a5a5a, reads %08x  %s",
+		  a, was, rb,
+		  rb == 0x5a5a5a5a ? "*** WRITABLE ***" :
+		  rb == was ? "unchanged" : "partially decoded");
+		swrite(a, was);
+	}
+	for (c = 0; c < 3; c++)
+		P("    MP0 %08x=%08x   MP1 %08x=%08x",
+		  0x10220000 + (c == 0 ? 0x2c : c == 1 ? 0x38 : 0x3c),
+		  sread(0x10220000 + (c == 0 ? 0x2c : c == 1 ? 0x38 : 0x3c)),
+		  0x10220200 + (c == 0 ? 0x2c : c == 1 ? 0x38 : 0x3c),
+		  sread(0x10220200 + (c == 0 ? 0x2c : c == 1 ? 0x38 : 0x3c)));
 }
 
 /* ---- iDVFS: what actually owns cluster B's frequency ------------------ */
@@ -922,6 +1093,8 @@ static void release_core(int cpu)
 
 	P("==== releasing cpu%d (MP2_CPU%d) ====", cpu, idx);
 
+	misc_block_diff();
+
 	/* the coherency interface for cluster 2, which ATF clears on power-on */
 	P("  AXI_CONFIG 0x1022222c = %08x (ACINACTM bit4)", sread(0x1022222c));
 	swrite(0x1022222c, sread(0x1022222c) & ~0x10u);
@@ -947,40 +1120,25 @@ static void release_core(int cpu)
 	}
 
 	writel(SPM_KEY, spm + SPM_POWERON_CONFIG_EN);
-	P("  MP2_CPU%d_PWR_CON = %08x", idx, readl(r));
-
-	writel(readl(r) & ~PWR_RST_B, r);
-	writel(readl(r) | PWR_ON, r);
-	udelay(1);
-	writel(readl(r) | PWR_ON_2ND, r);
-	wait_bit(spm + CPU_PWR_STATUS, CPU_PWR_BIT(cpu), true, 2000,
-		 "core power good");
-
-	/*
-	 * Same story as the cluster: the ack is not the whole state. A running
-	 * A53 core reads 0x0001004D; this one comes up at 0x00010337. Walk it.
-	 */
-	P("  MP2_CPU%d=%08x, target 0x0001004d (MP0_CPU0 = %08x)", idx,
+	P("  MP2_CPU%d_PWR_CON = %08x  (a running A53 core = %08x)", idx,
 	  readl(r), readl(spm + 0x220));
-	writel(readl(r) & ~(PWR_ISO | PD_SLPB_CLAMP), r);
-	writel(readl(r) & ~SRAM_PDN, r);
-	wait_bit(r, SRAM_PDN_ACK, false, 2000, "core SRAM_PDN_ACK clear");
-	udelay(1);
-	writel(readl(r) | SRAM_ISOINT_B, r);
-	writel(readl(r) & ~SRAM_CKISO, r);
-	writel(readl(r) | SRAM_SLEEP_B, r);
-	writel(readl(r) & ~PWR_CLK_DIS, r);
-	udelay(10);
+	P("  WFI before: SLEEP_TIMER_STA=%08x (MP2_CPU0 bit10=%d)",
+	  readl(spm + SPM_SLEEP_TIMER_STA),
+	  !!(readl(spm + SPM_SLEEP_TIMER_STA) & MP2_CPU0_WFI));
+
+	/* the last step of the table is PWR_RST_B = 1, i.e. the release */
+	atf_core_on(r, cpu);
+
 	P("  MP2_CPU%d=%08x  %s", idx, readl(r),
 	  readl(r) == readl(spm + 0x220) ? "*** IDENTICAL to a running core ***"
 					 : "still differs");
-	P("  core SPMC 0x%08x = %08x (ATF waits bit17)", spmc, sread(spmc));
+	P("  core SPMC 0x%08x = %08x", spmc, sread(spmc));
 
-	P("  WFI before release: SLEEP_TIMER_STA=%08x (MP2_CPU0 bit10=%d)",
-	  readl(spm + SPM_SLEEP_TIMER_STA),
-	  !!(readl(spm + SPM_SLEEP_TIMER_STA) & MP2_CPU0_WFI));
-	P("  releasing PWR_RST_B");
-	writel(readl(r) | PWR_RST_B, r);
+	/* power_on_little()'s tail: spark LDO, then the per-core enable bit */
+	swrite(0x10222700, 0x3f);
+	swrite(spmc, sread(spmc) | 1);
+	P("  spark 0x10222700=%08x, core enable 0x%08x=%08x",
+	  sread(0x10222700), spmc, sread(spmc));
 
 	for (i = 0; i < 60; i++) {
 		u32 wfi = readl(spm + SPM_SLEEP_TIMER_STA);
