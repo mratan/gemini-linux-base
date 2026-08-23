@@ -567,6 +567,18 @@ static bool cputop_power_on(void)
  * state of exactly these registers.
  */
 static void atf_core_poll_rehearsal(int cpu);
+static void atf_bus_rehearsal(void);
+
+/*
+ * Stage 5's whole payload, run at ATF's own decision point: the bus release and
+ * (optionally) the CCI snoop enable that follow the frequency check, then the
+ * two core polls power_on_big() does. Everything bounded, everything restored.
+ */
+static void atf_tail_rehearsal(int cpu)
+{
+	atf_bus_rehearsal();
+	atf_core_poll_rehearsal(cpu);
+}
 
 static void atf_clock_rehearsal(void (*with_clock_applied)(int), int arg)
 {
@@ -706,6 +718,81 @@ static void atf_core_poll_rehearsal(int cpu)
 	  readl(r), readl(spm + CPU_PWR_STATUS), sread(spmc));
 	P("  VERDICT: PSCI CPU_ON %s spin in power_on_big",
 	  (ok1 && ok2) ? "will NOT" : "*** WILL ***");
+}
+
+/* ---- polls 5 and 6: the bus release and the CCI snoop enable ---------- */
+
+/*
+ * The tail of power_on_cl3(), after the frequency check passes. These two are
+ * the leading suspects for the spin seen on 2026-08-22, precisely because they
+ * sit *after* the gate that was closed until ARMCAXPLL2 was moved — nothing had
+ * ever reached them.
+ *
+ * The bus release is low risk: dropping MP2's TOPAXI protection for a domain
+ * that is powered is what the SoC's own power-domain code does routinely, and
+ * it is restored here.
+ *
+ * The CCI half is NOT low risk and is opt-in. Enabling snoop and DVM on a
+ * slave interface whose master cannot answer is a way to stall the
+ * interconnect for every other master on it — which is a whole-SoC hang, not a
+ * lost CPU. Run it only with the dead-man reset armed.
+ */
+static int rehearse_cci;
+module_param(rehearse_cci, int, 0444);
+MODULE_PARM_DESC(rehearse_cci,
+	"also rehearse ATF's CCI snoop enable for cluster 2 (can stall the "
+	"interconnect — arm the dead-man reset first)");
+
+static void atf_bus_rehearsal(void)
+{
+	u32 prot0 = readl(infracfg + TOPAXI_PROTECTEN);
+	bool ok;
+	int i;
+
+	P("==== rehearsing power_on_cl3's bus release (poll 5) ====");
+	bus_report("before");
+	writel(prot0 & ~MP2_BUS_PROT_MASK, infracfg + TOPAXI_PROTECTEN);
+	for (i = 0; i < 20000; i++) {
+		if (!(readl(infracfg + TOPAXI_PROTECTEN_STA1) & MP2_BUS_PROT_MASK))
+			break;
+		udelay(1);
+	}
+	ok = !(readl(infracfg + TOPAXI_PROTECTEN_STA1) & MP2_BUS_PROT_MASK);
+	P("  STA1 & 0x444 %s after %d us (=%08x)",
+	  ok ? "cleared" : "*** TIMEOUT — ATF WOULD SPIN HERE ***", i,
+	  readl(infracfg + TOPAXI_PROTECTEN_STA1));
+	P("  restoring TOPAXI_PROTECTEN %08x", prot0);
+	writel(prot0, infracfg + TOPAXI_PROTECTEN);
+	udelay(100);
+
+	if (!rehearse_cci) {
+		P("==== poll 6 (CCI snoop enable) NOT rehearsed: pass "
+		  "rehearse_cci=1 with the dead-man reset armed ====");
+		return;
+	}
+
+	P("==== rehearsing power_on_cl3's CCI snoop enable (poll 6) ====");
+	{
+		u32 snoop0 = readl(cci + CCI_MP2_SNOOP);
+		u32 want = snoop0 | 3u | (3u << 4);	/* cluster 2 -> (2 + 1) << 4 */
+
+		P("  MP2 slave interface %08x -> %08x", snoop0, want);
+		writel(want, cci + CCI_MP2_SNOOP);
+		for (i = 0; i < 20000; i++) {
+			if (!(readl(cci + CCI_STATUS) & 1))
+				break;
+			udelay(1);
+		}
+		P("  CCI STATUS change-pending %s after %d us (=%08x)",
+		  (readl(cci + CCI_STATUS) & 1) ?
+			"*** TIMEOUT — ATF WOULD SPIN HERE ***" : "cleared",
+		  i, readl(cci + CCI_STATUS));
+		P("  restoring the slave interface to %08x", snoop0);
+		writel(snoop0, cci + CCI_MP2_SNOOP);
+		for (i = 0; i < 20000 && (readl(cci + CCI_STATUS) & 1); i++)
+			udelay(1);
+		bus_report("after");
+	}
 }
 
 /* ---- the CSPM semaphore ATF also polls without a bound ---------------- */
@@ -1090,7 +1177,7 @@ static int __init a72psci_init(void)
 	}
 
 	if (stage == 5) {
-		atf_clock_rehearsal(atf_core_poll_rehearsal, cpu_target);
+		atf_clock_rehearsal(atf_tail_rehearsal, cpu_target);
 		cspm_sema_report_and_free();
 		bus_report("stage 5");
 		P("Every unbounded poll in ATF's path has now been measured "

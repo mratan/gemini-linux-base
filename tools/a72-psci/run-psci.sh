@@ -5,7 +5,8 @@
 #   stage 2  + power the CPUTOP domain and rehearse ATF's clock section, so the
 #            input to ATF's frequency check can be read without ATF spinning
 #   stage 3  + raw PSCI CPU_ON to a park stub   <- can spin the issuing CPU
-#   stage 5  + rehearse power_on_big's two core polls (safe; puts the core back)
+#   stage 5  + rehearse EVERY remaining unbounded poll in ATF's path, bounded,
+#            and put the state back (add rehearse_cci=1 for the risky one)
 #   stage 4  prerequisites + cluster powered, then `echo 1 > cpu8/online` by hand
 #   stage 0  restore
 #
