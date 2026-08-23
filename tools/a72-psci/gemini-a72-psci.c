@@ -179,6 +179,28 @@ static long swrite(u32 addr, u32 val)
 #define CLK26CALI_0		0x220
 #define CLK26CALI_1		0x224
 
+/*
+ * The tail of power_on_cl3(), after its frequency check passes, holds two more
+ * unbounded polls (tee.img 0x3dd8..0x3e80):
+ *
+ *     INFRACFG 0x10001234 &= ~0x444                     ; release MP2's bus
+ *     while (readl(0x1000123c) & 0x444) ;               <- unbounded
+ *     MCUCFG   0x1022220c &= ~1
+ *     CCI      0x10396000 |= 3 | ((cluster + 1) << 4)   ; snoop + DVM enable
+ *     while (readl(0x1039000c) & 1) ;                   <- unbounded (change pending)
+ *     MCUCFG   0x10222590 |= 0x10000
+ *
+ * Both are plain non-secure reads, so a watcher on another CPU can say which
+ * one ATF is sitting in without issuing an SMC of its own.
+ */
+#define INFRACFG_PHYS		0x10001000UL
+#define TOPAXI_PROTECTEN	0x234
+#define TOPAXI_PROTECTEN_STA1	0x23c
+#define MP2_BUS_PROT_MASK	0x444u
+#define CCI_PHYS		0x10390000UL
+#define CCI_STATUS		0x0000c
+#define CCI_MP2_SNOOP		0x06000
+
 #define CSPM_PHYS		0x11015000UL
 #define CSPM_POWERON_CONFIG	0x000
 #define CSPM_SEMA		0x448
@@ -230,7 +252,17 @@ static int smc_cpu = 7;
 module_param(smc_cpu, int, 0444);
 MODULE_PARM_DESC(smc_cpu, "which CPU issues the PSCI call (it is the one lost if ATF spins)");
 
-static void __iomem *spm, *mcumixed, *topckgen, *cspm;
+static void __iomem *spm, *mcumixed, *topckgen, *cspm, *infracfg, *cci;
+
+/* the two registers ATF polls without a bound after its frequency check */
+static void bus_report(const char *when)
+{
+	P("  %-22s TOPAXI_PROTECTEN=%08x STA1=%08x (ATF waits for &0x444 == 0)",
+	  when, readl(infracfg + TOPAXI_PROTECTEN),
+	  readl(infracfg + TOPAXI_PROTECTEN_STA1));
+	P("  %-22s CCI STATUS=%08x (ATF waits for bit0 == 0) MP2 snoop=%08x",
+	  "", readl(cci + CCI_STATUS), readl(cci + CCI_MP2_SNOOP));
+}
 
 /* ---- the abist meter, with the latch lag removed ---------------------- */
 
@@ -785,6 +817,7 @@ static int ringwatch_fn(void *unused)
 		  readl(mcumixed + ARMPLLDIV_MUXSEL),
 		  readl(mcumixed + ARMPLLDIV_CKDIV),
 		  readl(cspm + CSPM_SEMA), meter(37));
+		bus_report("watch");
 	}
 	return 0;
 }
@@ -998,7 +1031,9 @@ static int __init a72psci_init(void)
 	mcumixed = ioremap(MCUMIXED_PHYS, 0x1000);
 	topckgen = ioremap(TOPCKGEN_PHYS, 0x1000);
 	cspm = ioremap(CSPM_PHYS, 0x1000);
-	if (!spm || !mcumixed || !topckgen || !cspm) {
+	infracfg = ioremap(INFRACFG_PHYS, 0x1000);
+	cci = ioremap(CCI_PHYS, 0x10000);
+	if (!spm || !mcumixed || !topckgen || !cspm || !infracfg || !cci) {
 		P("ioremap failed");
 		goto out;
 	}
@@ -1046,6 +1081,7 @@ static int __init a72psci_init(void)
 		atf_clock_rehearsal();
 		atf_core_poll_rehearsal(cpu_target);
 		cspm_sema_report_and_free();
+		bus_report("stage 5");
 		P("Every unbounded poll in ATF's path has now been measured "
 		  "bounded. Stage 3 is the real call.");
 		goto out;
@@ -1053,6 +1089,7 @@ static int __init a72psci_init(void)
 
 	if (stage == 3) {
 		cspm_sema_report_and_free();
+		bus_report("before CPU_ON");
 		if (make_mailbox_and_park()) {
 			P("could not build the instrument — refusing to fire");
 			goto out;
