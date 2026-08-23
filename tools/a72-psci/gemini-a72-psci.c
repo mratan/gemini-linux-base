@@ -1288,8 +1288,20 @@ static int __init a72psci_init(void)
 		 * a bare `run-psci.sh 3` fires at ~630 MHz — outside both
 		 * windows — which is exactly the run that cost 2026-08-22 its
 		 * device.
+		 *
+		 * The quantity to gate on is ARMCAXPLL2's PROGRAMMED rate, not
+		 * the live abist reading. At this point in the flow ATF's clock
+		 * steps have not run: the cluster is powered but PWR_CLK_DIS is
+		 * still set, so source 37 reads 26000 kHz. It becomes 749988
+		 * only after ATF sets the mux and the divider itself — measured
+		 * in stage 2. ARMCAXPLL2 is what source 37 then follows, and it
+		 * is the thing this module actually controls.
 		 */
-		unsigned int f = meter(37);
+		unsigned int f = pll_khz(readl(mcumixed + ARMCAXPLL2_CON1));
+
+		P("gate check: ARMCAXPLL2 is programmed for %u kHz "
+		  "(live abist(37) = %u kHz, still gated by PWR_CLK_DIS)",
+		  f, meter(37));
 
 		if (!assertions_ok) {
 			P("REFUSING CPU_ON: ATF's entry assertions do not hold, "
@@ -1298,14 +1310,14 @@ static int __init a72psci_init(void)
 		}
 		if (!((f >= ATF_WIN1_LO && f <= ATF_WIN1_HI) ||
 		      (f >= ATF_WIN2_LO && f <= ATF_WIN2_HI))) {
-			P("REFUSING CPU_ON: abist(37) = %u kHz is outside both of "
-			  "ATF's windows [%u..%u] and [%u..%u].", f,
+			P("REFUSING CPU_ON: ARMCAXPLL2 = %u kHz is outside both "
+			  "of ATF's windows [%u..%u] and [%u..%u].", f,
 			  ATF_WIN1_LO, ATF_WIN1_HI, ATF_WIN2_LO, ATF_WIN2_HI);
 			P("Pass armpll2_khz=750000 — that is the whole point of "
 			  "this tool.");
 			goto out;
 		}
-		P("gate check passed: assertions hold and abist(37) = %u kHz", f);
+		P("gate check passed: assertions hold and ARMCAXPLL2 = %u kHz", f);
 
 		cspm_sema_report_and_free();
 		bus_report("before CPU_ON");
