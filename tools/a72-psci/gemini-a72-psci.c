@@ -110,6 +110,7 @@
 #include <linux/platform_device.h>
 #include <linux/math64.h>
 #include <linux/kthread.h>
+#include <linux/completion.h>
 
 #define P(fmt, ...) pr_emerg("a72psci: " fmt "\n", ##__VA_ARGS__)
 
@@ -155,6 +156,7 @@ static long swrite(u32 addr, u32 val)
 #define SPM_POWERON_CONFIG_EN	0x000
 #define SPM_KEY			((0xb16U << 16) | 1U)
 #define CPU_PWR_STATUS		0x188
+#define CPU_PWR_STATUS_2ND	0x18c
 #define MP0_CPUSYS_PWR_CON	0x210
 #define MP2_CPUSYS_PWR_CON	0x218
 #define MP2_CPU0_PWR_CON	0x240
@@ -169,6 +171,8 @@ static long swrite(u32 addr, u32 val)
 #define SRAM_ISOINT_B		BIT(6)
 #define SRAM_PDN		BIT(8)
 #define SRAM_PDN_ACK		BIT(12)
+#define SRAM_SLEEP_B		BIT(16)
+#define SRAM_SLEEP_B_ACK	BIT(19)
 #define MP2_CPUTOP_BIT		BIT(17)
 
 #define MCUMIXED_PHYS		0x1001a000UL
@@ -210,8 +214,12 @@ static long swrite(u32 addr, u32 val)
 
 #define CSPM_PHYS		0x11015000UL
 #define CSPM_POWERON_CONFIG	0x000
+#define CSPM_PCM_CON0		0x018
+#define CSPM_PCM_FSM_STA	0x178
 #define CSPM_SEMA		0x448
 #define CSPM_KEY		0x0b160001U
+#define CSPM_CON0_KEY		(0xb16U << 16)
+#define CSPM_PCM_SW_RESET	BIT(15)
 
 #define DA9214_I2C_ADAPTER	2
 #define DA9214_ADDR		0x68
@@ -253,6 +261,12 @@ static int settle_ms = 45000;
 module_param(settle_ms, int, 0444);
 MODULE_PARM_DESC(settle_ms, "rail settle after enabling VPROC2, in ms");
 
+static int vproc2_already_on;
+module_param(vproc2_already_on, int, 0444);
+MODULE_PARM_DESC(vproc2_already_on,
+	"skip all DA9214 traffic because stage 1 already enabled and verified "
+	"VPROC2; required once the unpaused PCM owns i2c6");
+
 static int armpll2_khz;
 module_param(armpll2_khz, int, 0444);
 MODULE_PARM_DESC(armpll2_khz,
@@ -263,7 +277,50 @@ static int smc_cpu = 7;
 module_param(smc_cpu, int, 0444);
 MODULE_PARM_DESC(smc_cpu, "which CPU issues the PSCI call (it is the one lost if ATF spins)");
 
-static void __iomem *spm, *mcumixed, *topckgen, *cspm, *infracfg, *cci;
+static int force_clock_from_watcher;
+module_param(force_clock_from_watcher, int, 0444);
+MODULE_PARM_DESC(force_clock_from_watcher,
+	"while ATF retries its frequency measurement, repeatedly force cluster "
+	"B's non-secure mux/divider to ATF's own values from the watcher kthread");
+
+static int stop_pcm_from_watcher;
+module_param(stop_pcm_from_watcher, int, 0444);
+MODULE_PARM_DESC(stop_pcm_from_watcher,
+	"reset/stop the paused CPUHVFS PCM from the watcher after ATF has entered "
+	"its frequency retry, removing the clock owner without touching abist");
+
+static int prime_atf_meter;
+module_param(prime_atf_meter, int, 0444);
+MODULE_PARM_DESC(prime_atf_meter,
+	"work around ATF's one-sample meter lag: 1 rehearses source37 on a "
+	"pre-powered CPUTOP; 2 latches the already-750MHz source36 and works "
+	"with CPUTOP still off");
+
+static int release_mp2_sram_from_watcher;
+module_param(release_mp2_sram_from_watcher, int, 0444);
+MODULE_PARM_DESC(release_mp2_sram_from_watcher,
+	"after the primed frequency check reaches poll 5, apply the vendor "
+	"MTCMOS SRAM/isolation release sequence to MP2 from the watcher");
+
+static int full_cputop_mtcmos;
+module_param(full_cputop_mtcmos, int, 0444);
+MODULE_PARM_DESC(full_cputop_mtcmos,
+	"assert PWR_ON_2ND one microsecond after PWR_ON and complete MP2's "
+	"SRAM_SLEEP_B/isolation sequence during the bounded CPUTOP pre-power");
+
+static int handoff_b_pcm_from_watcher;
+module_param(handoff_b_pcm_from_watcher, int, 0444);
+MODULE_PARM_DESC(handoff_b_pcm_from_watcher,
+	"for the Android-like unpaused/CLUSTER_EN state, pause B to release "
+	"ATF's SPMC poll, then unpause it once ATF reaches the clock/bus stage");
+
+static void __iomem *spm, *mcumixed, *topckgen, *cspm, *csram, *infracfg, *cci;
+
+#define CSPM_SW_RSV2		0x610
+#define CSRAM_SW_RSV2		0x328
+#define CSRAM_PAUSE_SRC		0x330
+#define CPUHVFS_SW_PAUSE	BIT(13)
+#define CPUHVFS_CLUSTER_EN	BIT(14)
 
 /* the two registers ATF polls without a bound after its frequency check */
 static void bus_report(const char *when)
@@ -283,7 +340,7 @@ static void bus_report(const char *when)
  * run's count, and the single-shot version of this is what produced B-40's
  * "source 37 is pinned" reading.
  */
-static unsigned int meter_once(unsigned int src)
+static unsigned int meter_once_div(unsigned int src, unsigned int div)
 {
 	u32 dbg = readl(topckgen + CLK_DBG_CFG);
 	u32 misc = readl(topckgen + CLK_MISC_CFG_0);
@@ -291,7 +348,8 @@ static unsigned int meter_once(unsigned int src)
 	int i;
 
 	writel((dbg & 0xFFC0FFFCu) | (src << 16), topckgen + CLK_DBG_CFG);
-	writel((misc & 0x00FFFFFFu) | 0x01000000u, topckgen + CLK_MISC_CFG_0);
+	writel((misc & 0x00FFFFFFu) | ((div & 0xffu) << 24),
+	       topckgen + CLK_MISC_CFG_0);
 	writel(0x1000, topckgen + CLK26CALI_0);
 	writel(0x1010, topckgen + CLK26CALI_0);
 	for (i = 0; i < 200 && (readl(topckgen + CLK26CALI_0) & 0x10); i++)
@@ -303,6 +361,11 @@ static unsigned int meter_once(unsigned int src)
 	writel(0x1010, topckgen + CLK26CALI_0);
 	writel(0x1000, topckgen + CLK26CALI_0);
 	return (t * 26000u) / 1024u * 2u;
+}
+
+static unsigned int meter_once(unsigned int src)
+{
+	return meter_once_div(src, 1);
 }
 
 static unsigned int meter(unsigned int src)
@@ -356,7 +419,11 @@ static void armpll2_set(unsigned int khz)
 	u32 pcw = (u32)div_u64((u64)khz << (14 + posdiv), 26000);
 
 	P("  ARMCAXPLL2 -> %u kHz: pcw 0x%06x (posdiv %u)", khz, pcw, posdiv);
-	writel((con1 & ~0x3FFFFFu) | (pcw & 0x3FFFFFu), mcumixed + ARMCAXPLL2_CON1);
+	/* CPUHVFS hardware mode reloads CON1 from this PCW shadow. */
+	writel(pcw & 0x3fffffu, mcumixed + ARMCAXPLL2_SHADOW);
+	/* CON1 bit31 is the PCW-change trigger and self-clears after latching. */
+	writel((con1 & ~0x3FFFFFu) | (pcw & 0x3FFFFFu) | BIT(31),
+	       mcumixed + ARMCAXPLL2_CON1);
 	udelay(200);
 	armpll2_report("after set");
 }
@@ -486,13 +553,23 @@ static int prerequisites(void)
 
 	P("step 2: dummy read of 0x102224a0 = %08x", sread(0x102224a0));
 
-	P("step 3: VPROC2 (DA9214 BUCKB) on");
-	if (vproc2_set(true)) {
-		P("  VPROC2 ENABLE FAILED — stopping, the rest is meaningless");
-		return -EIO;
+	if (vproc2_already_on) {
+		/*
+		 * Stage 1 enabled and chip-read-verified this rail before CSPM was
+		 * started. Once the PCM is unpaused it is another i2c6 master, and
+		 * Linux has not yet ported the vendor's pause-around-transfer
+		 * semaphore. Even a redundant DA9214 read can collide and fail.
+		 */
+		P("step 3: VPROC2 already on — NO i2c6 traffic while PCM owns the bus");
+	} else {
+		P("step 3: VPROC2 (DA9214 BUCKB) on");
+		if (vproc2_set(true)) {
+			P("  VPROC2 ENABLE FAILED — stopping, the rest is meaningless");
+			return -EIO;
+		}
+		P("step 3b: letting the rail settle for %d ms", settle_ms);
+		msleep(settle_ms);
 	}
-	P("step 3b: letting the rail settle for %d ms", settle_ms);
-	msleep(settle_ms);
 
 	P("step 4: CPU_EXT_BUCK_ISO %08x -> clear bits[1:0]",
 	  readl(spm + CPU_EXT_BUCK_ISO));
@@ -558,7 +635,10 @@ static bool cputop_power_on(void)
 
 	for (k = 0; k < 8 && !ack; k++) {
 		writel(readl(r) | PWR_ON, r);
-		udelay(2);
+		udelay(1);
+		if (full_cputop_mtcmos)
+			writel(readl(r) | PWR_ON_2ND, r);
+		udelay(1);
 		for (i = 0; i < 20000; i++) {
 			if (readl(spm + CPU_PWR_STATUS) & MP2_CPUTOP_BIT) {
 				ack = true;
@@ -572,7 +652,7 @@ static bool cputop_power_on(void)
 		if (ack)
 			break;
 
-		writel(readl(r) & ~PWR_ON, r);
+		writel(readl(r) & ~(PWR_ON | PWR_ON_2ND), r);
 		for (i = 0; i < 20000 &&
 		     (readl(spm + CPU_PWR_STATUS) & MP2_CPUTOP_BIT); i++)
 			udelay(1);
@@ -593,6 +673,31 @@ static bool cputop_power_on(void)
 	}
 	P("  MCUCFG 0x102222a0 bit17 %s after %d us (=%08x)",
 	  (sread(0x102222a0) & BIT(17)) ? "SET" : "TIMEOUT", i, sread(0x102222a0));
+
+	if (full_cputop_mtcmos) {
+		for (i = 0; i < 20000; i++) {
+			if ((readl(spm + CPU_PWR_STATUS) & MP2_CPUTOP_BIT) &&
+			    (readl(spm + CPU_PWR_STATUS_2ND) & MP2_CPUTOP_BIT))
+				break;
+			udelay(1);
+		}
+		writel(readl(r) & ~PWR_ISO, r);
+		writel(readl(r) & ~SRAM_PDN, r);
+		for (i = 0; i < 2000 && (readl(r) & SRAM_PDN_ACK); i++)
+			udelay(1);
+		writel(readl(r) & ~SRAM_SLEEP_B, r);
+		udelay(1);
+		writel(readl(r) | SRAM_SLEEP_B, r);
+		for (i = 0; i < 2000 && !(readl(r) & SRAM_SLEEP_B_ACK); i++)
+			udelay(1);
+		P("  full MTCMOS memory wake: MP2=%08x SLEEP_ACK wait=%d us", readl(r), i);
+		ndelay(900);
+		writel(readl(r) | SRAM_ISOINT_B, r);
+		ndelay(100);
+		writel(readl(r) & ~SRAM_CKISO, r);
+		writel(readl(r) & ~PWR_CLK_DIS, r);
+		writel(readl(r) | PWR_RST_B, r);
+	}
 
 	spm_report("after CPUTOP power-on");
 	P("  0x10222700 (spark vret) = %08x, writing 0x3f", sread(0x10222700));
@@ -634,6 +739,22 @@ static void atf_tail_rehearsal(int cpu)
 	writel(prot0, infracfg + TOPAXI_PROTECTEN);
 	udelay(100);
 	bus_report("after the tail rehearsal");
+}
+
+static void prime_atf_meter_latch(int unused)
+{
+	unsigned int first, second;
+
+	/*
+	 * tee.img's meter reads CLK26CALI_1 once. This silicon exposes the
+	 * previous run's count there; meter() normally hides that by taking two
+	 * samples. Take two source-37 samples while the rehearsed clock is live
+	 * and, critically, do not touch CLK26CALI again before the SMC.
+	 */
+	first = meter_once(37);
+	second = meter_once(37);
+	P("  primed ATF's lagged meter: source37 first=%u second=%u kHz; "
+	  "leaving the 750 MHz count latched", first, second);
 }
 
 static void atf_clock_rehearsal(void (*with_clock_applied)(int), int arg)
@@ -978,14 +1099,235 @@ static void atf_ring_dump(const char *when)
 }
 
 static struct task_struct *ringwatch;
+static DECLARE_COMPLETION(ringwatch_started);
+
+/*
+ * The PCM overwrites B's divider while ATF is in power_on_cl3's frequency
+ * retry. ATF re-measures on every iteration, so create a wide causal window
+ * in which its own mux/divider values win. This touches only non-secure
+ * MCUMIXED registers; in particular it does NOT invoke an SMC or touch the
+ * abist registers ATF is using concurrently.
+ */
+static void ringwatch_force_clock(void)
+{
+	u32 contested = 0;
+	int i;
+
+	if (!force_clock_from_watcher)
+		return;
+
+	P("==== watcher clock intervention: forcing B MUXSEL=1 CKDIV=8 for 2 s ====");
+	P("  before force: MUXSEL=%08x CKDIV=%08x ARMCAXPLL2_CON1=%08x (%u kHz)",
+	  readl(mcumixed + ARMPLLDIV_MUXSEL),
+	  readl(mcumixed + ARMPLLDIV_CKDIV),
+	  readl(mcumixed + ARMCAXPLL2_CON1),
+	  pll_khz(readl(mcumixed + ARMCAXPLL2_CON1)));
+
+	for (i = 0; i < 1000000 && !kthread_should_stop(); i++) {
+		u32 mux = readl(mcumixed + ARMPLLDIV_MUXSEL);
+		u32 div = readl(mcumixed + ARMPLLDIV_CKDIV);
+
+		/*
+		 * Do not rewrite an already-correct clock. The first version did
+		 * two writels every 5 us and ATF measured a ramp of 0..17 MHz:
+		 * the intervention itself was glitching the clock throughout the
+		 * meter's integration window. Correct only an observed takeover.
+		 */
+		if ((mux & 0x3) != 1) {
+			writel((mux & ~0x3u) | 1u, mcumixed + ARMPLLDIV_MUXSEL);
+			contested++;
+		}
+		if ((div & 0x1f) != 8) {
+			writel((div & ~0x1fu) | 8u, mcumixed + ARMPLLDIV_CKDIV);
+			contested++;
+		}
+		udelay(2);
+		if (!(i % 5000))
+			cond_resched();
+	}
+	P("  after force: MUXSEL=%08x CKDIV=%08x; corrective writes=%u over %d polls",
+	  readl(mcumixed + ARMPLLDIV_MUXSEL),
+	  readl(mcumixed + ARMPLLDIV_CKDIV), contested, i);
+}
+
+static void ringwatch_release_mp2_sram(void)
+{
+	void __iomem *r = spm + MP2_CPUSYS_PWR_CON;
+	u32 sta1;
+	int i;
+
+	if (!release_mp2_sram_from_watcher)
+		return;
+
+	sta1 = readl(infracfg + TOPAXI_PROTECTEN_STA1);
+	P("==== watcher MP2 SRAM release: MP2=%08x STATUS=%08x/%08x STA1=%08x ====",
+	  readl(r), readl(spm + CPU_PWR_STATUS),
+	  readl(spm + CPU_PWR_STATUS_2ND), sta1);
+	if (!(readl(spm + CPU_PWR_STATUS) & MP2_CPUTOP_BIT) ||
+	    !(sta1 & 0x444u) ||
+	    (readl(mcumixed + ARMPLLDIV_MUXSEL) & 0x3u) != 1u) {
+		P("  REFUSING intervention: not uniquely at post-frequency poll 5");
+		return;
+	}
+
+	/* mt_spm_mtcmos.c's power-on order, using MP2's integrated SRAM bits. */
+	writel(SPM_KEY, spm + SPM_POWERON_CONFIG_EN);
+	writel(readl(r) | PWR_ON_2ND, r);
+	for (i = 0; i < 2000; i++) {
+		if ((readl(spm + CPU_PWR_STATUS) & MP2_CPUTOP_BIT) &&
+		    (readl(spm + CPU_PWR_STATUS_2ND) & MP2_CPUTOP_BIT))
+			break;
+		udelay(1);
+	}
+	P("  PWR_ON_2ND: MP2=%08x STATUS=%08x/%08x wait=%d us",
+	  readl(r), readl(spm + CPU_PWR_STATUS),
+	  readl(spm + CPU_PWR_STATUS_2ND), i);
+
+	writel(readl(r) & ~PWR_ISO, r);
+	writel(readl(r) & ~SRAM_PDN, r);
+	for (i = 0; i < 2000 && (readl(r) & SRAM_PDN_ACK); i++)
+		udelay(1);
+
+	/*
+	 * A live MP0 is 0x0009004d: both SRAM_SLEEP_B and its bit-19 ACK are
+	 * set. MP2 reaches only 0x0001004d unless the active-low sleep request
+	 * receives a real wake edge. This is ATF's "memory power ready" step.
+	 */
+	writel(readl(r) & ~SRAM_SLEEP_B, r);
+	for (i = 0; i < 2000 && (readl(r) & SRAM_SLEEP_B_ACK); i++)
+		udelay(1);
+	writel(readl(r) | SRAM_SLEEP_B, r);
+	for (i = 0; i < 2000 && !(readl(r) & SRAM_SLEEP_B_ACK); i++)
+		udelay(1);
+	P("  SRAM_SLEEP_B wake: MP2=%08x ACK wait=%d us", readl(r), i);
+
+	ndelay(900);
+	writel(readl(r) | SRAM_ISOINT_B, r);
+	ndelay(100);
+	writel(readl(r) & ~SRAM_CKISO, r);
+	writel(readl(r) & ~PWR_CLK_DIS, r);
+	writel(readl(r) | PWR_RST_B, r);
+	udelay(10);
+	P("  release complete: MP2=%08x STA1=%08x SRAM_ACK wait=%d us",
+	  readl(r), readl(infracfg + TOPAXI_PROTECTEN_STA1), i);
+
+	/*
+	 * ATF cleared PROTECTEN before the SRAM/isolation handshake completed.
+	 * If STA1 retained bit 0x400, generate a fresh deassert edge now that
+	 * the target is live; merely rewriting an already-clear PROTECTEN did
+	 * not make the hardware reevaluate the stale acknowledgement.
+	 */
+	if (readl(infracfg + TOPAXI_PROTECTEN_STA1) & MP2_BUS_PROT_MASK) {
+		u32 prot = readl(infracfg + TOPAXI_PROTECTEN);
+
+		P("  retriggering all MP2 bus-protect bits: PROTECTEN=%08x STA1=%08x",
+		  prot, readl(infracfg + TOPAXI_PROTECTEN_STA1));
+		writel(prot | MP2_BUS_PROT_MASK, infracfg + TOPAXI_PROTECTEN);
+		for (i = 0; i < 2000 &&
+		     (readl(infracfg + TOPAXI_PROTECTEN_STA1) & MP2_BUS_PROT_MASK) !=
+		     MP2_BUS_PROT_MASK; i++)
+			udelay(1);
+		P("  protect asserted: PROTECTEN=%08x STA1=%08x wait=%d us",
+		  readl(infracfg + TOPAXI_PROTECTEN),
+		  readl(infracfg + TOPAXI_PROTECTEN_STA1), i);
+		udelay(1000);
+		writel(prot & ~MP2_BUS_PROT_MASK, infracfg + TOPAXI_PROTECTEN);
+		for (i = 0; i < 2000 &&
+		     (readl(infracfg + TOPAXI_PROTECTEN_STA1) & MP2_BUS_PROT_MASK); i++)
+			udelay(1);
+		P("  bus-protect retrigger: PROTECTEN=%08x STA1=%08x wait=%d us",
+		  readl(infracfg + TOPAXI_PROTECTEN),
+		  readl(infracfg + TOPAXI_PROTECTEN_STA1), i);
+	}
+}
+
+static void ringwatch_handoff_b_pcm(void)
+{
+	u32 b;
+	int i;
+
+	if (!handoff_b_pcm_from_watcher)
+		return;
+
+	b = readl(cspm + CSPM_SW_RSV2);
+	P("==== watcher CPUHVFS handoff: pausing B at SW_RSV2=%08x ====", b);
+	if (!(b & CPUHVFS_CLUSTER_EN) || (b & CPUHVFS_SW_PAUSE)) {
+		P("  REFUSING handoff: B is not CLUSTER_EN and unpaused");
+		return;
+	}
+	writel(b | CPUHVFS_SW_PAUSE, cspm + CSPM_SW_RSV2);
+	writel(b | CPUHVFS_SW_PAUSE, csram + CSRAM_SW_RSV2);
+	udelay(10);
+	writel(BIT(0), csram + CSRAM_PAUSE_SRC);
+	P("  B paused: SW_RSV2=%08x; waiting boundedly for ATF clock stage",
+	  readl(cspm + CSPM_SW_RSV2));
+
+	for (i = 0; i < 2000 && !kthread_should_stop(); i++) {
+		if ((readl(spm + CPU_PWR_STATUS) & MP2_CPUTOP_BIT) &&
+		    (readl(mcumixed + ARMPLLDIV_MUXSEL) & 0x3u) == 1u)
+			break;
+		usleep_range(900, 1100);
+	}
+	P("  handoff wait=%d ms MP2=%08x MUXSEL=%08x STA1=%08x", i,
+	  readl(spm + MP2_CPUSYS_PWR_CON),
+	  readl(mcumixed + ARMPLLDIV_MUXSEL),
+	  readl(infracfg + TOPAXI_PROTECTEN_STA1));
+	if (i == 2000)
+		return;
+
+	writel(0, csram + CSRAM_PAUSE_SRC);
+	b = readl(cspm + CSPM_SW_RSV2) & ~CPUHVFS_SW_PAUSE;
+	writel(b, cspm + CSPM_SW_RSV2);
+	writel(b, csram + CSRAM_SW_RSV2);
+	P("  B unpaused at ATF bus stage: SW_RSV2=%08x", b);
+}
+
+static void ringwatch_stop_pcm(void)
+{
+	if (!stop_pcm_from_watcher)
+		return;
+
+	P("==== watcher PCM intervention: stopping paused CPUHVFS ====");
+	P("  before stop: FSM=%08x MUXSEL=%08x CKDIV=%08x STA1=%08x",
+	  readl(cspm + CSPM_PCM_FSM_STA),
+	  readl(mcumixed + ARMPLLDIV_MUXSEL),
+	  readl(mcumixed + ARMPLLDIV_CKDIV),
+	  readl(infracfg + TOPAXI_PROTECTEN_STA1));
+	writel(CSPM_KEY, cspm + CSPM_POWERON_CONFIG);
+	writel(CSPM_CON0_KEY | CSPM_PCM_SW_RESET, cspm + CSPM_PCM_CON0);
+	writel(CSPM_CON0_KEY, cspm + CSPM_PCM_CON0);
+	udelay(10);
+	P("  after stop: FSM=%08x MUXSEL=%08x CKDIV=%08x STA1=%08x",
+	  readl(cspm + CSPM_PCM_FSM_STA),
+	  readl(mcumixed + ARMPLLDIV_MUXSEL),
+	  readl(mcumixed + ARMPLLDIV_CKDIV),
+	  readl(infracfg + TOPAXI_PROTECTEN_STA1));
+}
 
 static int ringwatch_fn(void *unused)
 {
 	int n;
 
+	/* The SMC must not be issued until this independently scheduled. */
+	complete(&ringwatch_started);
 	for (n = 0; n < 120 && !kthread_should_stop(); n++) {
-		ssleep(5);
+		if (n == 0 && (force_clock_from_watcher || stop_pcm_from_watcher ||
+			       release_mp2_sram_from_watcher || handoff_b_pcm_from_watcher))
+			msleep(1000);
+		else
+			ssleep(5);
 		P("==== ring watch tick %d (cpu%d) ====", n, smp_processor_id());
+		/*
+		 * Intervene before dumping the ring. A frequency retry emits about
+		 * 1400 lines/s; printing that backlog can delay this kthread by tens
+		 * of seconds and miss the useful window entirely.
+		 */
+		if (n == 0) {
+			ringwatch_handoff_b_pcm();
+			ringwatch_stop_pcm();
+			ringwatch_force_clock();
+			ringwatch_release_mp2_sram();
+		}
 		atf_ring_dump("watch");
 		spm_report("watch");
 		/*
@@ -1028,6 +1370,7 @@ static void ringwatch_start(void)
 	}
 	atf_ring_dump("before CPU_ON");
 
+	reinit_completion(&ringwatch_started);
 	ringwatch = kthread_create(ringwatch_fn, NULL, "a72-ringwatch");
 	if (IS_ERR(ringwatch)) {
 		P("  could not start the ring watcher");
@@ -1036,7 +1379,13 @@ static void ringwatch_start(void)
 	}
 	kthread_bind(ringwatch, 0);
 	wake_up_process(ringwatch);
-	P("  ring watcher running on cpu0; it survives a spin on cpu%d", smc_cpu);
+	if (!wait_for_completion_timeout(&ringwatch_started, HZ)) {
+		P("  ring watcher did not schedule within 1 s — REFUSING CPU_ON");
+		kthread_stop(ringwatch);
+		ringwatch = NULL;
+		return;
+	}
+	P("  ring watcher scheduled on cpu0; it survives a spin on cpu%d", smc_cpu);
 }
 
 /* ---- stage 3: the park stub and the raw PSCI call --------------------- */
@@ -1146,6 +1495,10 @@ static void raw_cpu_on(int cpu)
 	atf_assertions_hold();
 	armpll2_report("immediately before CPU_ON");
 	ringwatch_start();
+	if (!ringwatch) {
+		P("  REFUSING CPU_ON: the in-kernel watcher is not running");
+		return;
+	}
 	P("  CPU_ON(mpidr=0x%llx, entry=0x%llx) — from here ATF owns the cluster",
 	  mpidr, (unsigned long long)park_pa);
 
@@ -1260,9 +1613,10 @@ static int __init a72psci_init(void)
 	mcumixed = ioremap(MCUMIXED_PHYS, 0x1000);
 	topckgen = ioremap(TOPCKGEN_PHYS, 0x1000);
 	cspm = ioremap(CSPM_PHYS, 0x1000);
+	csram = ioremap(0x0012a000, 0x1000);
 	infracfg = ioremap(INFRACFG_PHYS, 0x1000);
 	cci = ioremap(CCI_PHYS, 0x10000);
-	if (!spm || !mcumixed || !topckgen || !cspm || !infracfg || !cci) {
+	if (!spm || !mcumixed || !topckgen || !cspm || !csram || !infracfg || !cci) {
 		P("ioremap failed");
 		goto out;
 	}
@@ -1368,6 +1722,48 @@ static int __init a72psci_init(void)
 		}
 		P("gate check passed: assertions hold and ARMCAXPLL2 = %u kHz", f);
 
+		if (prime_atf_meter == 1) {
+			if (!(readl(spm + CPU_PWR_STATUS) & MP2_CPUTOP_BIT)) {
+				P("REFUSING CPU_ON: prime_atf_meter=1 requires a pre-powered CPUTOP");
+				goto out;
+			}
+			P("==== priming ATF's one-sample-lag abist meter from source37 ====");
+			atf_clock_rehearsal(prime_atf_meter_latch, 0);
+			P("  no further CLK26CALI access is permitted before CPU_ON");
+		} else if (prime_atf_meter == 2) {
+			unsigned int first, second, src, div;
+			unsigned int chosen_src = UINT_MAX, chosen_div = 0;
+
+			P("==== finding a 750 MHz raw count to prime ATF's lagged meter ====");
+			for (div = 1; div <= 16 && chosen_src == UINT_MAX; div++) {
+				for (src = 0; src < 64; src++) {
+					unsigned int measured;
+
+					meter_once_div(src, div);
+					measured = meter_once_div(src, div);
+					if (measured >= ATF_WIN1_LO && measured <= ATF_WIN1_HI) {
+						P("  source%u divider-code%u=%u kHz is in ATF's first window",
+						  src, div, measured);
+						chosen_src = src;
+						chosen_div = div;
+						break;
+					}
+				}
+			}
+			if (chosen_src == UINT_MAX) {
+				P("REFUSING CPU_ON: no source 0..63/divider-code 1..16 yields ATF's 750 MHz count");
+				goto out;
+			}
+			first = meter_once_div(chosen_src, chosen_div);
+			second = meter_once_div(chosen_src, chosen_div);
+			P("  source%u/div%u first=%u second=%u kHz; leaving that count latched",
+			  chosen_src, chosen_div, first, second);
+			P("  no further CLK26CALI access is permitted before CPU_ON");
+		} else if (prime_atf_meter) {
+			P("REFUSING CPU_ON: prime_atf_meter must be 0, 1, or 2");
+			goto out;
+		}
+
 		cspm_sema_report_and_free();
 		bus_report("before CPU_ON");
 		if (make_mailbox_and_park()) {
@@ -1410,6 +1806,8 @@ out:
 		iounmap(topckgen);
 	if (cspm)
 		iounmap(cspm);
+	if (csram)
+		iounmap(csram);
 	if (infracfg)
 		iounmap(infracfg);
 	if (cci)

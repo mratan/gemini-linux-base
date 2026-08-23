@@ -50,6 +50,8 @@
  *   stage=3             everything in 2, then set CLUSTER_EN on cluster B and
  *                       watch MP2_CPUSYS_PWR_CON.
  *   stage=4             everything in 3, then UNPAUSE cluster B.
+ *   stage=5             attach to an already-running stage-2 PCM, then enable
+ *                       and unpause B without resetting/reloading the PCM.
  *
  * Stage 3 turned out not to be enough, and the vendor code says why: setting
  * CLUSTER_EN while paused only records the request. cspm_cluster_notify_on()
@@ -171,6 +173,10 @@
 #define NUM_CPU_CLUSTER		4
 
 /* CSRAM offsets the firmware and the vendor driver agree on */
+#define OFFS_INIT_OPP		0x02e0
+#define OFFS_INIT_FREQ		0x02f0
+#define OFFS_INIT_VOLT		0x0300
+#define OFFS_INIT_VSRAM		0x0310
 #define OFFS_SW_RSV0		0x0320
 #define OFFS_PAUSE_SRC		0x0330
 #define OFFS_FW_RSV3		0x02b0
@@ -185,16 +191,26 @@
 static int v_ll = 0x4d, v_l = 0x4d, v_cci = 0x4d, v_b = 0x58;
 static int vs_ll = 0xf, vs_l = 0xf, vs_cci = 0xf, vs_b = 0xb;
 static int f_ll = 15, f_l = 15, f_cci = 15, f_b = 15;
+static int freq_ll_khz, freq_l_khz, freq_b_khz, freq_cci_khz;
 module_param(v_ll, int, 0444);   module_param(v_l, int, 0444);
 module_param(v_cci, int, 0444);  module_param(v_b, int, 0444);
 module_param(vs_ll, int, 0444);  module_param(vs_l, int, 0444);
 module_param(vs_cci, int, 0444); module_param(vs_b, int, 0444);
 module_param(f_ll, int, 0444);   module_param(f_l, int, 0444);
 module_param(f_cci, int, 0444);  module_param(f_b, int, 0444);
+module_param(freq_ll_khz, int, 0444);  module_param(freq_l_khz, int, 0444);
+module_param(freq_b_khz, int, 0444);   module_param(freq_cci_khz, int, 0444);
+
+static int clear_b_assign_after_kick;
+module_param(clear_b_assign_after_kick, int, 0444);
+MODULE_PARM_DESC(clear_b_assign_after_kick,
+	"clear B's pending SW_F_ASSIGN while it is still paused, matching Android's offline 0x26f0 state");
 
 static int stage = 1;
 module_param(stage, int, 0444);
-MODULE_PARM_DESC(stage, "1 = load+verify only, 2 = also kick PCM, 3 = also enable cluster B");
+MODULE_PARM_DESC(stage,
+	"1 load+verify; 2 kick paused; 3 enable B paused; 4 unpause B; "
+	"5 attach to existing stage 2 and unpause B without resetting PCM");
 
 static void __iomem *cspm;
 static void __iomem *csram;
@@ -374,18 +390,24 @@ static void kick_pcm_to_run(void)
 	 * Every cluster starts PAUSED, exactly as the vendor kicks it. This is
 	 * what keeps the co-processor off i2c6 and out of DVFS.
 	 *
-	 * The frequency fields describe where each cluster already is; they are
-	 * bookkeeping for a firmware that is not going to act on them while
-	 * paused. Ceiling 0 / floor 15 is the full range in software indices.
+	 * Ceiling 0 / floor 15 is the full range in software indices. DES must
+	 * match the seeded current OPP. This used to hard-code DES=15 for every
+	 * cluster, so changing f_b changed only HWSTA while the firmware still
+	 * drove cluster B to the lowest OPP when unpaused.
 	 */
-	for (i = 0; i < NUM_PHY_CLUSTER; i++) {
-		u32 swctrl = SW_F_MAX(opp_sw_to_fw(0)) |
-			     SW_F_MIN(opp_sw_to_fw(NUM_CPU_OPP - 1)) |
-			     SW_F_DES(opp_sw_to_fw(NUM_CPU_OPP - 1)) |
-			     SW_F_ASSIGN | SW_PAUSE;
-		cw(SW_RSV(i), swctrl);
-		writel(swctrl, csram + OFFS_SW_RSV0 + i * 4);
-		P("  cluster%d swctrl = 0x%08x (SW_PAUSE set)", i, cr(SW_RSV(i)));
+	{
+		u32 f[NUM_PHY_CLUSTER] = { f_ll, f_l, f_b };
+
+		for (i = 0; i < NUM_PHY_CLUSTER; i++) {
+			u32 swctrl = SW_F_MAX(opp_sw_to_fw(0)) |
+				     SW_F_MIN(opp_sw_to_fw(NUM_CPU_OPP - 1)) |
+				     SW_F_DES(opp_sw_to_fw(f[i])) |
+				     SW_F_ASSIGN | SW_PAUSE;
+			cw(SW_RSV(i), swctrl);
+			writel(swctrl, csram + OFFS_SW_RSV0 + i * 4);
+			P("  cluster%d swctrl = 0x%08x (opp %u -> fw %u, SW_PAUSE set)",
+			  i, cr(SW_RSV(i)), f[i], opp_sw_to_fw(f[i]));
+		}
 	}
 
 	/*
@@ -420,13 +442,29 @@ static void kick_pcm_to_run(void)
 		u32 v[NUM_CPU_CLUSTER]  = { v_ll, v_l, v_b, v_cci };
 		u32 vs[NUM_CPU_CLUSTER] = { vs_ll, vs_l, vs_b, vs_cci };
 		u32 f[NUM_CPU_CLUSTER]  = { f_ll, f_l, f_b, f_cci };
+		u32 khz[NUM_CPU_CLUSTER] = {
+			freq_ll_khz, freq_l_khz, freq_b_khz, freq_cci_khz
+		};
 
 		for (i = 0; i < NUM_CPU_CLUSTER; i++) {
+			/*
+			 * Firmware ABI metadata written by vendor
+			 * __cspm_check_and_update_sta(). Omitting these left reset
+			 * garbage in CSRAM; cluster-off paths happened to survive, but
+			 * the first powered cluster-on reset the SoC.
+			 */
+			writel(f[i], csram + OFFS_INIT_OPP + i * sizeof(u32));
+			writel(khz[i], csram + OFFS_INIT_FREQ + i * sizeof(u32));
+			writel(v[i], csram + OFFS_INIT_VOLT + i * sizeof(u32));
+			writel(vs[i], csram + OFFS_INIT_VSRAM + i * sizeof(u32));
+
 			cw(SW_RSV(3 + i), F_CURR(opp_sw_to_fw(f[i])) |
 					  V_CURR(v[i]) | VS_CURR(vs[i]));
-			P("  %-3s hwsta = 0x%08x  (opp %u -> fw %u, vproc 0x%02x, vsram 0x%02x)",
+			writel(cr(SW_RSV(3 + i)),
+			       csram + OFFS_FW_RSV3 + i * sizeof(u32));
+			P("  %-3s hwsta = 0x%08x  (opp %u -> fw %u, %u kHz, vproc 0x%02x, vsram 0x%02x)",
 			  nm[i], cr(SW_RSV(3 + i)), f[i], opp_sw_to_fw(f[i]),
-			  v[i], vs[i]);
+			  khz[i], v[i], vs[i]);
 		}
 	}
 
@@ -468,6 +506,32 @@ static int __init cspm_probe_init(void)
 	P("==== begin, stage=%d, fw=%s (%d words) ====", stage, CSPM_FW_VERSION,
 	  CSPM_FW_SIZE);
 
+	/* Validate every firmware bitfield before resetting or starting CSPM. */
+	if (f_ll < 0 || f_ll >= NUM_CPU_OPP ||
+	    f_l < 0 || f_l >= NUM_CPU_OPP ||
+	    f_b < 0 || f_b >= NUM_CPU_OPP ||
+	    f_cci < 0 || f_cci >= NUM_CPU_OPP) {
+		P("REFUSING invalid OPP seed: f_ll=%d f_l=%d f_b=%d f_cci=%d",
+		  f_ll, f_l, f_b, f_cci);
+		return -EINVAL;
+	}
+	if (v_ll < 0 || v_ll > 0x5a || v_l < 0 || v_l > 0x5a ||
+	    v_cci < 0 || v_cci > 0x5a || v_b < 0 || v_b > 0x58 ||
+	    vs_ll < 0 || vs_ll > 0x7f || vs_l < 0 || vs_l > 0x7f ||
+	    vs_cci < 0 || vs_cci > 0x7f || vs_b < 0 || vs_b > 0x7f) {
+		P("REFUSING invalid voltage seed");
+		return -EINVAL;
+	}
+	if (stage >= 2 && stage <= 4 &&
+	    (freq_ll_khz <= 0 || freq_ll_khz > 3000000 ||
+	     freq_l_khz <= 0 || freq_l_khz > 3000000 ||
+	     freq_b_khz <= 0 || freq_b_khz > 3000000 ||
+	     freq_cci_khz <= 0 || freq_cci_khz > 3000000)) {
+		P("REFUSING missing/invalid physical-frequency metadata: LL=%d L=%d B=%d CCI=%d",
+		  freq_ll_khz, freq_l_khz, freq_b_khz, freq_cci_khz);
+		return -EINVAL;
+	}
+
 	cspm = ioremap(CSPM_PHYS, CSPM_SIZE);
 	csram = ioremap(CSRAM_PHYS, CSRAM_SIZE);
 	mp2_pwr = ioremap(MP2_CPUSYS_PWR_CON, 4);
@@ -479,6 +543,56 @@ static int __init cspm_probe_init(void)
 	P("CSPM alive check: POWERON_CONFIG_EN=0x%08x PCM_CON0=0x%08x PCM_CON1=0x%08x FSM_STA=0x%08x",
 	  cr(POWERON_CONFIG_EN), cr(PCM_CON0), cr(PCM_CON1), cr(PCM_FSM_STA));
 	P("MP2_CPUSYS_PWR_CON = 0x%08x (before anything)", readl(mp2_pwr));
+
+	/*
+	 * Attach to the stage-2 PCM without resetting it. This is the missing
+	 * experiment: power CPUTOP first while B is disabled (which acks), then
+	 * let the already-running PCM see CLUSTER_EN. Re-running stage 4 here
+	 * would reset/reload the PCM and lose the ordering being tested.
+	 */
+	if (stage == 5) {
+		struct device_node *np;
+		u32 ll = cr(SW_RSV(0)), l = cr(SW_RSV(1)), b = cr(SW_RSV(2));
+
+		if ((ll & SW_PAUSE) == 0 || (l & SW_PAUSE) == 0 ||
+		    (b & (SW_PAUSE | CLUSTER_EN)) != SW_PAUSE) {
+			P("REFUSING stage 5 attach: expected paused stage-2 state, got LL=%08x L=%08x B=%08x",
+			  ll, l, b);
+			goto out;
+		}
+		P("stage 5 attach: PCM stays running; setting B CLUSTER_EN on powered MP2");
+		cw(SW_RSV(2), b | CLUSTER_EN);
+		writel(cr(SW_RSV(2)), csram + OFFS_SW_RSV0 + 2 * sizeof(u32));
+
+		np = of_find_node_by_path("/i2c@1100e000");
+		if (!np) {
+			P("cannot find /i2c@1100e000 — not unpausing");
+			goto out;
+		}
+		i2c_clk = of_clk_get_by_name(np, "main");
+		of_node_put(np);
+		if (IS_ERR(i2c_clk)) {
+			P("cannot get the i2c main clock (%ld) — not unpausing",
+			  PTR_ERR(i2c_clk));
+			i2c_clk = NULL;
+			goto out;
+		}
+		if (clk_prepare_enable(i2c_clk)) {
+			P("cannot enable the i2c clock — not unpausing");
+			goto out;
+		}
+		P("stage 5 attach: i2c clock enabled; about to clear PAUSE_SRC/SW_PAUSE");
+		writel(0, csram + OFFS_PAUSE_SRC);
+		cw(SW_RSV(2), cr(SW_RSV(2)) & ~SW_PAUSE);
+		writel(cr(SW_RSV(2)), csram + OFFS_SW_RSV0 + 2 * sizeof(u32));
+		P("stage 5 attach: unpause writes landed; sampling MP2");
+		for (i = 0; i < 30; i++) {
+			mdelay(10);
+			P("  +%3d ms MP2=%08x B=%08x FSM=%08x",
+			  (i + 1) * 10, readl(mp2_pwr), cr(SW_RSV(2)), cr(PCM_FSM_STA));
+		}
+		goto out;
+	}
 
 	/*
 	 * The image must live where the IM can fetch it: physically contiguous,
@@ -538,6 +652,11 @@ static int __init cspm_probe_init(void)
 	kick_pcm_to_run();
 	mdelay(20);
 	report_pcm_alive("after kick");
+	if (clear_b_assign_after_kick) {
+		cw(SW_RSV(2), cr(SW_RSV(2)) & ~SW_F_ASSIGN);
+		writel(cr(SW_RSV(2)), csram + OFFS_SW_RSV0 + 2 * sizeof(u32));
+		P("cleared B SW_F_ASSIGN while paused: SW_RSV2=0x%08x", cr(SW_RSV(2)));
+	}
 	P("MP2_CPUSYS_PWR_CON = 0x%08x (after kick, before any cluster request)",
 	  readl(mp2_pwr));
 
@@ -553,6 +672,7 @@ static int __init cspm_probe_init(void)
 	mdelay(50);
 
 	cw(SW_RSV(2), cr(SW_RSV(2)) | CLUSTER_EN);
+	writel(cr(SW_RSV(2)), csram + OFFS_SW_RSV0 + 2 * sizeof(u32));
 
 	for (i = 0; i < 20; i++) {
 		mdelay(10);
@@ -604,6 +724,7 @@ static int __init cspm_probe_init(void)
 
 	writel(0, csram + OFFS_PAUSE_SRC);
 	cw(SW_RSV(2), cr(SW_RSV(2)) & ~SW_PAUSE);
+	writel(cr(SW_RSV(2)), csram + OFFS_SW_RSV0 + 2 * sizeof(u32));
 
 	for (i = 0; i < 30; i++) {
 		mdelay(10);

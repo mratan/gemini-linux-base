@@ -77,6 +77,16 @@ case "$STAGE" in
     $SSH "$DEV" "dmesg -C; insmod /tmp/gemini-a72-psci.ko stage=$STAGE cpu_target=$CPU $EXTRA; sleep 1; dmesg"
     ;;
 *)
+    # Record the log boundary before launch. Searching the whole accumulating
+    # file can match a previous boot's CPU_ON result and disarm recovery for a
+    # call that is actually still outstanding.
+    LOG=$(ls -t "$REPO"/04-docs/captures/netconsole-*.log 2>/dev/null | head -1)
+    if [ -z "$LOG" ]; then
+        echo "== no netconsole log to watch — start the listener and re-run"
+        exit 1
+    fi
+    START_BYTES=$(wc -c < "$LOG")
+
     echo "== arming the dead-man switch: hardware reset in ${DEADMAN}s unless /tmp/a72-ok appears"
     # shellcheck disable=SC2029
     $SSH "$DEV" "cat > /tmp/a72-deadman.sh <<'EOS'
@@ -119,17 +129,17 @@ sleep 1; echo launched" || true
 
     # Watching netconsole rather than the device is the whole point: a login
     # while an SMC is outstanding is what turns one lost CPU into a lost board.
-    LOG=$(ls -t "$REPO"/04-docs/captures/netconsole-*.log 2>/dev/null | head -1)
-    if [ -z "$LOG" ]; then
-        echo "== no netconsole log to watch — start the listener and re-run"
-        exit 1
-    fi
-    echo "== watching $LOG"
+    echo "== watching $LOG from byte $START_BYTES"
     i=0
     while [ $i -lt $((DEADMAN - 40)) ]; do
-        if grep -q "CPU_ON RETURNED" "$LOG"; then
+        if tail -c +$((START_BYTES + 1)) "$LOG" | grep -q "CPU_ON RETURNED"; then
             echo "== the SMC RETURNED — no reset needed"
             exit 0
+        fi
+        if tail -c +$((START_BYTES + 1)) "$LOG" | \
+           grep -Eq "REFUSING CPU_ON|VPROC2 ENABLE FAILED|could not build the instrument|==== end ===="; then
+            echo "== module stopped before issuing CPU_ON — no SMC is outstanding"
+            exit 2
         fi
         sleep 2
         i=$((i + 2))
