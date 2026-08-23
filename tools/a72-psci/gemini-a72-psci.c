@@ -566,7 +566,9 @@ static bool cputop_power_on(void)
  * spinning on the answer. Undone afterwards, because ATF asserts on the entry
  * state of exactly these registers.
  */
-static void atf_clock_rehearsal(void)
+static void atf_core_poll_rehearsal(int cpu);
+
+static void atf_clock_rehearsal(void (*with_clock_applied)(int), int arg)
 {
 	u32 pll0, muxsel0, ckdiv0, k1_0, mon0;
 
@@ -608,6 +610,16 @@ static void atf_clock_rehearsal(void)
 	P("  MUXSEL=%08x CKDIV=%08x", readl(mcumixed + ARMPLLDIV_MUXSEL),
 	  readl(mcumixed + ARMPLLDIV_CKDIV));
 	meter_report("at ATF's decision point");
+
+	/*
+	 * Anything that has to be measured with ATF's clock configuration in
+	 * place goes HERE, not after the restore — power_on_big() runs with
+	 * whatever power_on_cl3() left behind, so measuring the core polls
+	 * against the pre-ATF mux and divider would be measuring the wrong
+	 * machine.
+	 */
+	if (with_clock_applied)
+		with_clock_applied(arg);
 
 	P("  putting it back so ATF's entry assertions hold");
 	cspm_sema_take();
@@ -1073,13 +1085,12 @@ static int __init a72psci_init(void)
 	meter_report("cluster powered, before ATF's clock steps");
 
 	if (stage == 2) {
-		atf_clock_rehearsal();
+		atf_clock_rehearsal(NULL, 0);
 		goto out;
 	}
 
 	if (stage == 5) {
-		atf_clock_rehearsal();
-		atf_core_poll_rehearsal(cpu_target);
+		atf_clock_rehearsal(atf_core_poll_rehearsal, cpu_target);
 		cspm_sema_report_and_free();
 		bus_report("stage 5");
 		P("Every unbounded poll in ATF's path has now been measured "
@@ -1099,7 +1110,7 @@ static int __init a72psci_init(void)
 	}
 
 	if (stage == 4) {
-		atf_clock_rehearsal();
+		atf_clock_rehearsal(NULL, 0);
 		P("prerequisites are in place, VPROC2 is UP and the CPUTOP domain "
 		  "is powered past both of ATF's unbounded polls.");
 		P("Now: echo 1 > /sys/devices/system/cpu/cpu%d/online", cpu_target);
