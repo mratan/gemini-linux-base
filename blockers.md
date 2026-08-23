@@ -2651,6 +2651,121 @@ currently wrong in exactly this way, and nobody has looked.
 
 ## 🟡 B-40 — the two Cortex-A72 cores never come up, and there is no cpufreq at all
 
+### 2026-08-22 (FINAL+3): the frequency gate is not a wall — it is ARMCAXPLL2, and it moves
+
+**Two of this blocker's load-bearing claims are wrong, and the one that mattered
+most was an instrument fault.**
+
+B-40 recorded, as settled: *"ATF's `CPU_ON` is unsafe by measurement: abist
+source 37 is pinned at `629992 kHz` alongside seven other sources, so it is not
+wired to the A72 clock here; 629992 satisfies neither the 742500±15000 nor the
+495000±10000 window, so `power_on_cl3` would retry forever."* That sentence is
+the only reason PSCI was ruled out and the CPUHVFS port was named as the last
+remaining route.
+
+#### Fault 1: the meter returns the previous measurement
+
+`CLK26CALI_1` (`0x10000224`) latches some time **after** the trigger bit clears,
+so a single-shot read returns the *previous* run's count. Every "source N" in
+that sweep of 32–47 was really source N−1. Measure twice and keep the second
+and the sweep is a different sweep.
+
+#### Fault 2: a passive sweep cannot tell "unwired" from "genuinely 630 MHz"
+
+The causal test can. With cluster B unpowered, move `ARMCAXPLL2`
+(MCUMIXED `0x1001a224`) and watch source 37:
+
+```
+ARMCAXPLL2 = 630 MHz   ->  src36 = 629992   src37 = 629992
+ARMCAXPLL2 = 500 MHz   ->  src36 = 499992   src37 = 499992
+ARMCAXPLL2 = 750 MHz   ->  src36 = 749988   src37 = 749988
+```
+
+**Source 37 is the A72 cluster clock. It follows ARMCAXPLL2 one for one.** It
+was never pinned; nobody had ever moved it. The other "pinned" sources are
+unconnected inputs whose counter simply never updates — which is exactly what
+made them read the same stale number as their neighbour under fault 1.
+
+`ARMCAXPLL2_CON1` reads `0xc10c1d89`, and the vendor's own `_cpu_freq_calc`
+arithmetic on it gives **629.99 MHz** — the value the meter reports, to 0.007%.
+Two independent instruments agreeing was available all along.
+
+#### With that fixed, every precondition ATF checks is satisfiable
+
+`tools/a72-psci`, stage 2, on the live machine:
+
+```
+prerequisites (vendor cpu_power_on_buck): VPROC2 1180 mV, EXT_BUCK_ISO clear
+ARMCAXPLL2 -> 750000 kHz (pcw 0x0e6c4e)
+CPUTOP power-on: CPU_PWR_STATUS bit17 SET after 0 us   (first attempt, no retry)
+                 MCUCFG 0x102222a0 bit17 SET after 0 us  (= 0x00ba0120)
+ATF's five assertions:
+  0x102224a0 = 00ff1100  want 00ff1100  ok
+  0x102224a4 = b9b13b14  want b9b13b14  ok
+  0x102224ac = 01b10100  want 01b10100  ok
+  0x102224b0 = 00af00af  want 00af00af  ok
+  0x102224b4 = 00000010  want 00000010  ok
+rehearsing ATF's clock section (PLL 3-step, MUXSEL |= 1, CKDIV = 8):
+  abist at ATF's decision point: BIG(37) = 749988 kHz
+  ATF's check on 749988: pass1[742500..757500] *** PASS ***
+```
+
+So `power_on_cl3` **can** get past its frequency loop. The route back is PSCI,
+not a CPUHVFS port.
+
+#### Three more things this run settled
+
+* **The `0x102224xx` block is dark until the cluster domain is powered.** With
+  VPROC2 up *and* `CPU_EXT_BUCK_ISO` clear it still reads all-zero, while its
+  neighbour `0x102222b0` returns real values through the same secure accessor.
+  It wakes only after `PWR_ON` + the SPMC ack. So ATF's five assertions can only
+  be evaluated where ATF evaluates them — on the far side of its two power-good
+  polls. (The handoff's "VPROC2 on **and** ISO cleared is enough" is too weak.)
+* **The SPMC ack is no longer intermittent.** At `vproc2_mv=1180` it asserted in
+  **0 µs on the first attempt**, three runs out of three, with none of ATF's
+  isolation-cycling retries needed.
+* **ATF gets exactly two attempts at the frequency check, not infinitely many.**
+  The retry path writes `0xA6800000` (~500 MHz) over `0x102224a4` — and the
+  *next* iteration's own assertion demands `0xB9B13B14` there. So iteration 3
+  asserts rather than spins. The unbounded loops in `power_on_cl3` are its two
+  power-good polls and its CSPM semaphore poll, not the frequency retry.
+
+#### The failure mode of a spinning SMC, and the instrument it needs
+
+`stage 3` fires raw PSCI `CPU_ON` from a thread pinned to cpu7, deliberately
+*not* through `cpu_up()`, so that a spin at EL3 costs one CPU instead of the
+machine. It did spin. And the machine still went unusable within ~3 minutes,
+for a reason worth recording:
+
+```
+watchdog: BUG: soft lockup - CPU#1 stuck for 48s! [sshd-auth:6605]
+Call trace:
+ smp_call_function_many_cond+0x158/0x3d0
+ kick_all_cpus_sync+0x44/0x70
+ bpf_int_jit_compile+0x1dc/0x598
+ bpf_prog_create_from_user+0x10c/0x1ac
+ do_seccomp+0x134/0xac8
+```
+
+**Every new ssh login installs a seccomp filter, which JITs, which calls
+`kick_all_cpus_sync()`, which IPIs the CPU stuck at EL3.** So "one CPU is lost
+but the machine lives" is true for about as long as it takes to try to log in —
+and logging in is exactly what you want to do next. A reader started *after*
+the hang can never run.
+
+The fix is in `tools/a72-psci`: a `kthread` bound to cpu0, started **before**
+the SMC, that dumps ATF's log ring (physical `0x7FF40000`) to the kernel log
+every 5 s. Stage 3 never returns from `module_init` when ATF spins, so the
+module is never freed and the thread keeps its code. The ring is confirmed
+readable and live — its header is
+`base=0x7ff40100 size=0x00029f00 wptr=0x7ff41a05` and it holds BL31's own boot
+narration in plain text.
+
+Recovery was the documented one and worked with no human:
+`uhubctl -l 1-10 -p 1 -a off`, hold, `-a on`.
+
+---
+
 ### 2026-08-22 (FINAL+2): the unpause is fixed, and the PCM owns MP2's sequencer
 
 **The instant death was the seeding, and it is fixed.** Writing the real
