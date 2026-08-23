@@ -5,6 +5,7 @@
 #   stage 2  + power the CPUTOP domain and rehearse ATF's clock section, so the
 #            input to ATF's frequency check can be read without ATF spinning
 #   stage 3  + raw PSCI CPU_ON to a park stub   <- can spin the issuing CPU
+#   stage 5  + rehearse power_on_big's two core polls (safe; puts the core back)
 #   stage 4  prerequisites + cluster powered, then `echo 1 > cpu8/online` by hand
 #   stage 0  restore
 #
@@ -49,7 +50,7 @@ $SSH "$DEV" "for c in /sys/devices/system/cpu/cpu[0-9]/cpufreq; do
      grep -H . /sys/devices/system/cpu/cpu0/cpufreq/scaling_{min,max,cur}_freq"
 
 case "$STAGE" in
-0|1|2)
+0|1|2|5)
     # These never call PSCI: every poll in the module is bounded, so a plain
     # foreground insmod is safe and the output comes straight back.
     # shellcheck disable=SC2029

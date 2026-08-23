@@ -591,6 +591,96 @@ static void atf_clock_rehearsal(void)
 	atf_assertions_hold();
 }
 
+/* ---- stage 5: rehearse power_on_big()'s two core polls ---------------- */
+
+/*
+ * After power_on_cl3() returns, power_on_big() does, for the core (tee.img
+ * 0x47f4..0x488c):
+ *
+ *     MP2_CPUn_PWR_CON &= ~PWR_RST_B
+ *     MP2_CPUn_PWR_CON |= PWR_ON ; udelay(2)
+ *     while (!(CPU_PWR_STATUS & BIT(15 - cpu))) ;          <- unbounded
+ *     while (!(mcucfg(0x10222430 + idx*4) & BIT(17))) ;    <- unbounded
+ *     MP2_CPUn_PWR_CON |= PWR_RST_B
+ *
+ * and nothing else: no PWR_ON_2ND, no ISO, no SRAM, no clock bits. Those two
+ * polls are the only places left where a PSCI CPU_ON can spin once the cluster
+ * is already powered, so measure them here, bounded, and put the core back.
+ *
+ * The core MUST be left powered down afterwards. power_on_big() reads
+ * MP2_CPUn_PWR_CON first and, if PWR_ON is already set, prints "The required
+ * Big core:%d was powered on" and RETURNS — never writing the boot address and
+ * never releasing reset. A pre-powered core is not a shortcut, it is a no-op.
+ */
+static void atf_core_poll_rehearsal(int cpu)
+{
+	int idx = cpu - 8;
+	void __iomem *r = spm + MP2_CPU0_PWR_CON + idx * 4;
+	u32 spmc = 0x10222430U + idx * 4;
+	bool ok1 = false, ok2 = false;
+	int i;
+
+	P("==== rehearsing power_on_big()'s two core polls for cpu%d ====", cpu);
+	P("  MP2_CPU%d_PWR_CON = %08x  core SPMC 0x%08x = %08x", idx,
+	  readl(r), spmc, sread(spmc));
+
+	writel(SPM_KEY, spm + SPM_POWERON_CONFIG_EN);
+	writel(readl(r) & ~PWR_RST_B, r);
+	writel(readl(r) | PWR_ON, r);
+	udelay(2);
+
+	for (i = 0; i < 20000; i++) {
+		if (readl(spm + CPU_PWR_STATUS) & BIT(15 - cpu)) {
+			ok1 = true;
+			break;
+		}
+		udelay(1);
+	}
+	P("  poll 1: CPU_PWR_STATUS bit%d %s after %d us (=%08x)", 15 - cpu,
+	  ok1 ? "SET" : "*** TIMEOUT — ATF WOULD SPIN HERE ***", i,
+	  readl(spm + CPU_PWR_STATUS));
+
+	for (i = 0; i < 20000; i++) {
+		if (sread(spmc) & BIT(17)) {
+			ok2 = true;
+			break;
+		}
+		udelay(1);
+	}
+	P("  poll 2: core SPMC 0x%08x bit17 %s after %d us (=%08x)", spmc,
+	  ok2 ? "SET" : "*** TIMEOUT — ATF WOULD SPIN HERE ***", i, sread(spmc));
+	P("  MP2_CPU%d_PWR_CON now %08x (a running A53 core = %08x)", idx,
+	  readl(r), readl(spm + 0x220));
+
+	P("  putting the core back down — a pre-powered core makes power_on_big "
+	  "return without releasing it");
+	writel(readl(r) & ~PWR_RST_B, r);
+	writel(readl(r) | PWR_CLK_DIS, r);
+	writel(readl(r) & ~(PWR_ON | PWR_ON_2ND), r);
+	udelay(100);
+	P("  MP2_CPU%d_PWR_CON = %08x  CPU_PWR_STATUS = %08x  SPMC = %08x", idx,
+	  readl(r), readl(spm + CPU_PWR_STATUS), sread(spmc));
+	P("  VERDICT: PSCI CPU_ON %s spin in power_on_big",
+	  (ok1 && ok2) ? "will NOT" : "*** WILL ***");
+}
+
+/* ---- the CSPM semaphore ATF also polls without a bound ---------------- */
+
+static void cspm_sema_report_and_free(void)
+{
+	u32 v;
+
+	writel(CSPM_KEY, cspm + CSPM_POWERON_CONFIG);
+	v = readl(cspm + CSPM_SEMA);
+	P("  CSPM_SEMA = %08x %s", v,
+	  (v & 1) ? "— HELD; ATF polls this without a bound, releasing it"
+		  : "— free, ATF can take it");
+	if (v & 1) {
+		writel(1, cspm + CSPM_SEMA);
+		P("  CSPM_SEMA now %08x", readl(cspm + CSPM_SEMA));
+	}
+}
+
 /* ---- ATF's own log ring, read while ATF is still inside the SMC ------- */
 
 /*
@@ -952,7 +1042,17 @@ static int __init a72psci_init(void)
 		goto out;
 	}
 
+	if (stage == 5) {
+		atf_clock_rehearsal();
+		atf_core_poll_rehearsal(cpu_target);
+		cspm_sema_report_and_free();
+		P("Every unbounded poll in ATF's path has now been measured "
+		  "bounded. Stage 3 is the real call.");
+		goto out;
+	}
+
 	if (stage == 3) {
+		cspm_sema_report_and_free();
 		if (make_mailbox_and_park()) {
 			P("could not build the instrument — refusing to fire");
 			goto out;
