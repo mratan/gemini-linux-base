@@ -37,6 +37,9 @@ EXTRA="${EXTRA:-}"
 STAGE="${1:-1}"
 CPU="${2:-8}"
 DEADMAN="${DEADMAN:-240}"
+REPO="${REPO:-$(cd ../../../.. && pwd)}"
+HUB="${HUB:-1-10}"
+HUBPORT="${HUBPORT:-1}"
 SSH="ssh -o StrictHostKeyChecking=no -o ConnectTimeout=8"
 
 scp -q -o StrictHostKeyChecking=no gemini-a72-psci.ko "$DEV":/tmp/
@@ -82,9 +85,41 @@ dmesg -C
 setsid nohup /tmp/a72-deadman.sh $DEADMAN >/tmp/deadman.log 2>&1 </dev/null &
 setsid nohup sh -c 'insmod /tmp/gemini-a72-psci.ko stage=$STAGE cpu_target=$CPU $EXTRA; touch /tmp/a72-ok' >/tmp/insmod.log 2>&1 </dev/null &
 sleep 1; echo launched" || true
-    echo "== launched. Watch netconsole. If it spins, the board resets itself"
-    echo "== in ~${DEADMAN}s — drop the hub port before then so the preloader"
-    echo "== does not park in download mode:"
-    echo "==   03-tools/uhubctl/uhubctl -l 1-10 -p 1 -a off ; sleep 90 ; ... -a on"
+    echo "== launched. Riding the recovery from here; do NOT ssh in to look."
+
+    # Watching netconsole rather than the device is the whole point: a login
+    # while an SMC is outstanding is what turns one lost CPU into a lost board.
+    LOG=$(ls -t "$REPO"/04-docs/captures/netconsole-*.log 2>/dev/null | head -1)
+    if [ -z "$LOG" ]; then
+        echo "== no netconsole log to watch — start the listener and re-run"
+        exit 1
+    fi
+    echo "== watching $LOG"
+    i=0
+    while [ $i -lt $((DEADMAN - 40)) ]; do
+        if grep -q "CPU_ON RETURNED" "$LOG"; then
+            echo "== the SMC RETURNED — no reset needed"
+            exit 0
+        fi
+        sleep 2
+        i=$((i + 2))
+    done
+
+    echo "== no return after ${i}s: ATF is spinning. Dropping the hub port so the"
+    echo "== dead-man reset does not leave the preloader parked in download mode."
+    "$REPO"/03-tools/uhubctl/uhubctl -l "$HUB" -p "$HUBPORT" -a off >/dev/null 2>&1
+    sleep 140
+    "$REPO"/03-tools/uhubctl/uhubctl -l "$HUB" -p "$HUBPORT" -a on >/dev/null 2>&1
+    echo "== port back on, waiting for the device"
+    i=0
+    while [ $i -lt 30 ]; do
+        sleep 15
+        if $SSH "$DEV" 'echo DEVICE-UP nproc=$(nproc) up=$(cut -d. -f1 /proc/uptime)' 2>/dev/null; then
+            exit 0
+        fi
+        i=$((i + 1))
+    done
+    echo "== DEVICE DID NOT RETURN — see B-40's recovery correction"
+    exit 1
     ;;
 esac
