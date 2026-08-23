@@ -679,6 +679,22 @@ static int ringwatch_fn(void *unused)
 		P("==== ring watch tick %d (cpu%d) ====", n, smp_processor_id());
 		atf_ring_dump("watch");
 		spm_report("watch");
+		/*
+		 * Non-secure reads ONLY. A secure accessor is an SMC, and
+		 * issuing one while another CPU is parked at EL3 is how the
+		 * watcher would join it. These four are enough to say which of
+		 * ATF's unbounded polls it is sitting in:
+		 *
+		 *   MP2_CPUn_PWR_CON PWR_ON set -> it is past power_on_cl3 and
+		 *                                  inside power_on_big
+		 *   MUXSEL[1:0]/CKDIV moved      -> it reached the clock steps
+		 *   CSPM_SEMA bit0 clear         -> it is stuck on the semaphore
+		 *   abist(37)                    -> what its check is reading
+		 */
+		P("  watch: MUXSEL=%08x CKDIV=%08x CSPM_SEMA=%08x abist37=%u kHz",
+		  readl(mcumixed + ARMPLLDIV_MUXSEL),
+		  readl(mcumixed + ARMPLLDIV_CKDIV),
+		  readl(cspm + CSPM_SEMA), meter(37));
 	}
 	return 0;
 }
