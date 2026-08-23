@@ -2761,8 +2761,59 @@ readable and live — its header is
 `base=0x7ff40100 size=0x00029f00 wptr=0x7ff41a05` and it holds BL31's own boot
 narration in plain text.
 
-Recovery was the documented one and worked with no human:
-`uhubctl -l 1-10 -p 1 -a off`, hold, `-a on`.
+Recovery was the documented one and it did **not** work — see the correction
+at the end of this entry.
+
+#### Every unbounded poll in ATF's path, and which are now measured
+
+All read out of `tee.img`: `power_on_cl3` at file offset `0x371c`,
+`power_on_big` at `0x46c4`. These are the only places a `CPU_ON` can hang.
+
+| # | poll | status |
+|---|---|---|
+| 1 | `CPU_PWR_STATUS` bit 17 (SPM `0x10006188`) | pre-satisfied by stage 2, acks in 0 µs |
+| 2 | MCUCFG `0x102222a0` bit 17 | pre-satisfied, 0 µs |
+| 3 | CSPM semaphore `0x11015448` bit 0 | stages 3/5 report it and free it if held |
+| 4 | the frequency retry | opened by `armpll2_khz=750000` |
+| 5 | INFRACFG `0x1000123c & 0x444 == 0` after `0x10001234 &= ~0x444` | stage 5 rehearses it |
+| 6 | CCI `0x1039000c` bit 0 after enabling snoop/DVM on slave interface 5 (`0x10396000`) | stage 5 with `rehearse_cci=1` |
+| 7 | `CPU_PWR_STATUS` bit (15−cpu), in `power_on_big` | stage 5 rehearses it |
+| 8 | core SPMC `0x10222430 + idx*4` bit 17 | stage 5 rehearses it |
+
+**5 and 6 are the leading suspects**, precisely because they sit *after* the
+gate that was shut until ARMCAXPLL2 was moved — nothing had ever reached them.
+
+Two more facts from the same reading:
+
+* **ATF's assert handler (`0xf104`) prints and then spins**: `bl 0xee88` (its
+  printf) → `bl 0x10720` → `b .`. So even a failed assertion is an unbounded
+  spin — but it *narrates itself into the log ring first*, which is what makes
+  the ring watcher worth having.
+* **ATF writes its OWN warm-boot entry to `0x10222290 + idx*8`** — `str w1,[x2]`
+  with `x1` from a BL31 global (the SRAM trampoline `0x0010103c`), **not** the
+  entry passed to `CPU_ON`. Every non-PSCI attempt in this blocker released a
+  just-reset A72 at a DRAM address with MMU and caches off and the cluster
+  outside the coherency domain. That is a much better explanation of "the core
+  executes nothing" than anything tried so far, and it means PSCI may be the
+  only route that can work.
+* **`power_on_big` bails on a pre-powered core.** It reads `MP2_CPUn_PWR_CON`
+  first and, with `PWR_ON` set, prints *"The required Big core:%d was powered
+  on"* and returns — no boot address, no reset release. Pre-powering the
+  **core** is a no-op; pre-powering the **cluster** is fine and is what removes
+  polls 1 and 2.
+
+#### Correction: `uhubctl` did NOT recover this, and the board is down
+
+The handoff's *"hangs recover with no human, reliably"* holds for a hung
+**kernel** — the RGU stops being petted and resets the board, and the port
+cycle is only there to keep the preloader from parking. It does not hold here.
+The kernel was alive on its remaining CPUs and systemd went on petting, so
+there was no reset to ride; the hub does not switch VBUS (B-27), so a port
+cycle is a data replug; and the device has a battery, so nothing the host can
+do removes its power. Ten-minute and twenty-minute holds, and eight replug
+cycles, left it enumerated on USB with carrier up and answering nothing — no
+ssh, no ping, no ARP, no netconsole, and not on the Wi-Fi LAN either. **It
+needs the power button.**
 
 ---
 
