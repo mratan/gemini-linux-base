@@ -2651,6 +2651,67 @@ currently wrong in exactly this way, and nobody has looked.
 
 ## 🟡 B-40 — the two Cortex-A72 cores never come up, and there is no cpufreq at all
 
+### 2026-08-22 (FINAL+5): the blocking poll is NAMED — and it closes the loop back to CPUHVFS
+
+**`tools/a72-psci` stage 5 works, and it identifies the exact poll ATF hangs
+on.** On a boot where everything upstream succeeds:
+
+```
+SPMC ack:            CPU_PWR_STATUS bit17 SET after 0 us   0x102222a0 00400100 -> 00ba0100
+ATF frequency check: abist(37) = 749988 kHz   pass1[742500..757500] *** PASS ***
+power_on_big polls:  bit7 SET after 0 us; core SPMC 0x10222430 bit17 SET after 0 us
+                     VERDICT: PSCI CPU_ON will NOT spin in power_on_big
+poll 5:              STA1 & 0x444  *** TIMEOUT — ATF WOULD SPIN HERE ***  (=0000f444)
+```
+
+So of ATF's eight unbounded polls, seven are satisfiable and **poll 5 is the
+wall**: `INFRACFG 0x1000123c & 0x444` never clears.
+
+#### The bits are MP2's, confirmed out of ATF itself
+
+ATF releases `0x911` (bits 0,4,8,11) for another cluster in the same register,
+and `0x444` is bits 2,6,10 — the third of three striped cluster groups. MP0's
+and MP1's bits are **absent** from `STA1` because those clusters run; MP2's are
+present. `0x444` is MP2's TOPAXI bus protection.
+
+#### It is not an edge problem, and it is not ISO/CLK
+
+Two experiments, both with a dead-man reset armed:
+
+* **Edge.** `PROTECTEN` (`0x10001234`) reads `0x00000000` while `STA1` reports
+  MP2 engaged, so ATF's `&= ~0x444` is a no-op with no transition to make —
+  the same shape as the `SRAM_PDN` edge above. Engaging `0x444` and releasing
+  it again gives it a real edge: `EN 0 -> 0x444 -> 0`, and **`STA1` stays
+  `0x0000F444` through 40 polls.** Not an edge problem.
+* **Isolation and clock.** With the domain coarsely powered, clearing
+  `PWR_ISO`, then `PWR_CLK_DIS`, then `SRAM_CKISO` by hand walks MP2 from
+  `0x00010137` to `0x00010105` — and **`STA1` does not move at any step.**
+
+#### What that leaves, and why it is the same wall as always
+
+MP2 at `0x00010105` against a running MP0 at `0x0009004d` is still missing
+`PWR_ON_2ND`, `SRAM_ISOINT_B`, and still has **`SRAM_PDN` set**. The SRAM is
+down. A cluster whose SRAM is down has an idle bus by construction, so its
+protection status has nothing to release — which is consistent with MP0/MP1's
+bits being clear precisely because those clusters are alive.
+
+So the chain is: **bus protection cannot release until MP2 is genuinely
+sequenced; MP2 is not sequenced because its SRAM never comes up; and the SRAM
+sequencing on this cluster is the SPMC's job, which is what CPUHVFS/the PCM was
+hypothesised to drive.** The SPMC acks the coarse power switch and does nothing
+further.
+
+**How to apply.** The next experiment is the combination nothing has run:
+`tools/cspm-probe` stages 1-3 (documented safe — the PCM loads, verifies and
+kicks with every cluster PAUSED, and the A53s and i2c6 are undisturbed), and
+*then* `a72-psci` stage 5. The question it answers is narrow and falsifiable:
+with the PCM running, does the SPMC complete MP2's sequence — `SRAM_PDN`
+clearing and `STA1 & 0x444` dropping — where it currently stops at the coarse
+switch? Note FINAL+2 recorded that with the PCM running the manual `PWR_ON` is
+refused, so the order matters: PCM first, then the ATF-side power-on.
+
+---
+
 ### 2026-08-22 (FINAL+4): the SPMC ack is NOT reliable at 1180 mV, and a failure latches for the whole boot
 
 **Retracting a claim I made in FINAL+3 and inherited from the handoff:**
