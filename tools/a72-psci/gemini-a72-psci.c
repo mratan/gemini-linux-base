@@ -66,13 +66,20 @@
  *
  * WHAT THIS MODULE DOES
  *
- *   stage 1  prerequisites only (the vendor's cpu_power_on_buck), then report
- *            ATF's five assertion registers and the lag-free meter. No PSCI.
- *   stage 2  + replicate ATF's clock section and print what ATF's check would
- *            see, then put it all back so ATF's asserts still hold.
+ *   stage 1  prerequisites only (the vendor's cpu_power_on_buck) and the
+ *            lag-free meter. ATF's assertion registers are NOT readable here:
+ *            the 0x102224xx block is dark until the cluster is powered.
+ *   stage 2  + power the cluster, check ATF's five assertions, replicate its
+ *            clock section and print what its check would see, then put it all
+ *            back so those assertions still hold.
+ *   stage 5  + rehearse every remaining unbounded poll in ATF's path, bounded,
+ *            and restore. `rehearse_cci=1` adds the one that can stall the
+ *            interconnect.
  *   stage 3  + raw PSCI CPU_ON to a park stub that writes a mailbox and then
  *            CPU_OFFs itself. Issued inline on a pinned CPU, so if ATF spins
- *            only that CPU is lost and the ATF log ring stays readable.
+ *            only that CPU is lost and the ATF log ring stays readable. It
+ *            REFUSES to fire unless ATF's assertions hold and the meter is
+ *            inside one of ATF's acceptance windows.
  *   stage 4  prerequisites, then leave the machine ready for a real
  *            `echo 1 > /sys/devices/system/cpu/cpu8/online`.
  *   stage 0  restore: cluster down, isolation re-asserted, VPROC2 off.
@@ -226,11 +233,15 @@ static const struct { u32 addr; u32 want; const char *what; } atf_assert[] = {
 static int stage = 1;
 module_param(stage, int, 0444);
 MODULE_PARM_DESC(stage,
-	"0 restore; 1 prerequisites+survey; 2 +ATF clock rehearsal; "
-	"3 +raw PSCI CPU_ON to a park stub; 4 prerequisites, leave armed");
+	"0 restore; 1 prerequisites + survey (no cluster power, so ATF's "
+	"assertion registers are not yet readable); 2 + cluster power and ATF's "
+	"clock rehearsal; 5 + every remaining unbounded poll rehearsed bounded; "
+	"3 + raw PSCI CPU_ON to a park stub; 4 prerequisites, leave armed for "
+	"`echo 1 > cpuN/online`");
 
 static int cpu_target = 8;
 module_param(cpu_target, int, 0444);
+MODULE_PARM_DESC(cpu_target, "8 or 9 — nothing else is an A72");
 
 static int vproc2_mv = 1180;
 module_param(vproc2_mv, int, 0444);
@@ -368,9 +379,18 @@ static bool cspm_sema_take(void)
 	return false;
 }
 
-static void cspm_sema_give(void)
+/*
+ * Only ever release a semaphore this module actually took. CSPM_SEMA is a
+ * write-1-to-toggle register, so an unconditional "give" after a failed "take"
+ * ends SOMEBODY ELSE's critical section — and the thing it protects here is
+ * ARMPLLDIV, the divider feeding the clusters this kernel is running on.
+ */
+static void cspm_sema_give(bool held)
 {
-	writel(1, cspm + CSPM_SEMA);
+	if (held)
+		writel(1, cspm + CSPM_SEMA);
+	else
+		P("  not releasing the CSPM semaphore: we never had it");
 }
 
 /* ---- prerequisites: the vendor's cpu_power_on_buck() ------------------ */
@@ -404,7 +424,14 @@ static int vproc2_set(bool on)
 	}
 	r = da9214_rmw(ad, DA9214_PAGE_CON, 0x0, 0xf, 0);
 	if (r >= 0 && on && vproc2_mv) {
-		u8 step = (vproc2_mv - 300) / 10;
+		u8 step;
+
+		if (vproc2_mv < 600 || vproc2_mv > 1180) {
+			P("  REFUSING VPROC2 = %d mV (outside 600..1180)", vproc2_mv);
+			i2c_put_adapter(ad);
+			return -EINVAL;
+		}
+		step = (vproc2_mv - 300) / 10;
 
 		P("  VPROC2 target %d mV (VBUCKB_A = 0x%02x)", vproc2_mv,
 		  step | 0x80);
@@ -567,7 +594,7 @@ static bool cputop_power_on(void)
  * state of exactly these registers.
  */
 static void atf_core_poll_rehearsal(int cpu);
-static void atf_bus_rehearsal(void);
+static u32 atf_bus_rehearsal(void);
 
 /*
  * Stage 5's whole payload, run at ATF's own decision point: the bus release and
@@ -576,13 +603,27 @@ static void atf_bus_rehearsal(void);
  */
 static void atf_tail_rehearsal(int cpu)
 {
-	atf_bus_rehearsal();
+	/*
+	 * Order matters and so does the restore point. In ATF the core polls
+	 * run with MP2's bus protection ALREADY dropped, so atf_bus_rehearsal()
+	 * leaves it dropped and hands back the saved value for the caller to
+	 * restore after the core polls. Restoring it in between — which is what
+	 * this did first — measures a machine ATF never presents, and the
+	 * verdict it prints would be worth nothing.
+	 */
+	u32 prot0 = atf_bus_rehearsal();
+
 	atf_core_poll_rehearsal(cpu);
+	P("  restoring TOPAXI_PROTECTEN %08x", prot0);
+	writel(prot0, infracfg + TOPAXI_PROTECTEN);
+	udelay(100);
+	bus_report("after the tail rehearsal");
 }
 
 static void atf_clock_rehearsal(void (*with_clock_applied)(int), int arg)
 {
 	u32 pll0, muxsel0, ckdiv0, k1_0, mon0;
+	bool held;
 
 	P("==== rehearsing ATF's power_on_cl3 clock section ====");
 	pll0 = sread(0x102224a0);
@@ -605,19 +646,19 @@ static void atf_clock_rehearsal(void (*with_clock_applied)(int), int arg)
 	P("  big PLL 0x102224a0 = %08x  PCW 0x102224a4 = %08x",
 	  sread(0x102224a0), sread(0x102224a4));
 
-	cspm_sema_take();
+	held = cspm_sema_take();
 	writel(readl(mcumixed + ARMPLLDIV_MUXSEL) | 1, mcumixed + ARMPLLDIV_MUXSEL);
 	udelay(1);
 	writel((readl(mcumixed + ARMPLLDIV_CKDIV) & ~0x1fu) | 8,
 	       mcumixed + ARMPLLDIV_CKDIV);
 	udelay(1);
-	cspm_sema_give();
+	cspm_sema_give(held);
 
-	cspm_sema_take();
+	held = cspm_sema_take();
 	writel(0, mcumixed + ARMPLLDIV_ARM_K1);
 	writel(0xffffffff, mcumixed + ARMPLLDIV_MON_EN);
 	udelay(1);
-	cspm_sema_give();
+	cspm_sema_give(held);
 
 	P("  MUXSEL=%08x CKDIV=%08x", readl(mcumixed + ARMPLLDIV_MUXSEL),
 	  readl(mcumixed + ARMPLLDIV_CKDIV));
@@ -634,12 +675,12 @@ static void atf_clock_rehearsal(void (*with_clock_applied)(int), int arg)
 		with_clock_applied(arg);
 
 	P("  putting it back so ATF's entry assertions hold");
-	cspm_sema_take();
+	held = cspm_sema_take();
 	writel(muxsel0, mcumixed + ARMPLLDIV_MUXSEL);
 	writel(ckdiv0, mcumixed + ARMPLLDIV_CKDIV);
 	writel(k1_0, mcumixed + ARMPLLDIV_ARM_K1);
 	writel(mon0, mcumixed + ARMPLLDIV_MON_EN);
-	cspm_sema_give();
+	cspm_sema_give(held);
 	swrite(0x102224a0, pll0);
 	udelay(100);
 	P("  restored: PLL=%08x MUXSEL=%08x CKDIV=%08x", sread(0x102224a0),
@@ -743,7 +784,7 @@ MODULE_PARM_DESC(rehearse_cci,
 	"also rehearse ATF's CCI snoop enable for cluster 2 (can stall the "
 	"interconnect — arm the dead-man reset first)");
 
-static void atf_bus_rehearsal(void)
+static u32 atf_bus_rehearsal(void)
 {
 	u32 prot0 = readl(infracfg + TOPAXI_PROTECTEN);
 	bool ok;
@@ -761,14 +802,10 @@ static void atf_bus_rehearsal(void)
 	P("  STA1 & 0x444 %s after %d us (=%08x)",
 	  ok ? "cleared" : "*** TIMEOUT — ATF WOULD SPIN HERE ***", i,
 	  readl(infracfg + TOPAXI_PROTECTEN_STA1));
-	P("  restoring TOPAXI_PROTECTEN %08x", prot0);
-	writel(prot0, infracfg + TOPAXI_PROTECTEN);
-	udelay(100);
-
 	if (!rehearse_cci) {
 		P("==== poll 6 (CCI snoop enable) NOT rehearsed: pass "
 		  "rehearse_cci=1 with the dead-man reset armed ====");
-		return;
+		return prot0;
 	}
 
 	P("==== rehearsing power_on_cl3's CCI snoop enable (poll 6) ====");
@@ -793,6 +830,7 @@ static void atf_bus_rehearsal(void)
 			udelay(1);
 		bus_report("after");
 	}
+	return prot0;
 }
 
 /* ---- the CSPM semaphore ATF also polls without a bound ---------------- */
@@ -843,22 +881,32 @@ static void cspm_sema_report_and_free(void)
 
 static void __iomem *atf_ring;
 static u32 atf_seen;
+/*
+ * The watcher kthread on cpu0 and the SMC thread on smc_cpu both dump the
+ * ring. Without this they interleave into one shared line buffer and both
+ * advance atf_seen, so ATF's narration arrives garbled with whole ranges
+ * dropped — at the one moment it is the only evidence there is.
+ */
+static DEFINE_SPINLOCK(atf_ring_lock);
 
 static void atf_ring_dump(const char *when)
 {
 	u32 base, size, wptr, from, i, n;
 	static char line[240];
 	unsigned int col = 0;
+	unsigned long flags;
 
 	if (!atf_ring)
 		return;
+	spin_lock_irqsave(&atf_ring_lock, flags);
 	base = readl(atf_ring + 0x00);
 	size = readl(atf_ring + 0x04);
 	wptr = readl(atf_ring + 0x08);
-	if (base != ATF_RING_PHYS + 0x100 || size > ATF_RING_MAP ||
+	if (base != ATF_RING_PHYS + 0x100 || size > ATF_RING_MAP - 0x100 ||
 	    wptr < base || wptr > base + size) {
 		P("  ATF ring header looks wrong: base=%08x size=%08x wptr=%08x",
 		  base, size, wptr);
+		spin_unlock_irqrestore(&atf_ring_lock, flags);
 		return;
 	}
 	n = wptr - base;
@@ -866,6 +914,7 @@ static void atf_ring_dump(const char *when)
 		atf_seen = n > 0x600 ? n - 0x600 : 0;	/* first dump: recent tail */
 	if (n <= atf_seen) {
 		P("  ATF ring (%s): nothing new (%u bytes total)", when, n);
+		spin_unlock_irqrestore(&atf_ring_lock, flags);
 		return;
 	}
 	from = atf_seen;
@@ -887,6 +936,7 @@ static void atf_ring_dump(const char *when)
 		P("  ATF| %s", line);
 	}
 	atf_seen = n;
+	spin_unlock_irqrestore(&atf_ring_lock, flags);
 }
 
 static struct task_struct *ringwatch;
@@ -912,10 +962,20 @@ static int ringwatch_fn(void *unused)
 		 *   CSPM_SEMA bit0 clear         -> it is stuck on the semaphore
 		 *   abist(37)                    -> what its check is reading
 		 */
-		P("  watch: MUXSEL=%08x CKDIV=%08x CSPM_SEMA=%08x abist37=%u kHz",
+		/*
+		 * NO abist measurement here. meter() WRITES CLK_DBG_CFG,
+		 * CLK_MISC_CFG_0 and CLK26CALI_0 — the same registers ATF is
+		 * using for its own frequency check inside the SMC we are
+		 * watching. A tick landing inside ATF's measurement corrupts
+		 * its reading, which costs it its single retry and then its
+		 * PCW assertion: the watcher would be causing the panic it is
+		 * there to observe. Everything below is a plain read.
+		 */
+		P("  watch: MUXSEL=%08x CKDIV=%08x CSPM_SEMA=%08x "
+		  "(no abist here — it would race ATF's own meter)",
 		  readl(mcumixed + ARMPLLDIV_MUXSEL),
 		  readl(mcumixed + ARMPLLDIV_CKDIV),
-		  readl(cspm + CSPM_SEMA), meter(37));
+		  readl(cspm + CSPM_SEMA));
 		bus_report("watch");
 	}
 	return 0;
@@ -1123,8 +1183,40 @@ static void restore(void)
 
 static int __init a72psci_init(void)
 {
+	bool assertions_ok = false;
+
 	P("==== gemini-a72-psci stage=%d cpu=%d vproc2=%d mV settle=%d ms ====",
 	  stage, cpu_target, vproc2_mv, settle_ms);
+
+	/*
+	 * Validate before anything touches a register. Every offset in this
+	 * module is computed from cpu_target as `idx = cpu - 8`, so cpu=0 would
+	 * make MP2_CPU0_PWR_CON + idx*4 land on SPM+0x220 — MP0_CPU0_PWR_CON,
+	 * a CPU this kernel is running on — and the core rehearsal would then
+	 * clear its PWR_ON. The secure window check does not catch the MCUCFG
+	 * side of that either: 0x10222430 + idx*4 slides to 0x10222410, still
+	 * inside ATF's guard.
+	 */
+	if (cpu_target != 8 && cpu_target != 9) {
+		P("cpu_target=%d is not an A72 — refusing (8 or 9 only)", cpu_target);
+		return -EINVAL;
+	}
+	if (smc_cpu <= 0 || smc_cpu >= nr_cpu_ids || !cpu_online(smc_cpu)) {
+		P("smc_cpu=%d is not a usable CPU — refusing. It must be online, "
+		  "and not cpu0: the ring watcher is bound there and would be "
+		  "lost with it.", smc_cpu);
+		return -EINVAL;
+	}
+	/*
+	 * The DA9214 codes VBUCKB_A as (mV - 300) / 10 in seven bits, so an
+	 * out-of-range value does not fail, it WRAPS: 200 mV asks for 1480 and
+	 * 1600 asks for 320. This is the A72 core rail; over-volting it is the
+	 * one thing in this repo that no watchdog undoes.
+	 */
+	if (vproc2_mv && (vproc2_mv < 600 || vproc2_mv > 1180)) {
+		P("vproc2_mv=%d is outside 600..1180 — refusing", vproc2_mv);
+		return -EINVAL;
+	}
 
 	spm = ioremap(SPM_PHYS, 0x1000);
 	mcumixed = ioremap(MCUMIXED_PHYS, 0x1000);
@@ -1166,7 +1258,8 @@ static int __init a72psci_init(void)
 	if (!cputop_power_on())
 		goto out;
 
-	if (!atf_assertions_hold())
+	assertions_ok = atf_assertions_hold();
+	if (!assertions_ok)
 		P("  NOTE: ATF would panic with the block in this state");
 
 	meter_report("cluster powered, before ATF's clock steps");
@@ -1186,6 +1279,34 @@ static int __init a72psci_init(void)
 	}
 
 	if (stage == 3) {
+		/*
+		 * Refuse to fire when the module has already proved ATF cannot
+		 * succeed. Both of these are cheap and both are irreversible if
+		 * ignored: a failed assertion is an EL3 panic, and a frequency
+		 * outside ATF's windows costs it its one retry and then the
+		 * same panic. armpll2_khz defaults to 0, so without this guard
+		 * a bare `run-psci.sh 3` fires at ~630 MHz — outside both
+		 * windows — which is exactly the run that cost 2026-08-22 its
+		 * device.
+		 */
+		unsigned int f = meter(37);
+
+		if (!assertions_ok) {
+			P("REFUSING CPU_ON: ATF's entry assertions do not hold, "
+			  "so it would panic at EL3. Fix the block state first.");
+			goto out;
+		}
+		if (!((f >= ATF_WIN1_LO && f <= ATF_WIN1_HI) ||
+		      (f >= ATF_WIN2_LO && f <= ATF_WIN2_HI))) {
+			P("REFUSING CPU_ON: abist(37) = %u kHz is outside both of "
+			  "ATF's windows [%u..%u] and [%u..%u].", f,
+			  ATF_WIN1_LO, ATF_WIN1_HI, ATF_WIN2_LO, ATF_WIN2_HI);
+			P("Pass armpll2_khz=750000 — that is the whole point of "
+			  "this tool.");
+			goto out;
+		}
+		P("gate check passed: assertions hold and abist(37) = %u kHz", f);
+
 		cspm_sema_report_and_free();
 		bus_report("before CPU_ON");
 		if (make_mailbox_and_park()) {
@@ -1204,6 +1325,28 @@ static int __init a72psci_init(void)
 	}
 
 out:
+	/*
+	 * Reached only when nothing hung — a spinning SMC never returns here at
+	 * all, and the watcher is stopped before we get this far. The MMIO
+	 * mappings are safe to drop; the coherent park page deliberately is NOT
+	 * freed, because an A72 that fetched the stub may still be executing it
+	 * (it CPU_OFFs itself, but nothing here can prove when), and handing
+	 * that memory back to the allocator would be worse than leaking it.
+	 */
+	if (spm)
+		iounmap(spm);
+	if (mcumixed)
+		iounmap(mcumixed);
+	if (topckgen)
+		iounmap(topckgen);
+	if (cspm)
+		iounmap(cspm);
+	if (infracfg)
+		iounmap(infracfg);
+	if (cci)
+		iounmap(cci);
+	if (atf_ring)
+		iounmap(atf_ring);
 	P("==== end ====");
 	return -EAGAIN;	/* never actually stay loaded */
 }

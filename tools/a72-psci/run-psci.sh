@@ -42,6 +42,16 @@ HUB="${HUB:-1-10}"
 HUBPORT="${HUBPORT:-1}"
 SSH="ssh -o StrictHostKeyChecking=no -o ConnectTimeout=8"
 
+# Rebuild first, always. B-32 and B-33 are both "the thing that ran was not the
+# thing in the tree"; a committed .ko beside an edited .c is the same trap.
+if [ -n "${SKIP_BUILD:-}" ]; then
+    echo "== SKIP_BUILD set: shipping gemini-a72-psci.ko as it stands"
+else
+    PATH="$REPO/03-tools/gcc-13.3.0-nolibc/aarch64-linux/bin:$PATH" \
+    ARCH=arm64 CROSS_COMPILE=aarch64-linux- \
+        make -s -C "$REPO/07-kernel/build-local/src" M="$PWD" modules
+fi
+
 scp -q -o StrictHostKeyChecking=no gemini-a72-psci.ko "$DEV":/tmp/
 
 # netconsole does not survive a reboot, and arming is not listening. Re-arm on
@@ -89,7 +99,21 @@ chmod +x /tmp/a72-deadman.sh
 rm -f /tmp/a72-ok
 dmesg -C
 setsid nohup /tmp/a72-deadman.sh $DEADMAN >/tmp/deadman.log 2>&1 </dev/null &
-setsid nohup sh -c 'insmod /tmp/gemini-a72-psci.ko stage=$STAGE cpu_target=$CPU $EXTRA; touch /tmp/a72-ok' >/tmp/insmod.log 2>&1 </dev/null &
+setsid nohup sh -c 'insmod /tmp/gemini-a72-psci.ko stage=$STAGE cpu_target=$CPU $EXTRA
+    # Do NOT cancel the reset the moment insmod returns. The dangerous
+    # aftermath of a CPU_ON — an interconnect stall, the seccomp-JIT IPI
+    # cascade, an A72 running where nothing expects one — develops seconds
+    # later, and a dead-man that has already been disarmed is no use at all.
+    # Prove the machine still works first.
+    i=0
+    while [ \$i -lt 20 ]; do
+        sleep 1
+        i=\$((i+1))
+    done
+    if [ -d /proc/1 ] && [ -r /proc/stat ] && ls /sys/devices/system/cpu >/dev/null 2>&1; then
+        echo a72: alive 20s after the run, cancelling the dead-man > /dev/kmsg
+        touch /tmp/a72-ok
+    fi' >/tmp/insmod.log 2>&1 </dev/null &
 sleep 1; echo launched" || true
     echo "== launched. Riding the recovery from here; do NOT ssh in to look."
 
