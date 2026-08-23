@@ -44,6 +44,12 @@ SSH="ssh -o StrictHostKeyChecking=no -o ConnectTimeout=8"
 
 scp -q -o StrictHostKeyChecking=no gemini-a72-psci.ko "$DEV":/tmp/
 
+# netconsole does not survive a reboot, and arming is not listening. Re-arm on
+# every run; the listener has to be started separately and BEFORE this, because
+# a run that wedges the box takes its own output with it.
+"$REPO"/scripts/gemini-netconsole.sh arm >/dev/null 2>&1 || \
+    echo "== WARNING could not re-arm netconsole"
+
 # shellcheck disable=SC2029
 $SSH "$DEV" "for c in /sys/devices/system/cpu/cpu[0-9]/cpufreq; do
         [ -d \$c ] || continue
