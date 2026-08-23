@@ -2651,6 +2651,45 @@ currently wrong in exactly this way, and nobody has looked.
 
 ## 🟡 B-40 — the two Cortex-A72 cores never come up, and there is no cpufreq at all
 
+### 2026-08-22 (FINAL+7): the unpause is reproducible, and the clock is the whole fight
+
+**`cspm-probe` stage 4 survived, with seeds taken from the live rails** —
+`v_ll=v_l=v_cci=0x4d` (BUCKA read `0x4d`; the CSPM `v` encoding is the DA9214
+register code verbatim, which is worth knowing) and `v_b=0x58` with VPROC2 up
+at 1180 mV. Cluster B unpaused, `SW_RSV2 = 0x50f0`, `FSM_STA` cycling
+`0x648640 / 0x649241 / 0x648628`, and the machine lived. Second time ever, and
+the first that was reproducible from a written-down recipe rather than luck.
+
+**But unpausing moves the clock the wrong way.** With cluster B unpaused the PCM
+takes its divider — `CKDIV` went `0x00` to `0x12` — and abist source 37 reads
+**15588 kHz**, down from 26000. That is `f_b=15` doing exactly what it was asked:
+the lowest of the sixteen OPPs. ATF wants 742500+-15000 or 495000+-10000.
+
+So cluster B's clock has three owners and none of them gives ATF what it wants:
+
+| state | src 37 | why |
+|---|---|---|
+| cluster unpowered, no PCM | 629992 | ARMCAXPLL2 passes through |
+| after prerequisites, no PCM | 26000 | gated |
+| cluster powered by us, ATF's clock steps, no PCM | **749988** | ATF's PLL + mux, uncontested |
+| PCM running, cluster B paused | 26000 | co-processor parks it |
+| PCM running, cluster B unpaused, `f_b=15` | 15588 | co-processor drives lowest OPP |
+
+**The one configuration that produces ATF's number is the one where the PCM is
+not running** — and that is the configuration where `STA1 & 0x444` never
+releases. That is the shape of the remaining problem, stated plainly for the
+first time.
+
+**Next, and it is a single-variable test:** seed `f_b` to the OPP nearest
+750 MHz instead of 15, unpause, and read source 37. If the PCM will park cluster
+B in ATF's window, the two requirements stop being mutually exclusive. Raising
+`f_b` makes the co-processor drive VPROC2 upward on a rail that supplies only
+the A72s and whose vendor ceiling is 1.18 V — where it already sits — so the
+over-volt risk is bounded, but it drives i2c6 to do it, so cpufreq stays pinned
+and the dead-man stays armed.
+
+---
+
 ### 2026-08-22 (FINAL+6): ATF narrates itself at last, and the PCM *does* release MP2's bus protection
 
 **The ring watcher works.** A kthread on cpu0, started before the SMC, dumping
@@ -2689,10 +2728,25 @@ tick 4:  STA1 = 0000f400      <- bit 2 released too
 ```
 
 **Two of MP2's three protection bits released, with ATF still stuck upstream in
-the frequency loop and nowhere near its own bus-release step.** Nothing else was
-driving them. That is the PCM doing what the SPMC alone never does, and it is
-the first direct evidence that CPUHVFS is load-bearing for this cluster rather
-than a notification after the fact.
+the frequency loop and nowhere near its own bus-release step.**
+
+**Corrected the same day, before this hardened into a fact.** The sentence that
+first stood here — "nothing else was driving them" — was wrong. ATF was
+*not* idle during that window: its retry loop asserts `PWR_ON`, polls, drives
+the clock, measures, then unwinds by dropping `PWR_ON` and cycling
+`B_EXT_BUCK_ISO`, several times a second. The domain was being power-cycled
+throughout, and `MP2` read `0x00010127`/`0x00010123` at the ticks either side.
+
+The control run settles it: PCM running **and** cluster B unpaused
+(`SW_RSV2 = 0x50f0`, FSM cycling), but with no ATF activity and the cluster
+unpowered at `MP2 = 0x00010133`, **`STA1` stays `0x0000F444`** — all three bits.
+
+So the release needs the cluster to be *powered*, not merely the PCM to be
+running. What is still true, and still worth something, is that FINAL+5 had the
+cluster powered by us with no PCM and `STA1` was immovable, whereas with the PCM
+running and ATF cycling the domain it went `f444 -> f404 -> f400`. The PCM is
+implicated, but "the PCM releases the bus protection" is more than the evidence
+supports.
 
 #### The ring also holds the working reference sequence
 
