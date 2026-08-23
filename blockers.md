@@ -2651,6 +2651,84 @@ currently wrong in exactly this way, and nobody has looked.
 
 ## 🟡 B-40 — the two Cortex-A72 cores never come up, and there is no cpufreq at all
 
+### 2026-08-22 (FINAL+6): ATF narrates itself at last, and the PCM *does* release MP2's bus protection
+
+**The ring watcher works.** A kthread on cpu0, started before the SMC, dumping
+physical `0x7FF40000` to netconsole every 5 s. For the first time this firmware
+has told us what it is doing while it does it:
+
+```
+ATF| [ATF](7)[392.043432]big armpll = 26000 Khz, retry = 5942.
+ATF| [ATF](7)[409.626879]big armpll = 26000 Khz, retry = 30581.
+```
+
+#### Two corrections to FINAL+3, both from ATF's own mouth
+
+* **The frequency retry is UNBOUNDED.** FINAL+3 stated, from the disassembly,
+  that "ATF gets exactly two attempts before its own assertion rejects the
+  retry PCW". It reached **retry 30581** and was still climbing. Whatever I
+  read into the assert ordering at `0x3858` vs `0x3974`, it does not stop the
+  loop. Treat `power_on_cl3`'s frequency retry as infinite.
+* **ATF measures 26000 kHz, not 749988.** The stage-2 rehearsal that read
+  749988 ran with the PCM **not** running. With the PCM running and cluster B
+  `CLUSTER_EN` set but `SW_PAUSE`d, the co-processor parks cluster B's clock at
+  26 MHz, and ATF can never satisfy either window. Measured alongside:
+  `MP2 = 0x00010123` (so `PWR_CLK_DIS` is **clear** — not a gating problem),
+  `MUXSEL = 0x54/0x55`, `CKDIV = 8`. The frequency is the PCM's to give.
+
+#### And the finding that matters: the PCM releases MP2's bus protection
+
+FINAL+5 left poll 5 as the wall, with `STA1 & 0x444` immovable — unaffected by
+an EN edge and unaffected by clearing `PWR_ISO`/`PWR_CLK_DIS`/`SRAM_CKISO`. With
+the PCM running, the watcher caught it moving on its own:
+
+```
+tick 2:  STA1 = 0000f444
+tick 2:  STA1 = 0000f404      <- bit 6 released
+tick 4:  STA1 = 0000f400      <- bit 2 released too
+```
+
+**Two of MP2's three protection bits released, with ATF still stuck upstream in
+the frequency loop and nowhere near its own bus-release step.** Nothing else was
+driving them. That is the PCM doing what the SPMC alone never does, and it is
+the first direct evidence that CPUHVFS is load-bearing for this cluster rather
+than a notification after the fact.
+
+#### The ring also holds the working reference sequence
+
+The same dump contains BL31's boot-time narration of the A53 core power-ons —
+the path that succeeds:
+
+```
+... power on CPU5 ...
+MEM_PWR_ACK=1
+Delay for PWR_ACK / PWR_ACK_2nd / memory power ready
+little_spark2_setldo sparkvretcntrl=3f
+Little power on:0x1F   then   Little power on:0x3F
+mt_on_1, entry 10103c
+plat_affinst_on_finish: enable_scu()
+plat_affinst_on_finish: plat_cci_enable()
+```
+
+`MEM_PWR_ACK` and "Delay for memory power ready" are exactly the memory-power
+step MP2 never completes. This is a reference trace for the working case and it
+is worth mining before anything else is guessed at.
+
+#### Next
+
+Unpause cluster B — `cspm-probe stage 4` with seeds taken from the live rails
+(`v_*` is the DA9214 register code verbatim: BUCKA read `0x4a`, so
+`v_ll=v_l=v_cci=0x4a`) — so the PCM gives cluster B a real frequency, and only
+then `a72-psci stage 3 skip_cputop=1`. If 26 MHz becomes ~750 MHz, ATF leaves
+the retry loop and arrives at a bus-release that is already two thirds done.
+
+**Lab:** the run was left to the dead-man rather than rescued by hand, on
+purpose. The fix was one register write away, but reaching it needs an ssh
+login, and a login while an SMC is outstanding is what cost the device earlier
+today. The intervention belongs in the watcher kthread, not in a shell.
+
+---
+
 ### 2026-08-22 (FINAL+5): the blocking poll is NAMED — and it closes the loop back to CPUHVFS
 
 **`tools/a72-psci` stage 5 works, and it identifies the exact poll ATF hangs

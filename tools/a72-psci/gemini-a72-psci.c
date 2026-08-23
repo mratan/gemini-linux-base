@@ -794,6 +794,28 @@ static void atf_core_poll_rehearsal(int cpu)
  * interconnect for every other master on it — which is a whole-SoC hang, not a
  * lost CPU. Run it only with the dead-man reset armed.
  */
+/*
+ * Android's actual arrangement, and the one combination nothing has run: the
+ * PCM running with cluster B enabled and paused (tools/cspm-probe stage 3),
+ * then PSCI CPU_ON, with ATF doing the whole power-on itself.
+ *
+ * Our own cputop_power_on() must be skipped for that. B-40 FINAL+2 measured
+ * that once the PCM runs it owns the SPMC and a manual PWR_ON is refused
+ * outright — 0x102222a0 reads 0x04200120 from the first attempt and bit 17
+ * never comes — so pre-satisfying ATF's polls is not available here, and ATF's
+ * two unbounded power-good polls are live again. That is what the ring watcher
+ * and the runner's dead-man reset are for.
+ *
+ * It also means ATF's five assertions cannot be checked first: the 0x102224xx
+ * block is dark until the cluster is powered, and now nothing powers it before
+ * the SMC. The ARMCAXPLL2 gate still applies and is still checked.
+ */
+static int skip_cputop;
+module_param(skip_cputop, int, 0444);
+MODULE_PARM_DESC(skip_cputop,
+	"do not power the CPUTOP ourselves; let ATF do it inside CPU_ON. "
+	"Required when the PCM is running, because it owns the SPMC.");
+
 static int rehearse_cci;
 module_param(rehearse_cci, int, 0444);
 MODULE_PARM_DESC(rehearse_cci,
@@ -1271,10 +1293,18 @@ static int __init a72psci_init(void)
 	if (stage < 2)
 		goto out;
 
-	if (!cputop_power_on())
+	if (skip_cputop) {
+		P("==== skip_cputop: leaving the CPUTOP for ATF ====");
+		P("  MP2=%08x CPU_PWR_STATUS=%08x — ATF's two power-good polls are"
+		  " LIVE this run", readl(spm + MP2_CPUSYS_PWR_CON),
+		  readl(spm + CPU_PWR_STATUS));
+		P("  0x102224a0 = %08x (dark until powered; assertions unreadable)",
+		  sread(0x102224a0));
+	} else if (!cputop_power_on()) {
 		goto out;
+	}
 
-	assertions_ok = atf_assertions_hold();
+	assertions_ok = skip_cputop ? true : atf_assertions_hold();
 	if (!assertions_ok)
 		P("  NOTE: ATF would panic with the block in this state");
 
@@ -1324,6 +1354,9 @@ static int __init a72psci_init(void)
 			  "so it would panic at EL3. Fix the block state first.");
 			goto out;
 		}
+		if (skip_cputop)
+			P("  (assertions not checked: skip_cputop leaves the block "
+			  "dark until ATF powers it)");
 		if (!((f >= ATF_WIN1_LO && f <= ATF_WIN1_HI) ||
 		      (f >= ATF_WIN2_LO && f <= ATF_WIN2_HI))) {
 			P("REFUSING CPU_ON: ARMCAXPLL2 = %u kHz is outside both "
