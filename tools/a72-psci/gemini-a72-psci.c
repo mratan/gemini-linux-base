@@ -507,6 +507,22 @@ static int prerequisites(void)
 	P("step 5: BigiDVFSSRAMLDOSet(110000) -> %ld, 0x102222b0 %08x -> %08x",
 	  (long)res.a0, before, after);
 
+	/*
+	 * The SPMC's own state BEFORE anything asserts PWR_ON. Recorded because
+	 * the ack is not reliable across boots: 0x102222a0 has been seen to
+	 * latch at 0x042001xx (2026-08-22 early) and at 0x0e500100 (late), and
+	 * neither clears through ATF's isolation-cycling retry. Reading it at
+	 * rest is what separates "the SoC came up in a bad state" from "our
+	 * power-on put it there" — and nothing had ever read it at rest.
+	 */
+	P("step 6: SPMC at rest, before any PWR_ON");
+	P("  0x102222a0 = %08x   (ATF polls bit17 here; good boots show 0x004001xx)",
+	  sread(0x102222a0));
+	P("  0x102222b0 = %08x  0x102222b4 = %08x  0x102224a0 = %08x",
+	  sread(0x102222b0), sread(0x102222b4), sread(0x102224a0));
+	P("  0x10222430 = %08x  0x10222434 = %08x  0x10222700 = %08x",
+	  sread(0x10222430), sread(0x10222434), sread(0x10222700));
+
 	spm_report("after prerequisites");
 	return 0;
 }

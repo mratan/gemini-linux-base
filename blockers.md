@@ -2651,6 +2651,50 @@ currently wrong in exactly this way, and nobody has looked.
 
 ## 🟡 B-40 — the two Cortex-A72 cores never come up, and there is no cpufreq at all
 
+### 2026-08-22 (FINAL+4): the SPMC ack is NOT reliable at 1180 mV, and a failure latches for the whole boot
+
+**Retracting a claim I made in FINAL+3 and inherited from the handoff:**
+*"The SPMC ack is no longer intermittent. At `vproc2_mv=1180` it asserted in
+0 us on the first attempt, every run."* That was three runs inside **one boot**.
+On the next boot, with VPROC2 verified at 1180 mV by reading the chip
+(`i2cget -f -y 2 0x68 0xd9` = `0xd8`, and `BUCKB_CONT` = `0x01`), the ack never
+came:
+
+```
+attempt 1..8: CPU_PWR_STATUS bit17 TIMEOUT after 20000 us
+              MP2=00010137  MCUCFG 0x102222a0=0e500100
+the SPMC never acked
+```
+
+Eight attempts, each with ATF's own escape between them (drop `PWR_ON`, wait
+for the domain down, cycle `B_EXT_BUCK_ISO` 100 us / 240 us). A second module
+load, three minutes later, with the rail still up, reproduced it exactly.
+
+**So the ack is a per-boot property, and a failure latches.** B-40 recorded the
+latched value as `0x042001xx`; this is a third family, `0x0e500100`, with bit 17
+clear and the whole `0x102224xx` PLL/iDVFS sub-block reading `0x00000000`. Two
+different latched states now, neither clearable without a reboot — so **there is
+exactly one attempt per boot**, and any experiment that costs an attempt has to
+be worth a reboot.
+
+**What differed between the boot that acked and the one that did not** is not
+the voltage. The successful boot never did prerequisites-and-power-on in one
+module load; it ran prerequisites alone (stage 1), left the rail up, and powered
+on **2.5 minutes later** from a second load. The failing boot collapsed that into
+one load with a 45 s settle. Two other things moved with it and are not yet
+separated: CONSYS/Wi-Fi came up *during* the failing run's settle window
+(`gemini-net-up` fires its func-on at ~120 s uptime), and BUCKA sat at 1040 mV
+rather than the 1100 mV of the successful boot.
+
+**How to apply.** Do not spend an attempt on a machine that is still booting.
+Wait for `uptime >= 240 s` so the CONSYS bring-up is finished, then run the
+prerequisites and the power-on as two separate loads with a gap. And read
+`0x102222a0` *at rest*, before any `PWR_ON` — `a72-psci` step 6 does this now,
+and nothing had ever recorded it, so "the SoC came up in a bad state" has never
+been distinguished from "our power-on put it there".
+
+---
+
 ### 2026-08-22 (FINAL+3): the frequency gate is not a wall — it is ARMCAXPLL2, and it moves
 
 **Two of this blocker's load-bearing claims are wrong, and the one that mattered
