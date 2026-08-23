@@ -1322,6 +1322,14 @@ static int __init a72psci_init(void)
 		P("prerequisites are in place, VPROC2 is UP and the CPUTOP domain "
 		  "is powered past both of ATF's unbounded polls.");
 		P("Now: echo 1 > /sys/devices/system/cpu/cpu%d/online", cpu_target);
+		/*
+		 * cpu_up() takes the hotplug locks and IPIs everybody. If ATF
+		 * spins inside it, the whole machine goes, not one CPU — which
+		 * is why stage 3 exists and why it fires a bare SMC instead.
+		 */
+		P("DO NOT do that until stage 3 has shown CPU_ON RETURNING. "
+		  "cpu_up() holds the hotplug locks and IPIs every CPU, so a "
+		  "spin inside it costs the machine, not one core.");
 	}
 
 out:
