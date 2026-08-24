@@ -114,7 +114,7 @@ diff --git a/drivers/regulator/mt6351-regulator.c b/drivers/regulator/mt6351-reg
  enum {
  	MT6351_ID_vcn18,
  	MT6351_ID_vcn28,
-@@ -78,10 +135,41 @@
+@@ -78,10 +135,52 @@
  	MT6351_ID_vcn33_wifi,
  	MT6351_ID_vmch,
  	MT6351_ID_vmc,
@@ -134,29 +134,40 @@ diff --git a/drivers/regulator/mt6351-regulator.c b/drivers/regulator/mt6351-reg
 + *   vcamd  -> mt6351_VCAMD_voltages
 + *   vcamio -> mt6351_VCAM_IO_voltages
 + *
-+ * VCAMA's table has four entries against a three-bit VOSEL field; codes 4..7
-+ * are not described by the vendor and are therefore not offered. The camera
-+ * power sequence only ever asks for the values the sensors want (AVDD 2.8 V,
-+ * DVDD 1.2 V, DOVDD 1.8 V — vendor kd_camera_hw.c PowerOnList), each of which
-+ * is present here.
++ * All three VOSEL fields are three bits wide, and the vendor describes fewer
++ * than eight codes for each. The undescribed codes are entered as 0, which
++ * regulator_list_voltage_table() reports as "unknown" — NOT left off the end
++ * of the table.
++ *
++ * That matters more than it looks. These rails are constrained min == max in
++ * DT, which sets apply_uV, so machine_constraints_voltage() reads the live
++ * VOSEL at registration. A short table makes an out-of-range selector return
++ * -EINVAL, machine_constraints_voltage() propagates it, devm_regulator_register()
++ * fails, and mt6351_regulator_probe() returns the error for the WHOLE driver —
++ * so a bootloader that happened to leave a camera rail on an undescribed code
++ * would take out vcn18/vcn28/vcn33_wifi and vmch/vmc with it, i.e. internal
++ * Wi-Fi (ADR-0001) and the SD card would die because of a camera rail. A
++ * padded table reads back 0 uV instead, and the constraint is then applied
++ * normally. The zeros are never selectable: regulator_map_voltage_iterate()
++ * only picks an entry inside [min_uV, max_uV], and no rail here allows 0.
 + */
 +static const unsigned int mt6351_vcama_voltages[] = {
-+	1500000, 1800000, 2500000, 2800000,
++	1500000, 1800000, 2500000, 2800000, 0, 0, 0, 0,
 +};
 +
 +static const unsigned int mt6351_vcamd_voltages[] = {
-+	900000, 950000, 1000000, 1050000, 1100000, 1200000, 1210000,
++	900000, 950000, 1000000, 1050000, 1100000, 1200000, 1210000, 0,
 +};
 +
 +static const unsigned int mt6351_vcamio_voltages[] = {
-+	900000, 950000, 1000000, 1050000, 1200000, 1500000, 1800000,
++	900000, 950000, 1000000, 1050000, 1200000, 1500000, 1800000, 0,
 +};
 +
 +/*
   * Per-rail one-time hardware setup, applied lazily on first enable()
   * rather than unconditionally in probe() — probe runs on every boot
   * regardless of whether anything actually uses these rails yet, and an
-@@ -139,6 +227,22 @@
+@@ -139,6 +238,22 @@
  	.is_enabled = regulator_is_enabled_regmap,
  };
  
@@ -179,7 +190,7 @@ diff --git a/drivers/regulator/mt6351-regulator.c b/drivers/regulator/mt6351-reg
  static struct mt6351_regulator_info mt6351_regulators[] = {
  	MT6351_LDO_FIXED(vcn18, 1800000, MT6351_LDO_VCN18_CON0),
  	MT6351_LDO_FIXED(vcn28, 2800000, MT6351_LDO_VCN28_CON0),
-@@ -146,6 +250,14 @@
+@@ -146,6 +261,14 @@
  	MT6351_LDO_FIXED(vcn33_wifi, 3300000, MT6351_LDO_VCN33_CON4),
  	MT6351_LDO_FIXED(vmch, 3000000, MT6351_LDO_VMCH_CON0),
  	MT6351_LDO_FIXED(vmc, 3000000, MT6351_LDO_VMC_CON0),
@@ -194,7 +205,7 @@ diff --git a/drivers/regulator/mt6351-regulator.c b/drivers/regulator/mt6351-reg
  };
  
  static int mt6351_regulator_probe(struct platform_device *pdev)
-@@ -153,7 +265,7 @@
+@@ -153,7 +276,7 @@
  	struct regmap *regmap = dev_get_regmap(pdev->dev.parent, NULL);
  	struct regulator_config config = {};
  	struct regulator_dev *rdev;
@@ -203,7 +214,7 @@ diff --git a/drivers/regulator/mt6351-regulator.c b/drivers/regulator/mt6351-reg
  
  	if (!regmap) {
  		dev_err(&pdev->dev, "no pwrap regmap on parent device\n");
-@@ -179,7 +291,8 @@
+@@ -179,7 +302,8 @@
  		}
  	}
  
@@ -213,7 +224,7 @@ diff --git a/drivers/regulator/mt6351-regulator.c b/drivers/regulator/mt6351-reg
  	return 0;
  }
  
-@@ -199,5 +312,5 @@
+@@ -199,5 +323,5 @@
  module_platform_driver(mt6351_regulator_driver);
  
  MODULE_AUTHOR("Gemini PDA Linux port");

@@ -522,7 +522,7 @@ static int __init cspm_probe_init(void)
 		P("REFUSING invalid voltage seed");
 		return -EINVAL;
 	}
-	if (stage >= 2 && stage <= 4 &&
+	if (((stage >= 2 && stage <= 4) || stage == 6 || stage == 7) &&
 	    (freq_ll_khz <= 0 || freq_ll_khz > 3000000 ||
 	     freq_l_khz <= 0 || freq_l_khz > 3000000 ||
 	     freq_b_khz <= 0 || freq_b_khz > 3000000 ||
@@ -659,6 +659,134 @@ static int __init cspm_probe_init(void)
 	}
 	P("MP2_CPUSYS_PWR_CON = 0x%08x (after kick, before any cluster request)",
 	  readl(mp2_pwr));
+
+	if (stage == 6) {
+		struct device_node *np = of_find_node_by_path("/i2c@1100e000");
+		u32 ll, l, b;
+
+		P("stage 6: Android-like global CPUHVFS state — LL/L active, B requested+paused");
+		if (!np) {
+			P("cannot find APPM i2c clock");
+			goto out;
+		}
+		i2c_clk = of_clk_get_by_name(np, "main");
+		of_node_put(np);
+		if (IS_ERR(i2c_clk) || clk_prepare_enable(i2c_clk)) {
+			P("cannot enable APPM i2c clock");
+			goto out;
+		}
+
+		ll = (cr(SW_RSV(0)) | CLUSTER_EN) & ~(SW_PAUSE | SW_F_ASSIGN);
+		l  = (cr(SW_RSV(1)) | CLUSTER_EN) & ~(SW_PAUSE | SW_F_ASSIGN);
+		b  = (cr(SW_RSV(2)) | CLUSTER_EN | SW_PAUSE) & ~SW_F_ASSIGN;
+		cw(SW_RSV(0), ll); writel(ll, csram + OFFS_SW_RSV0 + 0 * 4);
+		cw(SW_RSV(1), l);  writel(l,  csram + OFFS_SW_RSV0 + 1 * 4);
+		cw(SW_RSV(2), b);  writel(b,  csram + OFFS_SW_RSV0 + 2 * 4);
+		writel(0, csram + OFFS_PAUSE_SRC);
+		for (i = 0; i < 30; i++) {
+			mdelay(10);
+			P("  +%d ms LL=%08x L=%08x B=%08x HW=%08x/%08x/%08x FSM=%08x",
+			  (i + 1) * 10, cr(SW_RSV(0)), cr(SW_RSV(1)), cr(SW_RSV(2)),
+			  cr(SW_RSV(3)), cr(SW_RSV(4)), cr(SW_RSV(5)), cr(PCM_FSM_STA));
+		}
+		P("stage 6 complete: LL/L active; B CLUSTER_EN but paused; MP2=%08x",
+		  readl(mp2_pwr));
+		goto out;
+	}
+
+	if (stage == 7) {
+		/*
+		 * The vendor's real cluster-off handshake, from
+		 * mt_cpufreq_hybrid.c:cspm_cluster_notify_off() (3.18, mt6797):
+		 *
+		 *	cspm_write(swctrl, swctrl & ~(CLUSTER_EN|SW_PAUSE|SW_F_ASSIGN));
+		 *	// FW will set SW_PAUSE when done
+		 *	wait_complete_us(cspm_is_paused(swctrl), 10, DVFS_TIMEOUT);
+		 *
+		 * Every previous run reached B's pre-PSCI "paused" state by
+		 * *writing* SW_PAUSE. That is not the same state: the bit is
+		 * supposed to be set by the co-processor as the completion
+		 * report of its own cluster-off sequence. Android's dmesg shows
+		 * `cluster2 off` running before the first CPU8 boot, so the
+		 * firmware has always run this handshake before ATF is asked to
+		 * power MP2 — and we have never let it.
+		 *
+		 * notify_off's precondition is CLUSTER_EN set, so B is first put
+		 * in the live state (which is survivable while MP2 is unpowered)
+		 * and only then handed back.
+		 */
+		struct device_node *np = of_find_node_by_path("/i2c@1100e000");
+		u32 ll, l, b;
+		int fw_paused = -1;
+
+		P("stage 7: vendor cluster-off handshake — let the FIRMWARE set SW_PAUSE");
+		if (!np) {
+			P("cannot find APPM i2c clock");
+			goto out;
+		}
+		i2c_clk = of_clk_get_by_name(np, "main");
+		of_node_put(np);
+		if (IS_ERR(i2c_clk) || clk_prepare_enable(i2c_clk)) {
+			P("cannot enable APPM i2c clock");
+			i2c_clk = NULL;
+			goto out;
+		}
+
+		/* Android's global state: LL and L live, PAUSE_SRC == 0. */
+		ll = (cr(SW_RSV(0)) | CLUSTER_EN) & ~(SW_PAUSE | SW_F_ASSIGN);
+		l  = (cr(SW_RSV(1)) | CLUSTER_EN) & ~(SW_PAUSE | SW_F_ASSIGN);
+		cw(SW_RSV(0), ll); writel(ll, csram + OFFS_SW_RSV0 + 0 * 4);
+		cw(SW_RSV(1), l);  writel(l,  csram + OFFS_SW_RSV0 + 1 * 4);
+		writel(0, csram + OFFS_PAUSE_SRC);
+		mdelay(20);
+		P("  LL/L live: LL=%08x L=%08x FSM=%08x", cr(SW_RSV(0)), cr(SW_RSV(1)),
+		  cr(PCM_FSM_STA));
+
+		/* notify_on(B): its precondition is SW_PAUSE set at entry. */
+		b = (cr(SW_RSV(2)) | CLUSTER_EN) & ~SW_PAUSE;
+		cw(SW_RSV(2), b); writel(b, csram + OFFS_SW_RSV0 + 2 * 4);
+		P("  notify_on(B): SW_RSV2=%08x (CLUSTER_EN set, SW_PAUSE cleared)", cr(SW_RSV(2)));
+		for (i = 0; i < 10; i++) {
+			mdelay(10);
+			P("   +%2d ms B=%08x HWSTA_B=%08x MP2=%08x", (i + 1) * 10,
+			  cr(SW_RSV(2)), cr(SW_RSV(5)), readl(mp2_pwr));
+		}
+
+		/* notify_off(B): the handshake itself. */
+		if (!(cr(SW_RSV(2)) & CLUSTER_EN)) {
+			P("  REFUSING notify_off: CLUSTER_EN is not set (vendor WARN_ON)");
+			goto out;
+		}
+		b = cr(SW_RSV(2)) & ~(CLUSTER_EN | SW_PAUSE | SW_F_ASSIGN);
+		cw(SW_RSV(2), b); writel(b, csram + OFFS_SW_RSV0 + 2 * 4);
+		P("  notify_off(B): wrote SW_RSV2=%08x — now waiting for the FIRMWARE", b);
+
+		/* vendor DVFS_TIMEOUT is 10 ms in 10 us steps; give it 40 ms. */
+		for (i = 0; i < 4000; i++) {
+			if (cr(SW_RSV(2)) & SW_PAUSE) {
+				fw_paused = i * 10;
+				break;
+			}
+			udelay(10);
+		}
+		writel(cr(SW_RSV(2)), csram + OFFS_SW_RSV0 + 2 * 4);
+
+		if (fw_paused >= 0)
+			P("  *** FIRMWARE SET SW_PAUSE after %d us: SW_RSV2=%08x ***",
+			  fw_paused, cr(SW_RSV(2)));
+		else
+			P("  firmware did NOT set SW_PAUSE within 40 ms: SW_RSV2=%08x",
+			  cr(SW_RSV(2)));
+
+		for (i = 0; i < 10; i++) {
+			mdelay(10);
+			P("   +%2d ms B=%08x HWSTA_B=%08x MP2=%08x FSM=%08x", (i + 1) * 10,
+			  cr(SW_RSV(2)), cr(SW_RSV(5)), readl(mp2_pwr), cr(PCM_FSM_STA));
+		}
+		P("stage 7 complete: B=%08x (Android's pre-CPU_ON value is 0x26f0), MP2=%08x",
+		  cr(SW_RSV(2)), readl(mp2_pwr));
+		goto out;
+	}
 
 	if (stage < 3) {
 		P("stage 2 only — PCM running, all clusters paused, no cluster requested.");

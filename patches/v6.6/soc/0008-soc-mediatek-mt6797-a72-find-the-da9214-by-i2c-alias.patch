@@ -21,7 +21,7 @@ diff --git a/drivers/soc/mediatek/mt6797-a72.c b/drivers/soc/mediatek/mt6797-a72
  #define DA9214_ADDR		0x68
  #define DA9214_PAGE_CON		0x00
  #define DA9214_BUCKB_CONT	0x5e
-@@ -199,10 +210,20 @@
+@@ -199,10 +210,28 @@
   */
  static int mt6797_a72_enable_vproc2(void)
  {
@@ -38,7 +38,15 @@ diff --git a/drivers/soc/mediatek/mt6797-a72.c b/drivers/soc/mediatek/mt6797-a72
 +		return -ENODEV;
 +	}
 +
-+	ad = of_find_i2c_adapter_by_node(np);
++	/*
++	 * of_get_, not of_find_: the _get_ variant takes a reference on the
++	 * adapter's module as well as on its device, which is the pairing
++	 * i2c_put_adapter() below undoes. of_find_ takes only the device
++	 * reference, so pairing it with i2c_put_adapter() underflows
++	 * i2c-mt65xx's module refcount (silent today only because that driver
++	 * is built in and its ->owner is NULL).
++	 */
++	ad = of_get_i2c_adapter_by_node(np);
 +	of_node_put(np);
  	if (!ad) {
  		pr_err("i2c6 adapter not available; cannot enable VPROC2\n");

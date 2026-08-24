@@ -2,7 +2,7 @@ diff --git a/Documentation/devicetree/bindings/misc/planet,gemini-camera-power.y
 new file mode 100644
 --- /dev/null
 +++ b/Documentation/devicetree/bindings/misc/planet,gemini-camera-power.yaml
-@@ -0,0 +1,122 @@
+@@ -0,0 +1,129 @@
 +# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
 +%YAML 1.2
 +---
@@ -37,6 +37,8 @@ new file mode 100644
 +
 +  clocks:
 +    items:
++      - description: mmsys SMI common gate, enabled before the ISP domain
++      - description: camsys LARB2 gate
 +      - description: camsys register-bank gate
 +      - description: SENINF gate
 +      - description: sensor master-clock (CAMTG) gate
@@ -45,6 +47,8 @@ new file mode 100644
 +
 +  clock-names:
 +    items:
++      - const: smi_common
++      - const: larb2
 +      - const: camsys
 +      - const: seninf
 +      - const: camtg
@@ -111,12 +115,15 @@ new file mode 100644
 +        compatible = "planet,gemini-camera-power";
 +        reg = <0x1a040000 0x3000>;
 +        power-domains = <&scpsys MT6797_POWER_DOMAIN_ISP>;
-+        clocks = <&camsys CLK_CAM_CAMSYS>,
++        clocks = <&mmsys CLK_MM_SMI_COMMON>,
++                 <&camsys CLK_CAM_LARB2>,
++                 <&camsys CLK_CAM_CAMSYS>,
 +                 <&camsys CLK_CAM_SENINF>,
 +                 <&camsys CLK_CAM_CAMTG>,
 +                 <&topckgen CLK_TOP_MUX_CAMTG>,
 +                 <&topckgen CLK_TOP_UNIVPLL_D26>;
-+        clock-names = "camsys", "seninf", "camtg", "camtg_sel", "univpll_d26";
++        clock-names = "smi_common", "larb2", "camsys", "seninf",
++                      "camtg", "camtg_sel", "univpll_d26";
 +        vcama-supply = <&mt6351_vcama_reg>;
 +        vcamd-supply = <&mt6351_vcamd_reg>;
 +        vcamio-supply = <&mt6351_vcamio_reg>;
@@ -167,7 +174,7 @@ diff --git a/drivers/misc/gemini-camera-power.c b/drivers/misc/gemini-camera-pow
 new file mode 100644
 --- /dev/null
 +++ b/drivers/misc/gemini-camera-power.c
-@@ -0,0 +1,503 @@
+@@ -0,0 +1,558 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Gemini PDA camera bring-up power controller.
@@ -212,9 +219,18 @@ new file mode 100644
 + * drivers/misc/mediatek/cameraisp/src/mt6797/camera_isp.c, ISP_MCLK1_EN()
 + * and ISP_MCLK2_EN() — set bit 29 of SENINF0/SENINF1 + 0x600.
 + *
-+ * Clock ordering: same file, ISP_EnableClock() — the ISP power domain and
-+ * smi_common come up before any CAM_* gate is touched. The power domain is
-+ * a DT power-domains reference here, so the genpd core does that part.
++ * Clock ordering: same file, Prepare_Enable_ccf_clock(), which carries the
++ * requirement in a comment — "must keep this clk open order: CG_SCP_SYS_DIS
++ * -> CG_DISP0_SMI_COMMON -> CG_SCP_SYS_ISP -> ISP clk" — and then enables
++ * CAM_LARB2 before CAM_CAMSYS.
++ *
++ * genpd supplies only part of that. Taking a runtime-PM reference here powers
++ * the ISP domain and, because ISP is a genpd child of MM, the MM domain with
++ * it. It does NOT enable the smi_common gate: MT6797_POWER_DOMAIN_ISP has
++ * .clk_id = {CLK_NONE} in mtk-scpsys.c, and MM's CLK_MM is the mm_sel
++ * topckgen mux, not CLK_MM_SMI_COMMON. So smi_common is taken as an explicit
++ * clock below, before the domain, and CAM_LARB2 before CAM_CAMSYS, in the
++ * vendor's order.
 + */
 +
 +#include <linux/bitops.h>
@@ -231,18 +247,40 @@ new file mode 100644
 +#include <linux/sysfs.h>
 +
 +/*
-+ * SENINF instance stride and the MCLK enable bit, from the vendor
++ * SENINF instance stride and the MCLK register, from the vendor
 + * ISP_MCLKn_EN() functions: SENINF0 0x1a040000, SENINF1 0x1a041000,
 + * SENINF2 0x1a042000, and in each the register at +0x600 bit 29.
++ *
++ * Bit 29 is the enable, and the vendor only ever read-modify-writes that one
++ * bit — but it does so on top of a rest value this driver would otherwise
++ * never establish. camera_isp.c's release path (ISP_MCLK_EN Release) writes
++ * 0x00000001 to all three of these registers, so the vendor's "MCLK off" is
++ * 0x00000001 and its "MCLK on" is 0x20000001. Linux never runs the vendor
++ * SENINF init, so bit 0 arrives at whatever the preloader left — measured as
++ * 0 on this board — and an RMW of bit 29 alone yields 0x20000000, which is
++ * not a state the vendor ever produces.
++ *
++ * What bit 0 selects is not documented anywhere available; setting it alone
++ * did not make the sensor answer (2026-08-24). It is written here because
++ * matching the vendor's known-good register value is strictly better than
++ * matching half of it, not because it is understood.
 + */
 +#define SENINF_STRIDE			0x1000
 +#define SENINF_MCLK_REG			0x0600
++#define SENINF_MCLK_REST		0x00000001
 +#define SENINF_MCLK_EN			BIT(29)
 +
-+/* Vendor power-sequence voltages (kd_camera_hw.h VOL* / PowerOnList). */
++/*
++ * Vendor power-sequence voltages (kd_camera_hw.h VOL* / PowerOnList).
++ *
++ * DVDD is 1.21 V, not the 1.2 V PowerOnList asks for: hwpoweron() rewrites
++ * Vol_1200 to Vol_1210 before every _hwPowerOn(DVDD, ...) — "vcamd:
++ * unsupportable voltage range: 1500000-1210000uV" — on all three sockets, and
++ * the live vendor stack reads the rail back as 1210000 uV.
++ */
 +#define CAM_DOVDD_UV			1800000
 +#define CAM_AVDD_UV			2800000
-+#define CAM_DVDD_UV			1200000
++#define CAM_DVDD_UV			1210000
 +
 +/* Vendor power-sequence settle time, in milliseconds, between every step. */
 +#define CAM_STEP_DELAY_MS		10
@@ -263,6 +301,8 @@ new file mode 100644
 +	struct device *dev;
 +	void __iomem *seninf_base;
 +
++	struct clk *smi_common;
++	struct clk *larb2;
 +	struct clk *camsys;
 +	struct clk *seninf;
 +	struct clk *camtg;
@@ -284,12 +324,7 @@ new file mode 100644
 +{
 +	void __iomem *reg = cam->seninf_base + seninf * SENINF_STRIDE +
 +			    SENINF_MCLK_REG;
-+	u32 val = readl(reg);
-+
-+	if (on)
-+		val |= SENINF_MCLK_EN;
-+	else
-+		val &= ~SENINF_MCLK_EN;
++	u32 val = SENINF_MCLK_REST | (on ? SENINF_MCLK_EN : 0);
 +
 +	writel(val, reg);
 +	dev_dbg(cam->dev, "seninf%u MCLK %s, reg now 0x%08x\n",
@@ -338,8 +373,10 @@ new file mode 100644
 +	clk_disable_unprepare(cam->camtg);
 +	clk_disable_unprepare(cam->seninf);
 +	clk_disable_unprepare(cam->camsys);
++	clk_disable_unprepare(cam->larb2);
 +
 +	pm_runtime_put_sync(cam->dev);
++	clk_disable_unprepare(cam->smi_common);
 +	cam->powered = false;
 +	dev_info(cam->dev, "camera sockets powered down\n");
 +}
@@ -365,17 +402,29 @@ new file mode 100644
 +{
 +	int ret, i;
 +
-+	/* ISP MTCMOS domain first — nothing in camsys answers without it. */
++	/* Vendor order: smi_common, then the ISP domain, then the CAM gates. */
++	ret = clk_prepare_enable(cam->smi_common);
++	if (ret) {
++		dev_err(cam->dev, "smi_common clock: %d\n", ret);
++		return ret;
++	}
++
 +	ret = pm_runtime_resume_and_get(cam->dev);
 +	if (ret) {
 +		dev_err(cam->dev, "ISP power domain did not come up: %d\n", ret);
-+		return ret;
++		goto err_smi;
++	}
++
++	ret = clk_prepare_enable(cam->larb2);
++	if (ret) {
++		dev_err(cam->dev, "cam_larb2 clock: %d\n", ret);
++		goto err_pd;
 +	}
 +
 +	ret = clk_prepare_enable(cam->camsys);
 +	if (ret) {
 +		dev_err(cam->dev, "camsys clock: %d\n", ret);
-+		goto err_pd;
++		goto err_larb2;
 +	}
 +
 +	ret = clk_prepare_enable(cam->seninf);
@@ -463,8 +512,12 @@ new file mode 100644
 +	clk_disable_unprepare(cam->seninf);
 +err_camsys:
 +	clk_disable_unprepare(cam->camsys);
++err_larb2:
++	clk_disable_unprepare(cam->larb2);
 +err_pd:
 +	pm_runtime_put_sync(cam->dev);
++err_smi:
++	clk_disable_unprepare(cam->smi_common);
 +	return ret;
 +}
 +
@@ -564,6 +617,15 @@ new file mode 100644
 +	cam->seninf_base = devm_ioremap(dev, res->start, resource_size(res));
 +	if (!cam->seninf_base)
 +		return dev_err_probe(dev, -ENOMEM, "cannot map SENINF\n");
++
++	cam->smi_common = devm_clk_get(dev, "smi_common");
++	if (IS_ERR(cam->smi_common))
++		return dev_err_probe(dev, PTR_ERR(cam->smi_common),
++				     "smi_common clock\n");
++
++	cam->larb2 = devm_clk_get(dev, "larb2");
++	if (IS_ERR(cam->larb2))
++		return dev_err_probe(dev, PTR_ERR(cam->larb2), "larb2 clock\n");
 +
 +	cam->camsys = devm_clk_get(dev, "camsys");
 +	if (IS_ERR(cam->camsys))

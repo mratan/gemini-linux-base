@@ -103,6 +103,11 @@
 #include <linux/i2c.h>
 #include <linux/arm-smccc.h>
 #include <linux/cpu.h>
+#include <asm/cpufeature.h>
+#include <linux/cpuhotplug.h>
+#include <linux/nmi.h>
+#include <linux/kernel_stat.h>
+#include <asm/sysreg.h>
 #include <linux/cpumask.h>
 #include <linux/sched.h>
 #include <linux/mm.h>
@@ -160,6 +165,8 @@ static long swrite(u32 addr, u32 val)
 #define MP0_CPUSYS_PWR_CON	0x210
 #define MP2_CPUSYS_PWR_CON	0x218
 #define MP2_CPU0_PWR_CON	0x240
+#define CPU_IDLE_STA		0x174
+#define CPU_IDLE_STA2		0x178
 #define CPU_EXT_BUCK_ISO	0x290
 
 #define PWR_RST_B		BIT(0)
@@ -314,9 +321,92 @@ MODULE_PARM_DESC(handoff_b_pcm_from_watcher,
 	"for the Android-like unpaused/CLUSTER_EN state, pause B to release "
 	"ATF's SPMC poll, then unpause it once ATF reaches the clock/bus stage");
 
-static void __iomem *spm, *mcumixed, *topckgen, *cspm, *csram, *infracfg, *cci;
+static int enable_cci_from_watcher;
+module_param(enable_cci_from_watcher, int, 0444);
+MODULE_PARM_DESC(enable_cci_from_watcher,
+	"at post-frequency poll 5, enable MP2's CCI snoop/DVM port before ATF's "
+	"cold-start ordering would normally do so");
 
+static int power_core_from_watcher;
+module_param(power_core_from_watcher, int, 0444);
+MODULE_PARM_DESC(power_core_from_watcher,
+	"at poll 5, assert the target core's PWR_ON after the bounded MP2 MTCMOS "
+	"release and report whether a live core withdraws bus protection");
+
+static int pwrap_latch;
+module_param(pwrap_latch, int, 0444);
+MODULE_PARM_DESC(pwrap_latch,
+	"hold the PMIC wrapper's SPI controller in reset across the EXT_BUCK_ISO "
+	"change, as the vendor's cpu_power_on_buck() does (WDT_SWSYSRST bit 11)");
+
+static char *late_caps;
+module_param(late_caps, charp, 0444);
+MODULE_PARM_DESC(late_caps,
+	"comma-separated arm64 capability numbers to mark present system-wide "
+	"before onlining an A72, so verify_local_cpu_capabilities() does not "
+	"reject it for carrying an erratum the A53 boot CPUs do not have");
+
+static int disable_big_spark;
+module_param(disable_big_spark, int, 0444);
+MODULE_PARM_DESC(disable_big_spark,
+	"after onlining, clear bit 0 of the core's SPMC (0x10222430/4) to undo "
+	"ATF's big_spark2_core(core,1) retention enable");
+
+static int also_cpu = -1;
+module_param(also_cpu, int, 0444);
+MODULE_PARM_DESC(also_cpu,
+	"after the first big core is up and kept alive, online the other one too "
+	"(the second-core path: ATF skips power_on_cl3 because big_on != 0)");
+
+static int spin_ms;
+module_param(spin_ms, int, 0444);
+MODULE_PARM_DESC(spin_ms,
+	"after onlining, run a bound kthread on the A72 for this many ms so it "
+	"never reaches WFI; proves the core does real work and isolates idle");
+
+static int cspm_cluster_on_after;
+module_param(cspm_cluster_on_after, int, 0444);
+MODULE_PARM_DESC(cspm_cluster_on_after,
+	"after onlining, perform the vendor's cpuhvfs_notify_cluster_on(B): set "
+	"CLUSTER_EN and clear SW_PAUSE on CSPM SW_RSV2 (needs a running PCM)");
+
+static int mp2_sync_dcm = -1;
+module_param(mp2_sync_dcm, int, 0444);
+MODULE_PARM_DESC(mp2_sync_dcm,
+	"before CPU_ON, drive MCUCFG_SYNC_DCM_MP2_CONFIG (0x10222274): 0 = DCM "
+	"off (what Android has during power_on_cl3), 1 = on, -1 = leave alone");
+
+static int clear_miscdbg;
+module_param(clear_miscdbg, int, 0444);
+MODULE_PARM_DESC(clear_miscdbg,
+	"before CPU_ON, secure-read MCUCFG MISCDBG (0x1022220c) and clear its "
+	"AXI quiesce bits 0|4 that ATF's power-off sets and its power-on never "
+	"undoes; 2 also clears them in MP2_AXI_CONFIG (0x1022222c)");
+
+static int probe_axi_from_watcher;
+module_param(probe_axi_from_watcher, int, 0444);
+MODULE_PARM_DESC(probe_axi_from_watcher,
+	"after poll-5 cluster/core release, inspect MP2's non-secure AXI-config "
+	"aliases and clear ACINACTM if either sub-block is finally accessible");
+
+static int spmc_sw_top_on;
+module_param(spmc_sw_top_on, int, 0444);
+MODULE_PARM_DESC(spmc_sw_top_on,
+	"run ATF source's bounded software SPMC TOP power sequence before CPU_ON; "
+	"this directly drives SRAM/PRE1/PRE2/PDB rather than the broken HW FSM");
+
+static void __iomem *spm, *mcumixed, *topckgen, *cspm, *csram, *infracfg, *cci, *mp2cfg;
+static void __iomem *rgu;		/* mapped only for the pwrap latch */
+
+#define RGU_PHYS		0x10007000u
+#define WDT_SWSYSRST		0x018
+
+#define CSPM_SW_RSV0		0x608
 #define CSPM_SW_RSV2		0x610
+#define CSPM_HWSTA_LL		0x614
+#define CSPM_HWSTA_L		0x618
+#define CSPM_HWSTA_B		0x61c
+#define CPUHVFS_FW_DONE		BIT(15)
 #define CSRAM_SW_RSV2		0x328
 #define CSRAM_PAUSE_SRC		0x330
 #define CPUHVFS_SW_PAUSE	BIT(13)
@@ -480,6 +570,45 @@ static int da9214_rmw(struct i2c_adapter *ad, u8 reg, u8 val, u8 mask, u8 shift)
 	return r;
 }
 
+/*
+ * Read the A72 rail back from the DA9214 itself.
+ *
+ * The core stops executing while SPM still reports it powered — but SPM's
+ * PWR_CON only reflects the SoC-internal MTCMOS switch, not the external buck
+ * that actually feeds VPROC2. If BUCKB has been disabled or its voltage pulled
+ * down (over-current protection is a real possibility: the vendor's
+ * cpu_power_on_buck() brackets this whole sequence with an OCP reset_flag, and
+ * ATF carries an mt_ocp_api driver we have never initialised), the core would
+ * halt exactly like this: powered per SPM, clocked, not in WFI, not at EL3.
+ *
+ * The regulator framework caches its own idea of the voltage and will happily
+ * report the value it last asked for, so read the chip (§2.8).
+ */
+static void vproc2_report(const char *when)
+{
+	struct i2c_adapter *ad = i2c_get_adapter(2);
+	union i2c_smbus_data d;
+	int cont = -1, vsel = -1, page;
+
+	if (!ad) {
+		P("  VPROC2 (%s): no i2c6 adapter", when);
+		return;
+	}
+	page = i2c_smbus_xfer(ad, DA9214_ADDR, 0, I2C_SMBUS_WRITE,
+			      DA9214_PAGE_CON, I2C_SMBUS_BYTE_DATA, &d);
+	if (!i2c_smbus_xfer(ad, DA9214_ADDR, 0, I2C_SMBUS_READ,
+			    DA9214_BUCKB_CONT, I2C_SMBUS_BYTE_DATA, &d))
+		cont = d.byte;
+	if (!i2c_smbus_xfer(ad, DA9214_ADDR, 0, I2C_SMBUS_READ,
+			    DA9214_VBUCKB_A, I2C_SMBUS_BYTE_DATA, &d))
+		vsel = d.byte;
+	i2c_put_adapter(ad);
+	P("  VPROC2 (%s): BUCKB_CONT=0x%02x VBUCKB_A=0x%02x -> %d mV%s",
+	  when, cont, vsel, vsel < 0 ? -1 : 300 + (vsel & 0x7f) * 10,
+	  (cont >= 0 && !(cont & 1)) ? "   *** BUCKB IS OFF ***" : "");
+	(void)page;
+}
+
 static int vproc2_set(bool on)
 {
 	struct i2c_adapter *ad = i2c_get_adapter(DA9214_I2C_ADAPTER);
@@ -571,9 +700,47 @@ static int prerequisites(void)
 		msleep(settle_ms);
 	}
 
+	/*
+	 * The vendor latches the PMIC wrapper's SPI controller in reset across
+	 * the external-buck isolation change:
+	 *
+	 *   mtk_wdt_swsysret_config(MTK_WDT_SWSYS_RST_PWRAP_SPI_CTL_RST, 1);
+	 *   ... EXT_BUCK_ISO ...
+	 *   mtk_wdt_swsysret_config(MTK_WDT_SWSYS_RST_PWRAP_SPI_CTL_RST, 0);
+	 *
+	 * (psci.c:cpu_power_on_buck, and identically in ATF's own compiled-out
+	 * power_on_cl3 prologue). That bit is 0x800 in WDT_SWSYSRST 0x10007018,
+	 * key 0x88000000. It is the last line of the authoritative prerequisite
+	 * we had never implemented. The WDT_SWSYSRST bit map has no big-cluster
+	 * reset bit, so this is an interlock and not the missing target-side
+	 * reset — but "run the vendor sequence exactly" is the rule here.
+	 */
+	if (pwrap_latch) {
+		rgu = ioremap(RGU_PHYS, 0x100);
+		if (rgu) {
+			u32 w = readl(rgu + WDT_SWSYSRST);
+
+			P("step 3c: WDT_SWSYSRST %08x -> latch PWRAP_SPI_CTL_RST", w);
+			writel(w | 0x88000800u, rgu + WDT_SWSYSRST);
+		} else {
+			P("step 3c: cannot map the RGU — skipping the pwrap latch");
+		}
+	}
+
 	P("step 4: CPU_EXT_BUCK_ISO %08x -> clear bits[1:0]",
 	  readl(spm + CPU_EXT_BUCK_ISO));
 	writel(readl(spm + CPU_EXT_BUCK_ISO) & ~0x3u, spm + CPU_EXT_BUCK_ISO);
+
+	if (pwrap_latch && rgu) {
+		u32 w = readl(rgu + WDT_SWSYSRST);
+
+		writel((w & ~0x800u) | 0x88000000u, rgu + WDT_SWSYSRST);
+		P("step 4b: WDT_SWSYSRST unlatched -> %08x",
+		  readl(rgu + WDT_SWSYSRST));
+		iounmap(rgu);
+		rgu = NULL;
+	}
+
 	udelay(240);
 	P("  CPU_EXT_BUCK_ISO now %08x", readl(spm + CPU_EXT_BUCK_ISO));
 
@@ -599,9 +766,219 @@ static int prerequisites(void)
 	  sread(0x102222b0), sread(0x102222b4), sread(0x102224a0));
 	P("  0x10222430 = %08x  0x10222434 = %08x  0x10222700 = %08x",
 	  sread(0x10222430), sread(0x10222434), sread(0x10222700));
+	/*
+	 * MISCDBG and MP2_AXI_CONFIG, read through ATF rather than non-secure.
+	 * ATF's power_off_cl3 leaves MISCDBG bits 0|4 set to quiesce the MP2
+	 * interface; its power_on_cl3 clears only bit 0, and only after the
+	 * protection release that poll 5 hangs on. Whether those bits are
+	 * actually set here decides whether that is our wall.
+	 */
+	P("  0x1022220c = %08x (MISCDBG, ATF sets bits 0|4 to quiesce MP2 AXI)",
+	  sread(0x1022220c));
+	P("  0x1022222c = %08x (MP2_AXI_CONFIG)", sread(0x1022222c));
+	P("  0x10222274 = %08x (MP2 sync DCM; bit0 = bus-clock gating enabled)",
+	  sread(0x10222274));
+	P("  INFRACFG PROTECTEN1 = %08x  PROTEXTSTA3 = %08x",
+	  readl(infracfg + TOPAXI_PROTECTEN), readl(infracfg + TOPAXI_PROTECTEN_STA1));
 
 	spm_report("after prerequisites");
 	return 0;
+}
+
+/* ---- ATF's software SPMC TOP sequence, with every source poll bounded -- */
+
+#define SPMC_TOP		0x102222a0u
+#define SPMC_FSM_MASK		(0x1fu << 23)
+#define SPMC_FSM_ON		BIT(23)
+#define SPMC_PDB_ACK		BIT(21)
+#define SPMC_PRE2_ACK		BIT(20)
+#define SPMC_PRE1_ACK		BIT(19)
+#define SPMC_HOT_RESET		BIT(16)
+#define SPMC_SRAMPD_MASK	(0x3fu << 10)
+#define SPMC_SRAM_ISOINTB	BIT(9)
+#define SPMC_ISO		BIT(8)
+#define SPMC_SRAM_SLEEPB	BIT(7)
+#define SPMC_LOGIC_PDB		BIT(6)
+#define SPMC_PRE2_PDB		BIT(5)
+#define SPMC_PRE1_PDB		BIT(4)
+#define SPMC_FSM_OVERRIDE	BIT(3)
+#define SPMC_SW_PWR_ON		BIT(2)
+#define SPMC_PWR_OVERRIDE_EN	BIT(1)
+
+static bool spmc_wait(u32 mask, bool set, const char *what)
+{
+	int i;
+
+	for (i = 0; i < 2000; i++) {
+		if (!!(sread(SPMC_TOP) & mask) == set) {
+			P("  SPMC %-18s %s after %d us (= %08x)", what,
+			  set ? "SET" : "CLEAR", i, sread(SPMC_TOP));
+			return true;
+		}
+		udelay(1);
+	}
+	P("  SPMC %-18s TIMEOUT (= %08x)", what, sread(SPMC_TOP));
+	return false;
+}
+
+static bool spmc_software_top_on(void)
+{
+	static const u8 gray[32] = {
+		0x01, 0x03, 0x02, 0x06, 0x07, 0x05, 0x04, 0x0c,
+		0x0d, 0x0f, 0x0e, 0x0a, 0x0b, 0x09, 0x08, 0x18,
+		0x19, 0x1b, 0x1a, 0x1e, 0x1f, 0x1d, 0x1c, 0x14,
+		0x15, 0x17, 0x16, 0x12, 0x13, 0x11, 0x10, 0x30,
+	};
+	u32 v, orig, pll0, mux0, div0;
+	bool held;
+	int i;
+
+	if (!spmc_sw_top_on)
+		return true;
+	P("==== ATF-source software SPMC TOP power-on ====");
+	v = sread(SPMC_TOP);
+	P("  entry TOP_SPMC=%08x MP2=%08x STATUS=%08x/%08x", v,
+	  readl(spm + MP2_CPUSYS_PWR_CON), readl(spm + CPU_PWR_STATUS),
+	  readl(spm + CPU_PWR_STATUS_2ND));
+	if (v & SPMC_PDB_ACK) {
+		P("  SPMC TOP already has PDB all-on ACK");
+		goto clock_and_bus;
+	}
+	if ((v & SPMC_FSM_MASK) || (v & SPMC_FSM_OVERRIDE)) {
+		P("  REFUSING software SPMC takeover from non-OFF/non-HW state");
+		return false;
+	}
+
+	v &= ~(SPMC_SRAMPD_MASK | SPMC_LOGIC_PDB | SPMC_PRE1_PDB |
+	       SPMC_PRE2_PDB | SPMC_SRAM_SLEEPB | SPMC_SRAM_ISOINTB);
+	v |= SPMC_ISO | SPMC_HOT_RESET;
+	swrite(SPMC_TOP, v);
+	swrite(SPMC_TOP, v | SPMC_FSM_OVERRIDE);
+	if (!spmc_wait(SPMC_FSM_MASK, true, "FSM override"))
+		return false;
+
+	v = sread(SPMC_TOP) | SPMC_HOT_RESET | SPMC_PWR_OVERRIDE_EN |
+	    SPMC_SW_PWR_ON;
+	swrite(SPMC_TOP, v);
+	writel(readl(spm + MP2_CPUSYS_PWR_CON) & ~PWR_CLK_DIS,
+	       spm + MP2_CPUSYS_PWR_CON);
+	writel(readl(spm + MP2_CPUSYS_PWR_CON) | PWR_RST_B,
+	       spm + MP2_CPUSYS_PWR_CON);
+
+	/* Source uses & 0xFFFF03FF; only low control bits feed each gray write. */
+	orig = sread(SPMC_TOP) & 0x000003ffu;
+	for (i = 0; i < ARRAY_SIZE(gray); i++)
+		swrite(SPMC_TOP, orig | ((u32)gray[i] << 10));
+
+	v = sread(SPMC_TOP) | SPMC_PRE1_PDB;
+	swrite(SPMC_TOP, v);
+	if (!spmc_wait(SPMC_PRE1_ACK, true, "PRE1 ACK"))
+		return false;
+	v = sread(SPMC_TOP) | SPMC_PRE2_PDB;
+	swrite(SPMC_TOP, v);
+	if (!spmc_wait(SPMC_PRE2_ACK, true, "PRE2 ACK"))
+		return false;
+	v = sread(SPMC_TOP) | SPMC_LOGIC_PDB;
+	swrite(SPMC_TOP, v);
+	if (!spmc_wait(SPMC_PDB_ACK, true, "PDB ACK"))
+		return false;
+	v = sread(SPMC_TOP) | SPMC_SRAM_SLEEPB;
+	swrite(SPMC_TOP, v);
+	v = (sread(SPMC_TOP) & ~SPMC_ISO) | SPMC_SRAM_ISOINTB;
+	swrite(SPMC_TOP, v);
+	v = sread(SPMC_TOP) & ~SPMC_HOT_RESET;
+	swrite(SPMC_TOP, v);
+	udelay(2);
+
+clock_and_bus:
+	/*
+	 * Hand the fully sequenced controls back to the shipping HW FSM before
+	 * presenting SPM PWR_ON. Pure SW override reached every internal ACK but
+	 * never asserted CPU_PWR_STATUS on this production configuration.
+	 */
+	v = sread(SPMC_TOP);
+	if (v & SPMC_FSM_OVERRIDE) {
+		v &= ~(SPMC_FSM_OVERRIDE | SPMC_PWR_OVERRIDE_EN | SPMC_SW_PWR_ON);
+		swrite(SPMC_TOP, v);
+		udelay(10);
+		P("  SPMC handoff to HW FSM: %08x", sread(SPMC_TOP));
+	}
+	writel(readl(spm + MP2_CPUSYS_PWR_CON) | PWR_ON,
+	       spm + MP2_CPUSYS_PWR_CON);
+	for (i = 0; i < 2000 &&
+	     !(readl(spm + CPU_PWR_STATUS) & MP2_CPUTOP_BIT); i++)
+		udelay(1);
+	P("  software TOP physical request: MP2=%08x STATUS=%08x wait=%d us",
+	  readl(spm + MP2_CPUSYS_PWR_CON), readl(spm + CPU_PWR_STATUS), i);
+	if (i == 2000)
+		P("  CPU_PWR_STATUS did not mirror SW override; continuing with explicit SPM shadows");
+	v = readl(spm + MP2_CPUSYS_PWR_CON) | PWR_ON | PWR_ON_2ND |
+	    SRAM_ISOINT_B | PWR_RST_B;
+	v &= ~(PWR_ISO | SRAM_PDN | SRAM_CKISO | PWR_CLK_DIS);
+	writel(v, spm + MP2_CPUSYS_PWR_CON);
+	udelay(10);
+	P("  software TOP SPM shadow release: MP2=%08x", readl(spm + MP2_CPUSYS_PWR_CON));
+
+	/* big_sw_on_seq() clocks the live TOP before withdrawing pwrdnreqn. */
+	pll0 = sread(0x102224a0);
+	mux0 = readl(mcumixed + ARMPLLDIV_MUXSEL);
+	div0 = readl(mcumixed + ARMPLLDIV_CKDIV);
+	swrite(0x102224a0, 0x00ff0100);
+	udelay(20);
+	swrite(0x102224a0, 0x00ff0101);
+	udelay(10);
+	swrite(0x102224a0, 0x00ff1101);
+	udelay(30);
+	held = cspm_sema_take();
+	writel((mux0 & ~0x3u) | 1u, mcumixed + ARMPLLDIV_MUXSEL);
+	writel((div0 & ~0x1fu) | 8u, mcumixed + ARMPLLDIV_CKDIV);
+	cspm_sema_give(held);
+	udelay(20);
+
+	v = readl(infracfg + TOPAXI_PROTECTEN);
+	writel(v | MP2_BUS_PROT_MASK, infracfg + TOPAXI_PROTECTEN);
+	for (i = 0; i < 2000 &&
+	     (readl(infracfg + TOPAXI_PROTECTEN_STA1) & MP2_BUS_PROT_MASK) !=
+	     MP2_BUS_PROT_MASK; i++)
+		udelay(1);
+	P("  software TOP protect asserted: EN=%08x STA1=%08x wait=%d us",
+	  readl(infracfg + TOPAXI_PROTECTEN),
+	  readl(infracfg + TOPAXI_PROTECTEN_STA1), i);
+
+	v = readl(infracfg + TOPAXI_PROTECTEN);
+	writel(v & ~BIT(10), infracfg + TOPAXI_PROTECTEN);
+	for (i = 0; i < 2000 &&
+	     (readl(infracfg + TOPAXI_PROTECTEN_STA1) & BIT(10)); i++)
+		udelay(1);
+	P("  software TOP bit10 release: EN=%08x STA1=%08x wait=%d us",
+	  readl(infracfg + TOPAXI_PROTECTEN),
+	  readl(infracfg + TOPAXI_PROTECTEN_STA1), i);
+	if (i < 2000) {
+		writel(readl(infracfg + TOPAXI_PROTECTEN) & ~BIT(6),
+		       infracfg + TOPAXI_PROTECTEN);
+		for (i = 0; i < 2000 &&
+		     (readl(infracfg + TOPAXI_PROTECTEN_STA1) & BIT(6)); i++)
+			udelay(1);
+		writel(readl(infracfg + TOPAXI_PROTECTEN) & ~BIT(2),
+		       infracfg + TOPAXI_PROTECTEN);
+		for (i = 0; i < 2000 &&
+		     (readl(infracfg + TOPAXI_PROTECTEN_STA1) & BIT(2)); i++)
+			udelay(1);
+	}
+	P("  software TOP on complete: SPMC=%08x MP2=%08x STA1=%08x final wait=%d us",
+	  sread(SPMC_TOP), readl(spm + MP2_CPUSYS_PWR_CON),
+	  readl(infracfg + TOPAXI_PROTECTEN_STA1), i);
+
+	held = cspm_sema_take();
+	writel(mux0, mcumixed + ARMPLLDIV_MUXSEL);
+	writel(div0, mcumixed + ARMPLLDIV_CKDIV);
+	cspm_sema_give(held);
+	swrite(0x102224a0, pll0);
+	udelay(100);
+	P("  software TOP clock restored: PLL=%08x MUX=%08x DIV=%08x",
+	  sread(0x102224a0), readl(mcumixed + ARMPLLDIV_MUXSEL),
+	  readl(mcumixed + ARMPLLDIV_CKDIV));
+	return i < 2000;
 }
 
 /* ---- ATF's two unbounded polls, done here with a bound ---------------- */
@@ -700,6 +1077,20 @@ static bool cputop_power_on(void)
 	}
 
 	spm_report("after CPUTOP power-on");
+	/*
+	 * Re-read the two registers that decide the MISCDBG-quiesce and
+	 * sync-DCM hypotheses. Reading them with the cluster unpowered is
+	 * worthless: MCUCFG's cluster-domain registers answer 0 when the domain
+	 * is down (the same trap that made 0x102224xx look all-zero), so a
+	 * clear bit there proves nothing. Powered, this is the real value.
+	 */
+	P("  --- MCUCFG cluster-domain registers, now that MP2 is powered ---");
+	P("  0x1022220c = %08x (MISCDBG: bit0|bit4 = MP2 AXI quiesce)", sread(0x1022220c));
+	P("  0x1022222c = %08x (MP2_AXI_CONFIG)", sread(0x1022222c));
+	P("  0x10222274 = %08x (MP2 sync DCM: bit0 = bus-clock gating)", sread(0x10222274));
+	P("  PROTECTEN1 = %08x  PROTEXTSTA3 = %08x",
+	  readl(infracfg + TOPAXI_PROTECTEN),
+	  readl(infracfg + TOPAXI_PROTECTEN_STA1));
 	P("  0x10222700 (spark vret) = %08x, writing 0x3f", sread(0x10222700));
 	swrite(0x10222700, 0x3f);
 	P("  -> %08x", sread(0x10222700));
@@ -1250,17 +1641,12 @@ static void ringwatch_handoff_b_pcm(void)
 		return;
 
 	b = readl(cspm + CSPM_SW_RSV2);
-	P("==== watcher CPUHVFS handoff: pausing B at SW_RSV2=%08x ====", b);
-	if (!(b & CPUHVFS_CLUSTER_EN) || (b & CPUHVFS_SW_PAUSE)) {
-		P("  REFUSING handoff: B is not CLUSTER_EN and unpaused");
+	P("==== watcher CPUHVFS handoff: B starts at SW_RSV2=%08x ====", b);
+	if ((b & (CPUHVFS_CLUSTER_EN | CPUHVFS_SW_PAUSE)) != CPUHVFS_SW_PAUSE) {
+		P("  REFUSING handoff: B is not disabled+paused");
 		return;
 	}
-	writel(b | CPUHVFS_SW_PAUSE, cspm + CSPM_SW_RSV2);
-	writel(b | CPUHVFS_SW_PAUSE, csram + CSRAM_SW_RSV2);
-	udelay(10);
-	writel(BIT(0), csram + CSRAM_PAUSE_SRC);
-	P("  B paused: SW_RSV2=%08x; waiting boundedly for ATF clock stage",
-	  readl(cspm + CSPM_SW_RSV2));
+	P("  B disabled+paused; waiting boundedly for ATF clock stage");
 
 	for (i = 0; i < 2000 && !kthread_should_stop(); i++) {
 		if ((readl(spm + CPU_PWR_STATUS) & MP2_CPUTOP_BIT) &&
@@ -1275,11 +1661,712 @@ static void ringwatch_handoff_b_pcm(void)
 	if (i == 2000)
 		return;
 
+	{
+		static const unsigned int pulse_us[] = { 450 };
+		unsigned int p;
+
+		/* Avoid two clock owners fighting while CPUHVFS processes cluster-on. */
+		writel(readl(mcumixed + ARMPLLDIV_MUXSEL) & ~0x3u,
+		       mcumixed + ARMPLLDIV_MUXSEL);
+		udelay(10);
+		P("  parked B on 26 MHz before CPUHVFS pulse: MUXSEL=%08x CKDIV=%08x",
+		  readl(mcumixed + ARMPLLDIV_MUXSEL),
+		  readl(mcumixed + ARMPLLDIV_CKDIV));
+
+		for (p = 0; p < ARRAY_SIZE(pulse_us); p++) {
+			writel(0, csram + CSRAM_PAUSE_SRC);
+			b = (readl(cspm + CSPM_SW_RSV2) | CPUHVFS_CLUSTER_EN) &
+			    ~CPUHVFS_SW_PAUSE;
+			writel(b, cspm + CSPM_SW_RSV2);
+			writel(b, csram + CSRAM_SW_RSV2);
+			udelay(pulse_us[p]);
+			if (stop_pcm_from_watcher && p == ARRAY_SIZE(pulse_us) - 1) {
+				/* Capture the pre-reset edge: stop PCM before printk or re-pause. */
+				writel(CSPM_KEY, cspm + CSPM_POWERON_CONFIG);
+				writel(CSPM_CON0_KEY | CSPM_PCM_SW_RESET,
+				       cspm + CSPM_PCM_CON0);
+				writel(CSPM_CON0_KEY, cspm + CSPM_PCM_CON0);
+				stop_pcm_from_watcher = 0;
+				if (armpll2_khz)
+					armpll2_set(armpll2_khz);
+			}
+			b |= CPUHVFS_SW_PAUSE;
+			writel(b, cspm + CSPM_SW_RSV2);
+			writel(b, csram + CSRAM_SW_RSV2);
+			writel((readl(cspm + CSPM_SW_RSV0) & CPUHVFS_SW_PAUSE) ? BIT(0) : 0,
+			       csram + CSRAM_PAUSE_SRC);
+			udelay(10);
+			P("  B pulse %u us: SW_RSV2=%08x MP2=%08x STA1=%08x HWSTA_B=%08x",
+			  pulse_us[p], b, readl(spm + MP2_CPUSYS_PWR_CON),
+			  readl(infracfg + TOPAXI_PROTECTEN_STA1),
+			  readl(cspm + CSPM_HWSTA_B));
+			if (!(readl(infracfg + TOPAXI_PROTECTEN_STA1) & MP2_BUS_PROT_MASK))
+				break;
+		}
+	}
+}
+
+static void ringwatch_enable_cci(void)
+{
+	u32 snoop;
+	int i;
+
+	if (!enable_cci_from_watcher)
+		return;
+	P("==== watcher CCI intervention: MP2 snoop=%08x STATUS=%08x STA1=%08x ====",
+	  readl(cci + CCI_MP2_SNOOP), readl(cci + CCI_STATUS),
+	  readl(infracfg + TOPAXI_PROTECTEN_STA1));
+	if (!(readl(spm + CPU_PWR_STATUS) & MP2_CPUTOP_BIT) ||
+	    (readl(mcumixed + ARMPLLDIV_MUXSEL) & 0x3u) != 1u) {
+		P("  REFUSING CCI intervention: ATF is not at the post-frequency stage");
+		return;
+	}
+	snoop = readl(cci + CCI_MP2_SNOOP);
+	writel(snoop | 0x3u, cci + CCI_MP2_SNOOP);
+	for (i = 0; i < 2000 && (readl(cci + CCI_STATUS) & 1u); i++)
+		udelay(1);
+	P("  CCI enabled: MP2 snoop=%08x STATUS=%08x STA1=%08x wait=%d us",
+	  readl(cci + CCI_MP2_SNOOP), readl(cci + CCI_STATUS),
+	  readl(infracfg + TOPAXI_PROTECTEN_STA1), i);
+}
+
+static void ringwatch_power_core(void)
+{
+	void __iomem *r;
+	u32 bit;
+	int i;
+
+	if (!power_core_from_watcher)
+		return;
+	r = spm + MP2_CPU0_PWR_CON + (cpu_target - 8) * 4;
+	bit = BIT(15 - cpu_target);
+	P("==== watcher core intervention: cpu%d PWR_CON=%08x STATUS=%08x STA1=%08x ====",
+	  cpu_target, readl(r), readl(spm + CPU_PWR_STATUS),
+	  readl(infracfg + TOPAXI_PROTECTEN_STA1));
+	writel(readl(r) | PWR_ON, r);
+	for (i = 0; i < 2000 && !(readl(spm + CPU_PWR_STATUS) & bit); i++)
+		udelay(1);
+	P("  core PWR_ON: PWR_CON=%08x STATUS=%08x STA1=%08x wait=%d us",
+	  readl(r), readl(spm + CPU_PWR_STATUS),
+	  readl(infracfg + TOPAXI_PROTECTEN_STA1), i);
+
+	writel(readl(r) | PWR_ON_2ND, r);
+	for (i = 0; i < 2000 && !(readl(spm + CPU_PWR_STATUS_2ND) & bit); i++)
+		udelay(1);
+	writel(readl(r) & ~BIT(9), r); /* PD_SLPB_CLAMP */
+	writel(readl(r) & ~SRAM_PDN, r);
+	for (i = 0; i < 2000 && (readl(r) & SRAM_PDN_ACK); i++)
+		udelay(1);
+	writel(readl(r) | SRAM_SLEEP_B, r);
+	writel(readl(r) | SRAM_ISOINT_B, r);
+	writel(readl(r) & ~PWR_ISO, r);
+	udelay(1);
+	writel(readl(r) & ~SRAM_CKISO, r);
+	writel(readl(r) & ~PWR_CLK_DIS, r);
+	writel(readl(r) | PWR_RST_B, r);
+	udelay(10);
+	P("  core full release: PWR_CON=%08x STATUS=%08x/%08x STA1=%08x",
+	  readl(r), readl(spm + CPU_PWR_STATUS),
+	  readl(spm + CPU_PWR_STATUS_2ND),
+	  readl(infracfg + TOPAXI_PROTECTEN_STA1));
+}
+
+static void ringwatch_probe_axi(void)
+{
+	u32 a20c, a22c;
+
+	if (!probe_axi_from_watcher)
+		return;
+	/*
+	 * MISCDBG (0x1022220c) and MP2_AXI_CONFIG (0x1022222c) live in MCUCFG,
+	 * which is secure: non-secure reads return 0 (or all-ones) and
+	 * non-secure writes are dropped. The first version of this probe used
+	 * plain readl/writel, so its "1022220c=00000000" was the bus answering,
+	 * not the register — and its own `!= 0xffffffff` guard then skipped the
+	 * 0x22c write entirely. It has therefore never performed the operation
+	 * it claims to. Go through ATF's guarded accessors instead.
+	 *
+	 * The bits come from ATF's own power_off_cl3 (freedomtan/atf-1.0-x20,
+	 * plat/mt6797/power.c), which quiesces the interface with
+	 *	MISCDBG |= (1<<0) | (1<<4);
+	 * before engaging protection. Its power_on_cl3 only ever clears bit 0,
+	 * and only *after* the protection release it is stuck on — so if bit 4
+	 * latched at power-down, nothing in the shipping firmware clears it.
+	 *
+	 * The watcher may NOT do that itself: the secure accessors are SMCs,
+	 * and issuing one while a core is parked at EL3 is how the watcher
+	 * joins it (lab rule 1.1/2.7). So the real operation lives in
+	 * clear_miscdbg_pre_smc() below, which runs before CPU_ON. All the
+	 * watcher does here is report the non-secure view for continuity.
+	 */
+	a20c = readl(mp2cfg + 0x20c);
+	a22c = readl(mp2cfg + 0x22c);
+	P("==== watcher AXI probe (non-secure view only): 1022220c=%08x 1022222c=%08x STA1=%08x ====",
+	  a20c, a22c, readl(infracfg + TOPAXI_PROTECTEN_STA1));
+}
+
+/*
+ * Clear MISCDBG's AXI quiesce bits before handing the cluster to ATF.
+ *
+ * ATF's power_off_cl3 sets MISCDBG (MCUCFG+0x220c) bits 0 and 4 to quiesce
+ * MP2's interface, then engages INFRA_TOPAXI_PROTECTEN1 bits 2/6/10 and waits
+ * for PROTEXTSTA3 to report all three. Its power_on_cl3 releases the
+ * protection FIRST and only then clears bit 0 — and never clears bit 4 at all.
+ * Poll 5 is exactly that protection release, so if either quiesce bit is still
+ * latched from whoever powered MP2 down at boot, ATF is asking the fabric to
+ * bring up a port it has itself told to stay idle, and it will wait forever.
+ *
+ * Doing it here rather than in the watcher is mandatory: these are secure
+ * accessors, i.e. SMCs, and the watcher must never issue one (lab rule 2.7).
+ */
+/*
+ * A diagnostic that runs ON the A72, during its own hotplug bring-up.
+ *
+ * cpu8 comes online, prints from its own core, and then hard-locks with zero
+ * hardirqs, zero softirqs and zero cputime — it goes idle and never wakes. The
+ * two candidate explanations are (a) its architected counter is not running,
+ * so the timer comparator never fires, or (b) it is not receiving interrupts
+ * at all. Reading CNTVCT twice from the core itself separates them, and this
+ * is the only place code of ours can run there before it idles.
+ */
+static u64 a72_diag[6];
+static u64 a72_gic[6];
+static int a72_diag_done;
+static int a72_diag_state = -1;
+
+static int a72_diag_online(unsigned int cpu)
+{
+	if (cpu != (unsigned int)cpu_target)
+		return 0;
+
+	a72_diag[0] = read_sysreg(midr_el1);
+	a72_diag[1] = read_sysreg(cntfrq_el0);
+	a72_diag[2] = read_sysreg(cntvct_el0);
+	udelay(200);
+	a72_diag[3] = read_sysreg(cntvct_el0);
+	a72_diag[4] = read_sysreg(cntkctl_el1);
+	a72_diag[5] = read_sysreg(cntv_ctl_el0);
+	/*
+	 * The counter is fine, so the core is not waking because it is not
+	 * being interrupted. These are the GICv3 CPU-interface system
+	 * registers: if SRE is clear the interface is not even in system-register
+	 * mode; if IGRPEN1 is clear group-1 IRQs are off; if PMR is 0 everything
+	 * is masked. gic_cpu_init() runs at CPUHP_AP_*_STARTING, i.e. before this
+	 * callback, so all three should already be set the same as on an A53.
+	 */
+	a72_gic[0] = read_sysreg_s(SYS_ICC_SRE_EL1);
+	a72_gic[1] = read_sysreg_s(SYS_ICC_IGRPEN1_EL1);
+	a72_gic[2] = read_sysreg_s(SYS_ICC_PMR_EL1);
+	a72_gic[3] = read_sysreg_s(SYS_ICC_CTLR_EL1);
+	a72_gic[4] = read_sysreg(daif);
+	a72_gic[5] = read_sysreg_s(SYS_ICC_BPR1_EL1);
+
+	/*
+	 * Does this core survive a broadcast TLB invalidate?
+	 *
+	 * The A72 does not merely stop taking interrupts — it stops executing.
+	 * The kernel's cluster-2 idle-poll heartbeat freezes mid-count while the
+	 * core is still powered (MP2_CPU0_PWR_CON keeps PWR_ON) and is NOT in
+	 * WFI (SPM_CPU_IDLE_STA2 bit 20 clear). A core that halts in that state
+	 * is stalled on something the interconnect never completes, and the
+	 * commonest such thing is `tlbi ...is` + `dsb ish`: the DSB cannot
+	 * retire until every DVM participant acknowledges. That also explains
+	 * why a tight cpu_relax() spinner survived for minutes — it issues no
+	 * TLBIs — while anything doing real work did not.
+	 *
+	 * Local first, then inner-shareable, with a print between them, so the
+	 * netconsole line that is missing names the one that hung.
+	 */
+	P("  a72 self-test: local TLBI…");
+	asm volatile("tlbi vmalle1\n dsb nsh\n isb" ::: "memory");
+	P("  a72 self-test: local TLBI returned. broadcast TLBI (dsb ish)…");
+	asm volatile("tlbi vmalle1is\n dsb ish\n isb" ::: "memory");
+	P("  a72 self-test: broadcast TLBI returned. bare dsb ish…");
+	asm volatile("dsb ish" ::: "memory");
+	P("  a72 self-test: ALL PASSED — DVM/coherency is not the stall");
+
+	/*
+	 * Can this core use memory beyond its L1?
+	 *
+	 * After ATF's own power-on, MP2_CPUSYS_PWR_CON reads 0x00010127: PWR_ISO,
+	 * SRAM_CKISO and SRAM_PDN all still asserted, PWR_ON_2ND and SRAM_ISOINT_B
+	 * absent, SRAM_PDN_ACK and SRAM_SLEEP_B_ACK never set — against a live A53
+	 * cluster's 0x0009004d. That is the register picture of a cluster whose
+	 * SRAM is powered down and isolated. A core in that state can still run
+	 * indefinitely out of L1, which is exactly what the idle poll loop and the
+	 * cpu_relax() spinner are, and would stall the moment it needs L2.
+	 *
+	 * 256 KB is four times this A72's 32 KB L1-D, so every pass must miss into
+	 * L2. If the core never returns from here, the SRAM is the answer.
+	 */
+	{
+		static u8 sweep[256 * 1024] __aligned(64);
+		volatile u64 acc = 0;
+		int pass, off;
+
+		P("  a72 self-test: sweeping 256 KB (4x L1-D) to force L2 traffic…");
+		for (pass = 0; pass < 8; pass++)
+			for (off = 0; off < sizeof(sweep); off += 64)
+				acc += READ_ONCE(sweep[off]);
+		P("  a72 self-test: 256 KB sweep x8 RETURNED (acc=%llu) — L2 works",
+		  (unsigned long long)acc);
+	}
+
+	a72_diag_done = 1;
+	return 0;
+}
+
+/*
+ * Compare the target A72's GIC redistributor frame against a working A53's.
+ *
+ * The CPU interface on cpu8 reads back exactly like an A53's (SRE=1,
+ * IGRPEN1=1, PMR=0xf0, DAIF=0) and its architected counter runs, yet it takes
+ * zero interrupts. That leaves the redistributor: GICR_WAKER.ProcessorSleep
+ * still set, or the PPI never enabled in this frame. GICR stride is 0x20000
+ * (RD frame + SGI frame), so cpu N is at 0x19200000 + N * 0x20000 — which is
+ * where the kernel said it found cpu8: 0x19300000.
+ */
+#define GICR_BASE_PHYS		0x19200000u
+#define GICR_STRIDE		0x20000u
+#define GICR_CTLR		0x0000
+#define GICR_TYPER		0x0008
+#define GICR_WAKER		0x0014
+#define GICR_SGI_OFF		0x10000
+#define GICR_IGROUPR0		(GICR_SGI_OFF + 0x0080)
+#define GICR_ISENABLER0		(GICR_SGI_OFF + 0x0100)
+
+static void gicr_dump(unsigned int cpu)
+{
+	void __iomem *r = ioremap(GICR_BASE_PHYS + cpu * GICR_STRIDE, GICR_STRIDE);
+
+	if (!r) {
+		P("    cpu%u redistributor: ioremap failed", cpu);
+		return;
+	}
+	P("    cpu%u GICR @%08x: CTLR=%08x TYPER=%08x_%08x WAKER=%08x "
+	  "IGROUPR0=%08x ISENABLER0=%08x", cpu,
+	  GICR_BASE_PHYS + cpu * GICR_STRIDE,
+	  readl(r + GICR_CTLR), readl(r + GICR_TYPER + 4), readl(r + GICR_TYPER),
+	  readl(r + GICR_WAKER), readl(r + GICR_IGROUPR0),
+	  readl(r + GICR_ISENABLER0));
+	if (readl(r + GICR_WAKER) & BIT(2))
+		P("      *** ProcessorSleep still SET on cpu%u — the "
+		  "redistributor was never woken, so nothing is delivered ***", cpu);
+	iounmap(r);
+}
+
+/*
+ * Does the A72 take an interrupt at all?
+ *
+ * Everything static checks out — counter running, timer PPI enabled in its
+ * redistributor, redistributor awake, CPU interface in system-register mode
+ * with IRQs unmasked — and yet the core records zero hardirqs and hard-locks
+ * as soon as it idles. An IPI is the smallest possible test of delivery.
+ *
+ * It must be the non-waiting form: if the target never runs the callback, a
+ * waiting smp_call would hang this CPU too, and that is precisely the cascade
+ * lab rule 1.1 exists to prevent.
+ */
+static atomic_t a72_ipi_seen = ATOMIC_INIT(0);
+
+static void a72_ipi_fn(void *unused)
+{
+	atomic_set(&a72_ipi_seen, 1);
+}
+
+static void a72_ipi_test(void)
+{
+	int i;
+
+	atomic_set(&a72_ipi_seen, 0);
+	P("  --- IPI delivery test: pinging cpu%d (non-waiting) ---", cpu_target);
+	smp_call_function_single(cpu_target, a72_ipi_fn, NULL, 0);
+	for (i = 0; i < 200; i++) {
+		if (atomic_read(&a72_ipi_seen)) {
+			P("    *** cpu%d ANSWERED the IPI after %d ms — interrupt "
+			  "delivery works ***", cpu_target, i);
+			return;
+		}
+		mdelay(1);
+	}
+	P("    cpu%d did NOT answer an IPI in 200 ms — it is online but "
+	  "receives no interrupts", cpu_target);
+}
+
+/*
+ * Keep the A72 out of WFI, and prove it does real work.
+ *
+ * cpu8 answers an IPI 1 ms after coming online and then dies within ~10 s,
+ * recording zero hardirqs and zero cputime. It works until it idles. ATF's own
+ * power_off_cl3 waits on `SPM_CPU_IDLE_STA2 bit 20` — "Wait CL3's WFI" — so the
+ * SPM is watching MP2's WFI signal; if nothing has told the power controller
+ * that cluster 2 is live, the first WFI completes a power-down it still
+ * believes is pending. A bound spinner never executes WFI, so if the core
+ * survives while it runs, that is the mechanism.
+ */
+/*
+ * A SCHED_IDLE spinner is `idle=poll`, restricted to one CPU and done from a
+ * module instead of the command line — which we cannot change without a flash.
+ *
+ * The A72 is fully functional right up to the moment it executes WFI, and it
+ * cannot be woken from there even though it stays powered and clocked. At the
+ * lowest scheduling class the spinner is preempted by any real work, so the
+ * core behaves as a normal CPU; it only runs when the core would otherwise
+ * have idled, and stops it reaching WFI.
+ */
+static struct task_struct *a72_keepalive;
+static int stay_loaded;
+
+static void a72_watch_die(void);
+
+static int a72_keepalive_fn(void *arg)
+{
+	sched_set_normal(current, 19);
+	while (!kthread_should_stop()) {
+		cpu_relax();
+		if (need_resched())
+			schedule();
+	}
+	return 0;
+}
+
+static int a72_spin_fn(void *arg)
+{
+	unsigned long end = jiffies + msecs_to_jiffies(spin_ms);
+	u64 iters = 0;
+	u64 t0 = read_sysreg(cntvct_el0), t1;
+
+	while (time_before(jiffies, end)) {
+		iters++;
+		cpu_relax();
+		if (!(iters & 0xffff)) {
+			touch_nmi_watchdog();
+			touch_softlockup_watchdog();
+		}
+	}
+	t1 = read_sysreg(cntvct_el0);
+	P("  spinner on cpu%d finished: %llu iterations in %llu counter ticks "
+	  "(%llu ms at 13 MHz)", smp_processor_id(), iters, t1 - t0,
+	  (t1 - t0) / 13000);
+	return 0;
+}
+
+static void a72_spin_test(void)
+{
+	struct task_struct *t;
+
+	if (spin_ms < 0) {
+		a72_keepalive = kthread_create(a72_keepalive_fn, NULL,
+					       "a72-keepalive/%d", cpu_target);
+		if (IS_ERR(a72_keepalive)) {
+			P("    could not create the keepalive thread (%ld)",
+			  PTR_ERR(a72_keepalive));
+			a72_keepalive = NULL;
+			return;
+		}
+		kthread_bind(a72_keepalive, cpu_target);
+		wake_up_process(a72_keepalive);
+		P("  --- permanent SCHED_IDLE keepalive pinned to cpu%d ---",
+		  cpu_target);
+		P("    the module stays loaded; rmmod gemini_a72_psci stops it "
+		  "and cpu%d will wedge on its next idle", cpu_target);
+		msleep(2000);
+		P("    cpu%d online=%d after 2 s of keepalive", cpu_target,
+		  cpu_online(cpu_target));
+		return;
+	}
+	if (spin_ms == 0)
+		return;
+	P("  --- pinning a spinner to cpu%d for %d ms (no WFI while it runs) ---",
+	  cpu_target, spin_ms);
+	t = kthread_create(a72_spin_fn, NULL, "a72-spin");
+	if (IS_ERR(t)) {
+		P("    could not create the spinner (%ld)", PTR_ERR(t));
+		return;
+	}
+	kthread_bind(t, cpu_target);
+	wake_up_process(t);
+	msleep(spin_ms + 500);
+	P("    spinner window over; cpu%d online=%d", cpu_target,
+	  cpu_online(cpu_target));
+
+}
+
+static void a72_watch_die(void)
+{
+	/*
+	 * Watch it die, with enough resolution to say *when*.
+	 *
+	 * SPM_CPU_IDLE_STA2 bit 20 is MP2's WFI status — the bit ATF's own
+	 * power_off_cl3 spins on ("Wait CL3's WFI"). That makes it a direct
+	 * test of whether the cluster-2 poll-idle patch in arch_cpu_idle() is
+	 * doing anything: a polling core never executes WFI, so bit 20 must
+	 * stay CLEAR. If it is set, the patch is not on the path being taken
+	 * and the builds that carried it tested nothing.
+	 *
+	 * The IPI probe is non-waiting, so a core that has stopped answering
+	 * cannot hang the sampler; the first sample that fails timestamps the
+	 * death to within 500 ms.
+	 */
+	{
+		int k;
+		u64 prev = 0;
+		int frozen = 0;
+
+		P("  --- watching cpu%d: poll heartbeat every 100 ms ---",
+		  cpu_target);
+		for (k = 0; k < 200; k++) {
+			u32 s2;
+			int answered;
+
+			/*
+			 * No IPI in the loop. smp_call_function_single() takes a
+			 * per-CPU csd even in its non-waiting form, and a second call
+			 * to a CPU that never dequeued the first one blocks the
+			 * *caller* — which is why every previous run of this probe
+			 * produced exactly one sample. polls and irqs are plain
+			 * memory reads and cannot hang anything.
+			 */
+			answered = -1;
+			msleep(50);
+			s2 = readl(spm + CPU_IDLE_STA2);
+			/*
+			 * polls  = the kernel's cluster-2 idle-poll heartbeat. If it
+			 *          climbs, the core is executing and merely deaf; if it
+			 *          stops, the core itself has stopped.
+			 * irqs   = every interrupt the core has taken.
+			 */
+			{
+				/*
+				 * The kernel's idle-poll heartbeat is gone now
+				 * that cluster 2 idles normally; track the
+				 * interrupt count instead, which is the thing
+				 * that actually stopped when the core died.
+				 */
+				u64 now = kstat_cpu_irqs_sum(cpu_target);
+
+				/*
+				 * Only print while it is still moving, then the
+				 * moment it stops, then stop printing. A wall
+				 * of identical lines is what buried the last
+				 * three runs.
+				 */
+				if (now != prev) {
+					P("   +%3d ms irqs=%llu (+%llu) "
+					  "wfi=%u PWR_CON=%08x", k * 100, now,
+					  now - prev,
+					  !!(s2 & BIT(20)),
+					  readl(spm + MP2_CPU0_PWR_CON +
+						((cpu_target - 8) * 4)));
+					prev = now;
+					frozen = 0;
+				} else if (++frozen == 3) {
+					P("   *** FROZEN at +%d ms: irqs stuck "
+					  "at %llu, wfi=%u, PWR_CON=%08x ***",
+					  k * 100, now,
+					  !!(s2 & BIT(20)),
+					  readl(spm + MP2_CPU0_PWR_CON +
+						((cpu_target - 8) * 4)));
+					vproc2_report("at the freeze");
+				}
+			}
+			msleep(50);
+		}
+	}
+
+	/*
+	 * Now let it idle, and look at what the hardware did to it.
+	 *
+	 * If MP2_CPU0_PWR_CON loses PWR_ON, or its SPMC leaves FSM_ON, then WFI
+	 * caused a power-down and the core is simply gone. If the registers are
+	 * unchanged but it still will not answer an IPI, the core is parked in a
+	 * state it cannot be woken from. If it *does* answer, then WFI is fine
+	 * and only the timer never fires.
+	 */
+	P("  --- letting cpu%d idle for 3 s, then probing it ---", cpu_target);
+	msleep(3000);
+	P("    MP2_CPU%d_PWR_CON=%08x CPU_PWR_STATUS=%08x/%08x coreSPMC=%08x MP2=%08x",
+	  cpu_target - 8,
+	  readl(spm + MP2_CPU0_PWR_CON + ((cpu_target - 8) * 4)),
+	  readl(spm + CPU_PWR_STATUS), readl(spm + CPU_PWR_STATUS_2ND),
+	  sread(0x10222430u + ((cpu_target - 8) * 4)),
+	  readl(spm + MP2_CPUSYS_PWR_CON));
+	/*
+	 * And what is its clock doing while it sleeps? ATF is long finished, so
+	 * CLK26CALI is ours again. If source 37 has fallen back to 26 MHz or
+	 * zero, something took the cluster clock away the moment the core
+	 * stopped executing, and no interrupt can wake a core with no clock.
+	 */
+	armpll2_report("while cpu is idle");
+	meter_report("while cpu is idle");
+	P("  --- IPI test again, this time while cpu%d is IDLE ---", cpu_target);
+	a72_ipi_test();
+}
+
+/*
+ * cpuhvfs_notify_cluster_on(CPU_CLUSTER_B), transcribed from the vendor's
+ * mt_cpufreq_hybrid.c: require SW_PAUSE set at entry, then clear it and set
+ * CLUSTER_EN, mirroring into CSRAM. Android does this immediately after the
+ * kernel's CPU_ON returns; we have never done it, and it is the only step of
+ * the vendor's big-core online path still missing.
+ */
+static void a72_cspm_cluster_on(void)
+{
+	u32 b;
+
+	if (!cspm_cluster_on_after)
+		return;
+
+	b = readl(cspm + CSPM_SW_RSV2);
+	P("  --- cpuhvfs_notify_cluster_on(B): SW_RSV2 = %08x ---", b);
+	if (!(b & CPUHVFS_SW_PAUSE)) {
+		P("    REFUSING: vendor requires SW_PAUSE set at entry "
+		  "(is the PCM running with B parked?)");
+		return;
+	}
 	writel(0, csram + CSRAM_PAUSE_SRC);
-	b = readl(cspm + CSPM_SW_RSV2) & ~CPUHVFS_SW_PAUSE;
+	b = (b | CPUHVFS_CLUSTER_EN) & ~CPUHVFS_SW_PAUSE;
 	writel(b, cspm + CSPM_SW_RSV2);
 	writel(b, csram + CSRAM_SW_RSV2);
-	P("  B unpaused at ATF bus stage: SW_RSV2=%08x", b);
+	udelay(200);
+	P("    -> SW_RSV2 = %08x  MP2=%08x  (Android's online value is 0x56f0)",
+	  readl(cspm + CSPM_SW_RSV2), readl(spm + MP2_CPUSYS_PWR_CON));
+}
+
+/*
+ * Undo ATF's per-core SPARK retention enable.
+ *
+ * After powering the core, ATF calls big_spark2_setldo() and then
+ * big_spark2_core(core, 1), which is just bit 0 of that core's SPMC register
+ * (ATF's own log: "Write 10222430 = bb0101"). SPARK is the per-core retention
+ * LDO: with it armed, a WFI can drop the core into retention at a reduced
+ * voltage, and the exit from that state is managed by CPUHVFS on Android. The
+ * A53s use the same mechanism and are fine, but nothing on our side manages it
+ * for cluster 2 — and cluster 2's core dies exactly when it first idles.
+ */
+static void a72_disable_spark(void)
+{
+	u32 reg = 0x10222430u + ((cpu_target - 8) * 4);
+	u32 v;
+
+	if (!disable_big_spark)
+		return;
+	v = sread(reg);
+	P("  --- disabling SPARK retention: %08x = %08x -> %08x ---",
+	  reg, v, v & ~1u);
+	swrite(reg, v & ~1u);
+	udelay(10);
+	P("    readback %08x", sread(reg));
+}
+
+static void a72_diag_report(void)
+{
+	if (!a72_diag_done) {
+		P("  A72 self-diagnostic did NOT run (callback never fired)");
+		return;
+	}
+	P("  --- read ON cpu%d, by itself, during bring-up ---", cpu_target);
+	P("    MIDR_EL1   = %016llx", a72_diag[0]);
+	P("    CNTFRQ_EL0 = %llu Hz", a72_diag[1]);
+	P("    CNTVCT_EL0 = %llu then %llu after 200 us  -> delta %lld",
+	  a72_diag[2], a72_diag[3], (long long)(a72_diag[3] - a72_diag[2]));
+	P("    %s", a72_diag[3] == a72_diag[2] ?
+	  "*** THE ARCHITECTED COUNTER IS STOPPED ON THIS CORE ***" :
+	  "counter is running — so the timer comparator can fire; suspect the GIC");
+	P("    CNTKCTL_EL1 = %016llx  CNTV_CTL_EL0 = %016llx",
+	  a72_diag[4], a72_diag[5]);
+	P("    ICC_SRE_EL1=%llx IGRPEN1=%llx PMR=%llx CTLR=%llx BPR1=%llx DAIF=%llx",
+	  a72_gic[0], a72_gic[1], a72_gic[2], a72_gic[3], a72_gic[5], a72_gic[4]);
+	if (!(a72_gic[0] & 1))
+		P("    *** ICC_SRE_EL1.SRE is CLEAR — the CPU interface is not in "
+		  "system-register mode; EL3 never enabled it for this core ***");
+	else if (!(a72_gic[1] & 1))
+		P("    *** ICC_IGRPEN1_EL1 is CLEAR — group-1 IRQs disabled ***");
+	else if (a72_gic[2] == 0)
+		P("    *** ICC_PMR_EL1 is 0 — every priority is masked ***");
+	else
+		P("    CPU interface looks correctly configured; the redistributor "
+		  "or the distributor routing is the remaining suspect");
+
+	P("  --- GIC redistributor frames (A53 reference vs the A72) ---");
+	gicr_dump(0);
+	gicr_dump(4);
+	gicr_dump(cpu_target);
+	a72_ipi_test();
+	a72_disable_spark();
+	a72_cspm_cluster_on();
+	a72_spin_test();
+	a72_watch_die();
+}
+
+static void clear_miscdbg_pre_smc(void)
+{
+	u32 a20c, a22c;
+
+	if (!clear_miscdbg)
+		return;
+
+	a20c = sread(0x1022220cu);
+	a22c = sread(0x1022222cu);
+	P("  pre-SMC MISCDBG (secure): 1022220c=%08x 1022222c=%08x STA1=%08x",
+	  a20c, a22c, readl(infracfg + TOPAXI_PROTECTEN_STA1));
+
+	if (a20c & 0x11u) {
+		swrite(0x1022220cu, a20c & ~0x11u);
+		udelay(10);
+		P("    MISCDBG &= ~0x11 -> %08x  STA1=%08x", sread(0x1022220cu),
+		  readl(infracfg + TOPAXI_PROTECTEN_STA1));
+	} else {
+		P("    MISCDBG quiesce bits already clear — nothing to undo");
+	}
+
+	if (clear_miscdbg > 1 && (a22c & 0x11u) && a22c != 0xffffffffu) {
+		swrite(0x1022222cu, a22c & ~0x11u);
+		udelay(10);
+		P("    MP2_AXI_CONFIG &= ~0x11 -> %08x  STA1=%08x",
+		  sread(0x1022222cu), readl(infracfg + TOPAXI_PROTECTEN_STA1));
+	}
+}
+
+/*
+ * MP2's sync DCM, from the vendor's mt_dcm.c:dcm_mcusys_mp2_sync_dcm().
+ *
+ * `0x10222274` bit 0 enables clock gating on MP2's sync (bus) clock; bit 1 is
+ * a toggle the vendor pulses to make the new setting take, and bits [6:2] are
+ * a divider select. The vendor kernel disables this DCM from cpu_psci_cpu_die()
+ * when the last big core leaves, and only re-enables it *after* CPU_ON returns
+ * (psci.c:597 and :808). So throughout ATF's power_on_cl3 — including poll 5 —
+ * Android is running with MP2's sync DCM OFF, i.e. the bus clock ungated.
+ *
+ * We have never touched it, so ours is in whatever state boot left it. Poll 5
+ * waits for the fabric to power MP2's port up, and that handshake is clocked;
+ * a gated clock is a sufficient explanation for an ack that never arrives.
+ */
+#define MCUCFG_SYNC_DCM_MP2	0x10222274u
+#define SYNC_DCM_MP2_MASK	0x7fu		/* bit0 en, bit1 tog, [6:2] div */
+
+static void set_mp2_sync_dcm_pre_smc(void)
+{
+	u32 v;
+
+	if (mp2_sync_dcm < 0)
+		return;
+
+	v = sread(MCUCFG_SYNC_DCM_MP2);
+	P("  pre-SMC MP2 sync DCM: 0x10222274 = %08x (bit0 gating=%u)",
+	  v, v & 1u);
+
+	/* Vendor writes the value twice, with TOG set then clear. */
+	if (mp2_sync_dcm == 0) {
+		swrite(MCUCFG_SYNC_DCM_MP2, (v & ~SYNC_DCM_MP2_MASK) | 0x2u);
+		swrite(MCUCFG_SYNC_DCM_MP2, (v & ~SYNC_DCM_MP2_MASK) | 0x0u);
+	} else {
+		swrite(MCUCFG_SYNC_DCM_MP2, (v & ~SYNC_DCM_MP2_MASK) | 0x0fu);
+		swrite(MCUCFG_SYNC_DCM_MP2, (v & ~SYNC_DCM_MP2_MASK) | 0x0du);
+	}
+	udelay(10);
+	P("    -> %08x  STA1=%08x", sread(MCUCFG_SYNC_DCM_MP2),
+	  readl(infracfg + TOPAXI_PROTECTEN_STA1));
 }
 
 static void ringwatch_stop_pcm(void)
@@ -1302,6 +2389,8 @@ static void ringwatch_stop_pcm(void)
 	  readl(mcumixed + ARMPLLDIV_MUXSEL),
 	  readl(mcumixed + ARMPLLDIV_CKDIV),
 	  readl(infracfg + TOPAXI_PROTECTEN_STA1));
+	if (armpll2_khz)
+		armpll2_set(armpll2_khz);
 }
 
 static int ringwatch_fn(void *unused)
@@ -1312,7 +2401,9 @@ static int ringwatch_fn(void *unused)
 	complete(&ringwatch_started);
 	for (n = 0; n < 120 && !kthread_should_stop(); n++) {
 		if (n == 0 && (force_clock_from_watcher || stop_pcm_from_watcher ||
-			       release_mp2_sram_from_watcher || handoff_b_pcm_from_watcher))
+			       release_mp2_sram_from_watcher || handoff_b_pcm_from_watcher ||
+			       enable_cci_from_watcher || power_core_from_watcher ||
+			       probe_axi_from_watcher))
 			msleep(1000);
 		else
 			ssleep(5);
@@ -1324,9 +2415,12 @@ static int ringwatch_fn(void *unused)
 		 */
 		if (n == 0) {
 			ringwatch_handoff_b_pcm();
+			ringwatch_enable_cci();
 			ringwatch_stop_pcm();
 			ringwatch_force_clock();
 			ringwatch_release_mp2_sram();
+			ringwatch_power_core();
+			ringwatch_probe_axi();
 		}
 		atf_ring_dump("watch");
 		spm_report("watch");
@@ -1494,6 +2588,45 @@ static void raw_cpu_on(int cpu)
 	spm_report("immediately before CPU_ON");
 	atf_assertions_hold();
 	armpll2_report("immediately before CPU_ON");
+	if (handoff_b_pcm_from_watcher) {
+		u32 b = readl(cspm + CSPM_SW_RSV2);
+		bool already_paused = !!(b & CPUHVFS_SW_PAUSE);
+
+		P("  pre-SMC CPUHVFS handoff: disabling+pausing B, SW_RSV2=%08x", b);
+		if (!(b & CPUHVFS_CLUSTER_EN)) {
+			P("  REFUSING CPU_ON: handoff requires B CLUSTER_EN");
+			return;
+		}
+		b = (b | CPUHVFS_SW_PAUSE) & ~CPUHVFS_CLUSTER_EN;
+		writel(b, cspm + CSPM_SW_RSV2);
+		writel(b, csram + CSRAM_SW_RSV2);
+		if (!already_paused) {
+			udelay(10); /* vendor: skip FW_DONE 1->0 transition */
+			for (b = 0; b < 2000; b++) {
+				if ((readl(cspm + CSPM_HWSTA_LL) & CPUHVFS_FW_DONE) &&
+				    (readl(cspm + CSPM_HWSTA_L) & CPUHVFS_FW_DONE) &&
+				    (readl(cspm + CSPM_HWSTA_B) & CPUHVFS_FW_DONE))
+					break;
+				udelay(10);
+			}
+			P("  pre-SMC pause FW_DONE wait=%u us HWSTA=%08x/%08x/%08x",
+			  b * 10, readl(cspm + CSPM_HWSTA_LL),
+			  readl(cspm + CSPM_HWSTA_L), readl(cspm + CSPM_HWSTA_B));
+			if (b == 2000) {
+				P("  REFUSING CPU_ON: CPUHVFS did not complete its pause");
+				return;
+			}
+		} else {
+			P("  B was already paused; no in-flight transition to drain");
+		}
+		writel((readl(cspm + CSPM_SW_RSV0) & CPUHVFS_SW_PAUSE) ? BIT(0) : 0,
+		       csram + CSRAM_PAUSE_SRC);
+		udelay(1000);
+		P("  pre-SMC B paused: SW_RSV2=%08x PAUSE_SRC=%08x",
+		  readl(cspm + CSPM_SW_RSV2), readl(csram + CSRAM_PAUSE_SRC));
+	}
+	clear_miscdbg_pre_smc();
+	set_mp2_sync_dcm_pre_smc();
 	ringwatch_start();
 	if (!ringwatch) {
 		P("  REFUSING CPU_ON: the in-kernel watcher is not running");
@@ -1616,7 +2749,9 @@ static int __init a72psci_init(void)
 	csram = ioremap(0x0012a000, 0x1000);
 	infracfg = ioremap(INFRACFG_PHYS, 0x1000);
 	cci = ioremap(CCI_PHYS, 0x10000);
-	if (!spm || !mcumixed || !topckgen || !cspm || !csram || !infracfg || !cci) {
+	mp2cfg = ioremap(0x10222000, 0x1000);
+	if (!spm || !mcumixed || !topckgen || !cspm || !csram || !infracfg || !cci ||
+	    !mp2cfg) {
 		P("ioremap failed");
 		goto out;
 	}
@@ -1646,6 +2781,11 @@ static int __init a72psci_init(void)
 	 */
 	if (stage < 2)
 		goto out;
+
+	if (!spmc_software_top_on()) {
+		P("  software SPMC TOP sequence failed — refusing further action");
+		goto out;
+	}
 
 	if (skip_cputop) {
 		P("==== skip_cputop: leaving the CPUTOP for ATF ====");
@@ -1678,7 +2818,7 @@ static int __init a72psci_init(void)
 		goto out;
 	}
 
-	if (stage == 3) {
+	if (stage == 3 || stage == 6) {
 		/*
 		 * Refuse to fire when the module has already proved ATF cannot
 		 * succeed. Both of these are cheap and both are irreversible if
@@ -1766,6 +2906,144 @@ static int __init a72psci_init(void)
 
 		cspm_sema_report_and_free();
 		bus_report("before CPU_ON");
+
+		if (stage == 6) {
+			/*
+			 * Stage 3 proves the cluster can be powered and that an A72
+			 * executes, but it fires a bare SMC at a park stub, so the
+			 * core never becomes a Linux CPU. Stage 6 runs the identical
+			 * gate and then hands straight to the kernel's own hotplug,
+			 * which issues CPU_ON with __pa(secondary_entry) and does all
+			 * the bring-up bookkeeping.
+			 *
+			 * It has to be add_cpu() from in here rather than an `echo`
+			 * afterwards, because the frequency gate is passed by priming
+			 * ATF's one-sample-lagged abist meter: the latched count is
+			 * consumed by the very next CLK26CALI read, so nothing may
+			 * come between the priming and the SMC.
+			 *
+			 * cpu_up() takes the hotplug locks and IPIs everybody, so if
+			 * ATF spins at EL3 inside it the whole machine goes rather
+			 * than one core. The dead-man switch is the only net.
+			 */
+			int rc;
+
+			/*
+			 * arm64 refuses a late CPU that carries a capability the
+			 * system does not have: verify_local_cpu_caps() takes the
+			 * `system_has_cap == 0 && cpu_has_cap == 1` branch and, for
+			 * ARM64_CPUCAP_LOCAL_CPU_ERRATUM (which is OPTIONAL but not
+			 * PERMITTED for late CPUs), calls cpu_die_early():
+			 *
+			 *   CPU8: Detected conflict for capability 58 (Spectre-v2),
+			 *         System: 0, CPU: 1
+			 *   CPU8: will not boot
+			 *
+			 * The A53 boot CPUs are unaffected by Spectre-v2 and by the
+			 * A57/A72 errata (1319367 speculative-AT, 1742098 AArch32
+			 * AES), so with maxcpus=8 those caps never enter the system
+			 * set and every A72 is a conflict. Marking them present makes
+			 * the check take the other branch, which also runs the cap's
+			 * cpu_enable() on the A72 — i.e. the mitigation actually gets
+			 * installed on the core that needs it.
+			 *
+			 * This is a bring-up shim, not the fix. The fix is the vendor
+			 * arrangement: a platform hook that runs these prerequisites
+			 * from cpu_psci_cpu_boot() so cpu8/9 come up during boot with
+			 * maxcpus removed, and their caps fold into the system set
+			 * before it is finalised. That needs a kernel flash.
+			 */
+			if (late_caps && *late_caps) {
+				char *p = late_caps, *tok;
+
+				while ((tok = strsep(&p, ",")) != NULL) {
+					int cap;
+
+					if (!*tok || kstrtoint(tok, 0, &cap))
+						continue;
+					if (cap < 0 || cap >= ARM64_NCAPS) {
+						P("  REFUSING cap %d: out of range", cap);
+						continue;
+					}
+					if (test_bit(cap, system_cpucaps)) {
+						P("  cap %d already present system-wide", cap);
+						continue;
+					}
+					set_bit(cap, system_cpucaps);
+					P("  marked cap %d present system-wide", cap);
+				}
+			}
+
+			a72_diag_state = cpuhp_setup_state_nocalls(CPUHP_AP_ONLINE_DYN,
+								   "gemini/a72:online",
+								   a72_diag_online, NULL);
+			if (a72_diag_state < 0)
+				P("  could not register the A72 self-diagnostic (%d)",
+				  a72_diag_state);
+
+			P("==== stage 6: handing cpu%d to the kernel's hotplug ====",
+			  cpu_target);
+			rc = add_cpu(cpu_target);
+			P("  *** add_cpu(%d) RETURNED %d ***", cpu_target, rc);
+			P("  cpu%d online = %d", cpu_target, cpu_online(cpu_target));
+			/*
+			 * The frequency gate was passed by priming ATF's lagged meter,
+			 * which is a deliberately false premise (§7): it only makes ATF
+			 * *believe* the clock is right. Now that ATF is finished and no
+			 * longer using CLK26CALI, measure source 37 for real. If the A72
+			 * is online but parked on 26 MHz, that — not the bring-up — is
+			 * why it stops answering IPIs and why a workqueue pool on it
+			 * reports "stuck for 88s".
+			 */
+			a72_diag_report();
+			if (a72_keepalive)
+				stay_loaded = 1;
+
+			/*
+			 * The second core of the cluster. ATF's power_on_big() skips
+			 * power_on_cl3() once big_on is non-zero and goes straight to
+			 * this core's two unbounded polls — CPU_PWR_STATUS bit (7-idx)
+			 * and its own SPMC bit 17. One of them never acked when cpu9
+			 * was tried after cpu8, so read the SPMC at rest first: if it
+			 * is not the FSM_OFF/all-off-acked family (0x004x0100) the
+			 * attempt is already lost and hanging EL3 to find out is a
+			 * waste of a boot.
+			 */
+			if (rc == 0 && also_cpu >= 8 && also_cpu <= 9 &&
+			    also_cpu != cpu_target) {
+				u32 sp = sread(0x10222430u + ((also_cpu - 8) * 4));
+				int rc2;
+
+				P("==== second core: cpu%d ====", also_cpu);
+				P("  its SPMC at rest = %08x (FSM_STATE_OUT=%u), "
+				  "MP2_CPU%d_PWR_CON=%08x", sp, (sp >> 23) & 0x1f,
+				  also_cpu - 8,
+				  readl(spm + MP2_CPU0_PWR_CON + ((also_cpu - 8) * 4)));
+				if (((sp >> 23) & 0x1f) != 0) {
+					P("  REFUSING: its SPMC is not at rest — ATF "
+					  "would spin at EL3 on the power-good poll");
+				} else {
+					cpu_target = also_cpu;   /* for the diagnostics */
+					a72_keepalive = NULL;
+					rc2 = add_cpu(also_cpu);
+					P("  *** add_cpu(%d) RETURNED %d, online=%d ***",
+					  also_cpu, rc2, cpu_online(also_cpu));
+					if (rc2 == 0)
+						a72_spin_test();
+				}
+			}
+			if (a72_diag_state >= 0)
+				cpuhp_remove_state_nocalls(a72_diag_state);
+			if (rc == 0) {
+				armpll2_report("after add_cpu");
+				meter_report("after add_cpu — the REAL A72 clock");
+			}
+			spm_report("after add_cpu");
+			atf_ring_dump("after add_cpu");
+			bus_report("after add_cpu");
+			goto out;
+		}
+
 		if (make_mailbox_and_park()) {
 			P("could not build the instrument — refusing to fire");
 			goto out;
@@ -1798,6 +3076,20 @@ out:
 	 * (it CPU_OFFs itself, but nothing here can prove when), and handing
 	 * that memory back to the allocator would be worse than leaking it.
 	 */
+	if (stay_loaded) {
+		/*
+		 * The convention here is that this module always fails to load
+		 * (§4: "insmod reporting an error is success, read dmesg"), so
+		 * that nothing of ours is left running. A keepalive thread is
+		 * the one case that must outlive init: it is the only thing
+		 * stopping the A72 from reaching the WFI it cannot wake from.
+		 * Keep the mappings too — the thread's teardown needs none of
+		 * them, but unmapping while loaded would be gratuitous.
+		 */
+		P("==== staying loaded to keep the A72 out of WFI ====");
+		return 0;
+	}
+
 	if (spm)
 		iounmap(spm);
 	if (mcumixed)
@@ -1810,6 +3102,8 @@ out:
 		iounmap(csram);
 	if (infracfg)
 		iounmap(infracfg);
+	if (mp2cfg)
+		iounmap(mp2cfg);
 	if (cci)
 		iounmap(cci);
 	if (atf_ring)
@@ -1818,6 +3112,17 @@ out:
 	return -EAGAIN;	/* never actually stay loaded */
 }
 
+static void __exit a72psci_exit(void)
+{
+	if (a72_keepalive) {
+		P("stopping the cpu%d keepalive — it will wedge on its next idle",
+		  cpu_target);
+		kthread_stop(a72_keepalive);
+		a72_keepalive = NULL;
+	}
+}
+
 module_init(a72psci_init);
+module_exit(a72psci_exit);
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("mt6797 A72 bring-up through PSCI, with ATF's own frequency gate satisfied");

@@ -45,7 +45,7 @@ diff --git a/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts b/arch/arm64/boo
  		 * Display component instance aliases. mediatek-drm resolves an
  		 * OVL/RDMA node to its DDP_COMPONENT_* id via of_alias_get_id();
  		 * with two OVL and two RDMA instances (primary DSI vs external
-@@ -1610,6 +1647,61 @@
+@@ -1610,6 +1647,74 @@
  					regulator-min-microvolt = <3000000>;
  					regulator-max-microvolt = <3000000>;
  				};
@@ -61,7 +61,20 @@ diff --git a/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts b/arch/arm64/boo
 +				 *
 +				 *     DOVDD 1.8 V  -> vcamio
 +				 *     AVDD  2.8 V  -> vcama
-+				 *     DVDD  1.2 V  -> vcamd
++				 *     DVDD  1.2 V  -> vcamd, but see below
++				 *
++				 * DVDD is pinned to 1.21 V, not the 1.2 V the
++				 * power sequence asks for. That is what the
++				 * vendor actually programs: kd_camera_hw.c
++				 * hwpoweron() rewrites Vol_1200 to Vol_1210
++				 * before every _hwPowerOn(DVDD, ...) on all
++				 * three sockets, with the comment "vcamd:
++				 * unsupportable voltage range:
++				 * 1500000-1210000uV". The live vendor stack
++				 * agrees: Android reads vcamd back as
++				 * 1210000 uV. 1.2 V would leave this rail one
++				 * VOSEL code below every path the vendor has
++				 * ever validated.
 +				 *
 +				 * min == max at exactly those values: the
 +				 * VOSEL fields select from a small table
@@ -79,8 +92,8 @@ diff --git a/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts b/arch/arm64/boo
 +
 +				mt6351_vcamd_reg: vcamd {
 +					regulator-name = "vcamd";
-+					regulator-min-microvolt = <1200000>;
-+					regulator-max-microvolt = <1200000>;
++					regulator-min-microvolt = <1210000>;
++					regulator-max-microvolt = <1210000>;
 +				};
 +
 +				mt6351_vcamio_reg: vcamio {
@@ -107,7 +120,7 @@ diff --git a/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts b/arch/arm64/boo
  			};
  		};
  
-@@ -2553,3 +2645,151 @@
+@@ -2553,3 +2658,161 @@
  		};
  	};
  };
@@ -222,6 +235,14 @@ diff --git a/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts b/arch/arm64/boo
 +		power-domains = <&scpsys MT6797_POWER_DOMAIN_ISP>;
 +
 +		/*
++		 * smi_common and larb2 come first, in the vendor's order
++		 * (cameraisp Prepare_Enable_ccf_clock: SCP_SYS_DIS ->
++		 * DISP0_SMI_COMMON -> SCP_SYS_ISP -> ... -> CAM_LARB2 ->
++		 * CAM_CAMSYS). The ISP power domain does not bring
++		 * smi_common with it — MT6797_POWER_DOMAIN_ISP has
++		 * .clk_id = {CLK_NONE}, and MM's is the mm_sel mux — so it
++		 * has to be named here.
++		 *
 +		 * camtg is the sensor MCLK gate; camtg_sel is the topckgen
 +		 * mux feeding it. The vendor sets that mux to univpll_d26
 +		 * ("CAM_PLL_48_GROUP", 48 MHz) — kd_sensorlist.c
@@ -230,13 +251,15 @@ diff --git a/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts b/arch/arm64/boo
 +		 * block divides by two. camsys and seninf gate the register
 +		 * banks themselves.
 +		 */
-+		clocks = <&camsys CLK_CAM_CAMSYS>,
++		clocks = <&mmsys CLK_MM_SMI_COMMON>,
++			 <&camsys CLK_CAM_LARB2>,
++			 <&camsys CLK_CAM_CAMSYS>,
 +			 <&camsys CLK_CAM_SENINF>,
 +			 <&camsys CLK_CAM_CAMTG>,
 +			 <&topckgen CLK_TOP_MUX_CAMTG>,
 +			 <&topckgen CLK_TOP_UNIVPLL_D26>;
-+		clock-names = "camsys", "seninf", "camtg",
-+			      "camtg_sel", "univpll_d26";
++		clock-names = "smi_common", "larb2", "camsys", "seninf",
++			      "camtg", "camtg_sel", "univpll_d26";
 +
 +		vcama-supply = <&mt6351_vcama_reg>;
 +		vcamd-supply = <&mt6351_vcamd_reg>;

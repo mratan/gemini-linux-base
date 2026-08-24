@@ -2138,6 +2138,71 @@ is the battery or the case, not the table.
 
 ---
 
+
+---
+
+## 🟡 B-48 — the A72 cluster has no cpufreq governor: fixed clock, no idle-clocking
+
+**Opened 2026-08-24, from the A72 bring-up (worklog §9).** The big cluster runs
+at a fixed 2002 MHz (raised by `drivers/soc/mediatek/mt6797-a72.c` after the
+first core onlines; tunable 250–2600 via `/sys/kernel/mt6797_a72/freq_mhz`).
+There is no OPP table and no governor: `mtk_cpufreq_init()` returns -EINVAL for
+cpu8/9 ("dvfs info … not initialized"), so the cores cannot idle at a low clock
+and burst high the way the A53s do under schedutil. WFI gates the core clocks,
+but the cluster clock tree toggles at 2 GHz whenever anything runs there, and
+the voltage (1180 mV) never scales down toward Android's 890 mV @ 1495 MHz.
+
+**Cost**: battery. **What unblocks it**: a cluster-2 OPP table + cpufreq driver
+plumbing (proc/sram regulators exist — DA9214 BUCKB and the SRAM-LDO SIP; the
+runtime freq mechanism is proven: firmware SIP 0xC20003B8 with the cluster
+parked on the backup mux, see `mt6797_a72_retune()`). Largest remaining win of
+the A72 work. Note the interaction with B-50: a governor would also shrink the
+sustained-power exposure.
+
+---
+
+## 🟡 B-49 — late-onlined A72s run without their Spectre mitigations
+
+**Opened 2026-08-24, from the A72 bring-up (worklog §8, build #56).** The A72s
+are hotplugged after boot (i2c is not up during early SMP bring-up, so
+`maxcpus=8` stays), which makes them *late* CPUs. arm64 finalises system
+capabilities and patches alternatives from the A53 boot set; a late CPU's
+`LOCAL_CPU_ERRATUM` capabilities (Spectre-v2/v3a/v4/BHB, errata 1742098,
+1319367) can no longer be enabled — calling `cpu_enable()` that late installs
+half a mitigation and kills the core at its first EL0 exception (measured).
+Our `verify_local_cpu_caps()` patch (patches/v6.6/arm64/0001) therefore
+*permits without enabling*: cpu8/9 run unmitigated, exactly as `nospectre_v2`
+would leave them.
+
+**Cost**: Spectre-class speculation attacks are possible against/on the big
+cores. Acceptable for a personal pocket terminal; not for multi-user use.
+**What unblocks it**: bringing the A72s up before
+`setup_system_capabilities()` — which needs VPROC2 available during early SMP
+boot (pre-i2c: pin-mux the DA9214 onto a bit-banged path, or teach the
+preloader/LK to leave the rail on), or teaching the mitigation code to
+late-patch a per-CPU vector table. Both are real projects; document, don't
+drift into them casually.
+
+---
+
+## 🟡 B-50 — all ten cores flat out on battery still kills the machine (B-47, now worse)
+
+**Opened 2026-08-24.** B-47 established that eight A53s at maximum sag the
+battery 620 mV and silently kill the SoC, and that there is **no CPU thermal
+sensor** on this part. The A72 bring-up makes both sides of that worse: two
+more cores, bigger ones, at 2 GHz on their own rail (measured during this work:
+a 150 s all-ten soak hardware-reset the board with nothing in the log). The
+`gemini-cpufreq-cap` energy cap covers the A53 clusters only — nothing caps
+cluster 2 except its fixed clock choice (2002 not 2496 is deliberately part of
+this; see the mt6797-a72.c comment).
+
+**Standing rule**: never run all ten cores at maximum on battery; benchmarks
+keep parallel stages ≤4 workers and short (`scripts/gemini-bench.sh` enforces
+its own shape). **What unblocks it**: extend the energy cap to cluster 2
+(trivial once B-48 gives it cpufreq), or powered-dock detection that lifts the
+cap only on external power. Until then this is an operating constraint, not a
+bug to fix.
+
 ## 🔴 B-45 — i2c6's address phase works and its data phase does not, which is why the DA9214 "isn't there"
 
 ### UPDATE 2026-08-21 (late): both candidates are dead, and so is a third
