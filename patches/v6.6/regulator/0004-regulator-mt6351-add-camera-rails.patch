@@ -1,0 +1,222 @@
+diff --git a/drivers/regulator/Kconfig b/drivers/regulator/Kconfig
+--- a/drivers/regulator/Kconfig
++++ b/drivers/regulator/Kconfig
+@@ -856,14 +856,15 @@
+ 	  through regulator interface
+ 
+ config REGULATOR_MT6351
+-	tristate "MediaTek MT6351 PMIC (CONSYS VCN rails + msdc1 SD rails)"
++	tristate "MediaTek MT6351 PMIC (CONSYS, SD and camera rails)"
+ 	depends on MTK_PMIC_WRAP
+ 	help
+ 	  Say y here to enable the minimal MT6351 PMIC regulator driver
+ 	  covering the VCN LDOs (vcn18/vcn28/vcn33_bt/vcn33_wifi) needed by
+-	  the MT6797 CONSYS connectivity block, plus the vmch/vmc SD card
+-	  rails needed by msdc1. All other MT6351 rails are left as
+-	  configured by the bootloader.
++	  the MT6797 CONSYS connectivity block, the vmch/vmc SD card rails
++	  needed by msdc1, and the camera rails (vcama/vcamd/vcamio, plus
++	  the fixed vldo28 that supplies AFVDD). All other MT6351 rails are
++	  left as configured by the bootloader.
+ 
+ config REGULATOR_MT6357
+ 	tristate "MediaTek MT6357 PMIC"
+diff --git a/drivers/regulator/mt6351-regulator.c b/drivers/regulator/mt6351-regulator.c
+--- a/drivers/regulator/mt6351-regulator.c
++++ b/drivers/regulator/mt6351-regulator.c
+@@ -1,14 +1,18 @@
+ // SPDX-License-Identifier: GPL-2.0
+ //
+-// Minimal MT6351 PMIC regulator driver — CONSYS VCN rails only.
++// Minimal MT6351 PMIC regulator driver — the rails this board actually
++// drives: CONSYS VCN, the msdc1 SD rails, and the camera rails.
+ //
+ // The MT6351 never gained a mainline MFD/regulator driver (only its ASoC
+-// codec exists). This driver covers exactly the four VCN LDOs the MT6797
+-// CONSYS block needs (Gemini PDA bring-up); every other rail is left as
++// codec exists). This driver covers exactly the LDOs the MT6797 blocks we
++// have brought up need (Gemini PDA bring-up); every other rail is left as
+ // the bootloader configured it. Register addresses and bit positions are
+ // taken from the vendor 3.18 header
+ // drivers/misc/mediatek/include/mt-plat/mt6797/include/mach/upmu_hw.h
+-// (MT6351_LDO_VCN*_CON* / MT6351_PMIC_RG_VCN*_EN_*).
++// (MT6351_LDO_*_CON* / MT6351_PMIC_RG_*_EN_* / MT6351_PMIC_RG_*_VOSEL_*),
++// and the voltage tables from the vendor
++// drivers/misc/mediatek/power/mt6797/pmic.c (mtk_ldos[] and the
++// mt6351_*_voltages[] tables it indexes).
+ //
+ // The device sits behind the MediaTek PMIC wrapper: this platform driver
+ // binds the pwrap's "mediatek,mt6351" child node and uses the pwrap's
+@@ -30,6 +34,35 @@
+ #define MT6351_LDO_VMC_CON0		0x0aaa	/* SD I/O rail (msdc1) */
+ 
+ /*
++ * Camera rails. Enable bit is BIT(1) of each CON0, exactly as for the VCN
++ * rails (vendor upmu_hw.h: RG_VCAMA_EN / RG_VCAMD_EN / RG_VCAMIO_EN all
++ * MASK 0x1 SHIFT 1).
++ *
++ * VLDO28 is the odd one out: it has four enable banks (CON0 plus EN_0/EN_1
++ * in CON3/CON4) and no VOSEL at all — a fixed 2.8 V rail. The vendor
++ * mtk_ldos[] entry uses RG_VLDO28_EN_0, i.e. CON3 BIT(1), so that is the
++ * bank modelled here. It is the AFVDD (autofocus) supply per the vendor
++ * k97 DTS (kd_camera_hw1: vcamaf-supply = <&mt_pmic_vldo28_ldo_reg>);
++ * autofocus itself is out of scope for the camera PRD (#62) but the rail
++ * costs one table entry and two sensors in the k97 list want AFVDD in
++ * their power sequence.
++ */
++#define MT6351_LDO_VCAMA_CON0		0x0a12
++#define MT6351_LDO_VCAMD_CON0		0x0a40
++#define MT6351_LDO_VCAMIO_CON0		0x0a58
++#define MT6351_LDO_VLDO28_CON3		0x0aa2	/* RG_VLDO28_EN_0 bank */
++
++/*
++ * Camera VOSEL registers: 3 bits at bit 8 of each rail's ANA_CON0 (vendor
++ * upmu_hw.h RG_VCAMA_VOSEL / RG_VCAMD_VOSEL / RG_VCAMIO_VOSEL, all
++ * MASK 0x7 SHIFT 8).
++ */
++#define MT6351_VCAMA_ANA_CON0		0x0ad6
++#define MT6351_VCAMD_ANA_CON0		0x0b00
++#define MT6351_VCAMIO_ANA_CON0		0x0b14
++#define MT6351_VCAM_VOSEL_MASK		(0x7 << 8)
++
++/*
+  * Voltage-select registers for the SD rails (vendor upmu_hw.h
+  * MT6351_PMIC_RG_VMCH_VOSEL_* / RG_VMC_VOSEL_*). VMCH: 1 bit @8
+  * {3.0V, 3.3V}; VMC: 3 bits @8, full table {1.2, 1.3, 1.5, 1.8, 2.0,
+@@ -71,6 +104,30 @@
+ 	},								\
+ }
+ 
++/*
++ * Selectable-voltage LDO. _table must be a mt6351_*_voltages[] array whose
++ * index IS the VOSEL code, so selector == register value and the generic
++ * regmap helpers can be used unchanged.
++ */
++#define MT6351_LDO_TABLE(_name, _table, _en_reg, _vsel_reg)		\
++{									\
++	.desc = {							\
++		.name = #_name,						\
++		.of_match = of_match_ptr(#_name),			\
++		.regulators_node = of_match_ptr("regulators"),		\
++		.ops = &mt6351_ldo_table_ops,				\
++		.type = REGULATOR_VOLTAGE,				\
++		.id = MT6351_ID_##_name,				\
++		.owner = THIS_MODULE,					\
++		.n_voltages = ARRAY_SIZE(_table),			\
++		.volt_table = (_table),					\
++		.enable_reg = (_en_reg),				\
++		.enable_mask = MT6351_LDO_EN,				\
++		.vsel_reg = (_vsel_reg),				\
++		.vsel_mask = MT6351_VCAM_VOSEL_MASK,			\
++	},								\
++}
++
+ enum {
+ 	MT6351_ID_vcn18,
+ 	MT6351_ID_vcn28,
+@@ -78,10 +135,41 @@
+ 	MT6351_ID_vcn33_wifi,
+ 	MT6351_ID_vmch,
+ 	MT6351_ID_vmc,
++	MT6351_ID_vcama,
++	MT6351_ID_vcamd,
++	MT6351_ID_vcamio,
++	MT6351_ID_vldo28,
+ 	MT6351_ID_max
+ };
+ 
+ /*
++ * Camera LDO voltage tables, transcribed from the vendor
++ * drivers/misc/mediatek/power/mt6797/pmic.c. The vendor mtk_ldos[] entries
++ * name which table belongs to which rail:
++ *
++ *   vcama  -> mt6351_VCAMA_voltages
++ *   vcamd  -> mt6351_VCAMD_voltages
++ *   vcamio -> mt6351_VCAM_IO_voltages
++ *
++ * VCAMA's table has four entries against a three-bit VOSEL field; codes 4..7
++ * are not described by the vendor and are therefore not offered. The camera
++ * power sequence only ever asks for the values the sensors want (AVDD 2.8 V,
++ * DVDD 1.2 V, DOVDD 1.8 V — vendor kd_camera_hw.c PowerOnList), each of which
++ * is present here.
++ */
++static const unsigned int mt6351_vcama_voltages[] = {
++	1500000, 1800000, 2500000, 2800000,
++};
++
++static const unsigned int mt6351_vcamd_voltages[] = {
++	900000, 950000, 1000000, 1050000, 1100000, 1200000, 1210000,
++};
++
++static const unsigned int mt6351_vcamio_voltages[] = {
++	900000, 950000, 1000000, 1050000, 1200000, 1500000, 1800000,
++};
++
++/*
+  * Per-rail one-time hardware setup, applied lazily on first enable()
+  * rather than unconditionally in probe() — probe runs on every boot
+  * regardless of whether anything actually uses these rails yet, and an
+@@ -139,6 +227,22 @@
+ 	.is_enabled = regulator_is_enabled_regmap,
+ };
+ 
++/*
++ * Selectable-voltage LDOs. No mt6351_ldo_enable() indirection: none of the
++ * camera rails needs the one-time setup the VCN/SD rails do — the vendor
++ * camera power sequence (kd_camera_hw.c hwpoweron) is a plain
++ * regulator_set_voltage() + regulator_enable() per rail.
++ */
++static const struct regulator_ops mt6351_ldo_table_ops = {
++	.list_voltage = regulator_list_voltage_table,
++	.map_voltage = regulator_map_voltage_iterate,
++	.set_voltage_sel = regulator_set_voltage_sel_regmap,
++	.get_voltage_sel = regulator_get_voltage_sel_regmap,
++	.enable = regulator_enable_regmap,
++	.disable = regulator_disable_regmap,
++	.is_enabled = regulator_is_enabled_regmap,
++};
++
+ static struct mt6351_regulator_info mt6351_regulators[] = {
+ 	MT6351_LDO_FIXED(vcn18, 1800000, MT6351_LDO_VCN18_CON0),
+ 	MT6351_LDO_FIXED(vcn28, 2800000, MT6351_LDO_VCN28_CON0),
+@@ -146,6 +250,14 @@
+ 	MT6351_LDO_FIXED(vcn33_wifi, 3300000, MT6351_LDO_VCN33_CON4),
+ 	MT6351_LDO_FIXED(vmch, 3000000, MT6351_LDO_VMCH_CON0),
+ 	MT6351_LDO_FIXED(vmc, 3000000, MT6351_LDO_VMC_CON0),
++	MT6351_LDO_TABLE(vcama, mt6351_vcama_voltages,
++			 MT6351_LDO_VCAMA_CON0, MT6351_VCAMA_ANA_CON0),
++	MT6351_LDO_TABLE(vcamd, mt6351_vcamd_voltages,
++			 MT6351_LDO_VCAMD_CON0, MT6351_VCAMD_ANA_CON0),
++	MT6351_LDO_TABLE(vcamio, mt6351_vcamio_voltages,
++			 MT6351_LDO_VCAMIO_CON0, MT6351_VCAMIO_ANA_CON0),
++	/* VLDO28 has no VOSEL: fixed 2.8 V (vendor mt6351_2v8_voltages). */
++	MT6351_LDO_FIXED(vldo28, 2800000, MT6351_LDO_VLDO28_CON3),
+ };
+ 
+ static int mt6351_regulator_probe(struct platform_device *pdev)
+@@ -153,7 +265,7 @@
+ 	struct regmap *regmap = dev_get_regmap(pdev->dev.parent, NULL);
+ 	struct regulator_config config = {};
+ 	struct regulator_dev *rdev;
+-	int i, ret;
++	int i;
+ 
+ 	if (!regmap) {
+ 		dev_err(&pdev->dev, "no pwrap regmap on parent device\n");
+@@ -179,7 +291,8 @@
+ 		}
+ 	}
+ 
+-	dev_info(&pdev->dev, "MT6351 VCN regulators registered\n");
++	dev_info(&pdev->dev, "MT6351: %d regulators registered (VCN, SD, camera)\n",
++		 MT6351_ID_max);
+ 	return 0;
+ }
+ 
+@@ -199,5 +312,5 @@
+ module_platform_driver(mt6351_regulator_driver);
+ 
+ MODULE_AUTHOR("Gemini PDA Linux port");
+-MODULE_DESCRIPTION("MT6351 PMIC VCN regulator driver (CONSYS rails only)");
++MODULE_DESCRIPTION("MT6351 PMIC regulator driver (CONSYS, SD and camera rails)");
+ MODULE_LICENSE("GPL");

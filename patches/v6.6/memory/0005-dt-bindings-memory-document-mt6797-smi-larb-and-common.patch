@@ -1,0 +1,22 @@
+diff --git a/Documentation/devicetree/bindings/memory-controllers/mediatek,smi-common.yaml b/Documentation/devicetree/bindings/memory-controllers/mediatek,smi-common.yaml
+--- a/Documentation/devicetree/bindings/memory-controllers/mediatek,smi-common.yaml
++++ b/Documentation/devicetree/bindings/memory-controllers/mediatek,smi-common.yaml
+@@ -33,6 +33,7 @@
+           - mediatek,mt2712-smi-common
+           - mediatek,mt6779-smi-common
+           - mediatek,mt6795-smi-common
++          - mediatek,mt6797-smi-common
+           - mediatek,mt8167-smi-common
+           - mediatek,mt8173-smi-common
+           - mediatek,mt8183-smi-common
+diff --git a/Documentation/devicetree/bindings/memory-controllers/mediatek,smi-larb.yaml b/Documentation/devicetree/bindings/memory-controllers/mediatek,smi-larb.yaml
+--- a/Documentation/devicetree/bindings/memory-controllers/mediatek,smi-larb.yaml
++++ b/Documentation/devicetree/bindings/memory-controllers/mediatek,smi-larb.yaml
+@@ -21,6 +21,7 @@
+           - mediatek,mt2712-smi-larb
+           - mediatek,mt6779-smi-larb
+           - mediatek,mt6795-smi-larb
++          - mediatek,mt6797-smi-larb
+           - mediatek,mt8167-smi-larb
+           - mediatek,mt8173-smi-larb
+           - mediatek,mt8183-smi-larb

@@ -1,0 +1,673 @@
+diff --git a/Documentation/devicetree/bindings/misc/planet,gemini-camera-power.yaml b/Documentation/devicetree/bindings/misc/planet,gemini-camera-power.yaml
+new file mode 100644
+--- /dev/null
++++ b/Documentation/devicetree/bindings/misc/planet,gemini-camera-power.yaml
+@@ -0,0 +1,122 @@
++# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/misc/planet,gemini-camera-power.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: Planet Computers Gemini PDA camera bring-up power controller
++
++maintainers:
++  - Gemini PDA Linux port <https://github.com/mratan/gemini-linux>
++
++description: |
++  Bring-up scaffolding for the MT6797 camera stack on the Gemini PDA. It
++  gathers the supplies, master clocks and reset/power-down lines that the two
++  camera sockets share, and runs the vendor power-on sequence over them on
++  request, so that the fitted image sensors can be identified with an ordinary
++  I2C scan before any sensor driver exists.
++
++  This node is temporary. Once V4L2 sensor subdev drivers exist, each sensor's
++  own I2C node carries its supplies, clock and reset GPIO, and this node is
++  removed.
++
++properties:
++  compatible:
++    const: planet,gemini-camera-power
++
++  reg:
++    maxItems: 1
++    description:
++      The SENINF register block. Only the per-instance master-clock output
++      enable is used.
++
++  clocks:
++    items:
++      - description: camsys register-bank gate
++      - description: SENINF gate
++      - description: sensor master-clock (CAMTG) gate
++      - description: topckgen CAMTG mux, whose rate the sensors see
++      - description: the mux parent the vendor selects for CAMTG
++
++  clock-names:
++    items:
++      - const: camsys
++      - const: seninf
++      - const: camtg
++      - const: camtg_sel
++      - const: univpll_d26
++
++  power-domains:
++    maxItems: 1
++    description: the ISP MTCMOS domain containing camsys and SENINF
++
++  vcama-supply:
++    description: sensor analog supply (AVDD)
++
++  vcamd-supply:
++    description: sensor digital core supply (DVDD)
++
++  vcamio-supply:
++    description: sensor I/O supply (DOVDD)
++
++  main-reset-gpios:
++    maxItems: 1
++    description: rear sensor reset, active low
++
++  main-powerdown-gpios:
++    maxItems: 1
++    description: rear sensor power-down (PWDNB), active low
++
++  sub-reset-gpios:
++    maxItems: 1
++    description: front sensor reset, active low
++
++  sub-powerdown-gpios:
++    maxItems: 1
++    description: front sensor power-down (PWDNB), active low
++
++  pinctrl-0: true
++
++  pinctrl-names:
++    maxItems: 1
++
++required:
++  - compatible
++  - reg
++  - clocks
++  - clock-names
++  - power-domains
++  - vcama-supply
++  - vcamd-supply
++  - vcamio-supply
++  - main-reset-gpios
++  - main-powerdown-gpios
++  - sub-reset-gpios
++  - sub-powerdown-gpios
++
++additionalProperties: false
++
++examples:
++  - |
++    #include <dt-bindings/clock/mt6797-clk.h>
++    #include <dt-bindings/gpio/gpio.h>
++    #include <dt-bindings/power/mt6797-power.h>
++
++    camera-power@1a040000 {
++        compatible = "planet,gemini-camera-power";
++        reg = <0x1a040000 0x3000>;
++        power-domains = <&scpsys MT6797_POWER_DOMAIN_ISP>;
++        clocks = <&camsys CLK_CAM_CAMSYS>,
++                 <&camsys CLK_CAM_SENINF>,
++                 <&camsys CLK_CAM_CAMTG>,
++                 <&topckgen CLK_TOP_MUX_CAMTG>,
++                 <&topckgen CLK_TOP_UNIVPLL_D26>;
++        clock-names = "camsys", "seninf", "camtg", "camtg_sel", "univpll_d26";
++        vcama-supply = <&mt6351_vcama_reg>;
++        vcamd-supply = <&mt6351_vcamd_reg>;
++        vcamio-supply = <&mt6351_vcamio_reg>;
++        main-reset-gpios = <&pio 32 GPIO_ACTIVE_LOW>;
++        main-powerdown-gpios = <&pio 28 GPIO_ACTIVE_LOW>;
++        sub-reset-gpios = <&pio 33 GPIO_ACTIVE_LOW>;
++        sub-powerdown-gpios = <&pio 29 GPIO_ACTIVE_LOW>;
++    };
+diff --git a/drivers/misc/Kconfig b/drivers/misc/Kconfig
+--- a/drivers/misc/Kconfig
++++ b/drivers/misc/Kconfig
+@@ -577,6 +577,26 @@
+ 	  If unsure, say N. If built as a module it is called
+ 	  gemini-rightport-mux.
+ 
++config GEMINI_CAMERA_POWER
++	tristate "Planet Gemini PDA camera bring-up power controller"
++	depends on GPIOLIB
++	depends on OF
++	depends on REGULATOR
++	depends on COMMON_CLK
++	help
++	  Bring-up scaffolding for the Planet Gemini PDA camera stack
++	  (issue #63): drives the MT6351 camera rails, the sensor master
++	  clocks and the two sockets' reset/power-down lines through the
++	  vendor power-on sequence, so that the fitted sensors can be
++	  identified with an ordinary I2C scan. Binding powers nothing; a
++	  "power" sysfs attribute turns the sockets on and off.
++
++	  This is temporary: it is superseded by the V4L2 sensor subdev
++	  drivers, which carry these resources themselves.
++
++	  If unsure, say N. If built as a module it is called
++	  gemini-camera-power.
++
+ source "drivers/misc/c2port/Kconfig"
+ source "drivers/misc/eeprom/Kconfig"
+ source "drivers/misc/cb710/Kconfig"
+diff --git a/drivers/misc/Makefile b/drivers/misc/Makefile
+--- a/drivers/misc/Makefile
++++ b/drivers/misc/Makefile
+@@ -68,3 +68,4 @@
+ obj-$(CONFIG_TPS6594_ESM)	+= tps6594-esm.o
+ obj-$(CONFIG_TPS6594_PFSM)	+= tps6594-pfsm.o
+ obj-$(CONFIG_GEMINI_RIGHTPORT_MUX)	+= gemini-rightport-mux.o
++obj-$(CONFIG_GEMINI_CAMERA_POWER)	+= gemini-camera-power.o
+diff --git a/drivers/misc/gemini-camera-power.c b/drivers/misc/gemini-camera-power.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/misc/gemini-camera-power.c
+@@ -0,0 +1,503 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Gemini PDA camera bring-up power controller.
++ *
++ * WHAT THIS IS FOR
++ *
++ * Nobody knows which image sensors this board is fitted with. The vendor
++ * k97 build compiles four sensor drivers (sp5506 = OmniVision OV5675,
++ * sp5509 in two variants, st55a = Samsung S5K5E2YA) and there is no
++ * Gemini-specific camera configuration anywhere to say which are populated.
++ * An I2C scan answers it in seconds — but only if the sensors are powered
++ * and clocked, and none of the rails, the master clock or the reset and
++ * power-down lines can be driven from userspace.
++ *
++ * So this driver drives them. Writing 1 to its sysfs "socket_power" attribute
++ * runs the vendor's power-on sequence for both camera sockets and leaves them
++ * powered, so that an ordinary i2cdetect/i2ctransfer on the two camera buses
++ * can do the actual reading. Writing 0, or unloading the module, powers
++ * everything back down. Binding on its own powers nothing.
++ *
++ * It is scaffolding for issue #63 and is meant to be deleted by #64: once a
++ * V4L2 sensor subdev driver exists, these supplies, clocks and GPIOs belong
++ * on the sensor's own I2C node where the V4L2 framework can see them.
++ * Nothing else may depend on it, and it is deliberately not autoloaded.
++ *
++ * SOURCES
++ *
++ * Power sequence: vendor 3.18
++ * drivers/misc/mediatek/imgsensor/src/mt6797/camera_hw/kd_camera_hw.c,
++ * PowerOnList[] — identical for all four candidate sensors:
++ *
++ *	SensorMCLK high
++ *	RST low
++ *	PDN low
++ *	DOVDD 1.8 V, 10 ms
++ *	AVDD  2.8 V, 10 ms
++ *	DVDD  1.2 V, 10 ms
++ *	RST high, 10 ms
++ *	PDN high, 10 ms
++ *
++ * MCLK output enable: vendor
++ * drivers/misc/mediatek/cameraisp/src/mt6797/camera_isp.c, ISP_MCLK1_EN()
++ * and ISP_MCLK2_EN() — set bit 29 of SENINF0/SENINF1 + 0x600.
++ *
++ * Clock ordering: same file, ISP_EnableClock() — the ISP power domain and
++ * smi_common come up before any CAM_* gate is touched. The power domain is
++ * a DT power-domains reference here, so the genpd core does that part.
++ */
++
++#include <linux/bitops.h>
++#include <linux/clk.h>
++#include <linux/delay.h>
++#include <linux/gpio/consumer.h>
++#include <linux/io.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
++#include <linux/regulator/consumer.h>
++#include <linux/sysfs.h>
++
++/*
++ * SENINF instance stride and the MCLK enable bit, from the vendor
++ * ISP_MCLKn_EN() functions: SENINF0 0x1a040000, SENINF1 0x1a041000,
++ * SENINF2 0x1a042000, and in each the register at +0x600 bit 29.
++ */
++#define SENINF_STRIDE			0x1000
++#define SENINF_MCLK_REG			0x0600
++#define SENINF_MCLK_EN			BIT(29)
++
++/* Vendor power-sequence voltages (kd_camera_hw.h VOL* / PowerOnList). */
++#define CAM_DOVDD_UV			1800000
++#define CAM_AVDD_UV			2800000
++#define CAM_DVDD_UV			1200000
++
++/* Vendor power-sequence settle time, in milliseconds, between every step. */
++#define CAM_STEP_DELAY_MS		10
++
++static bool autopower;
++module_param(autopower, bool, 0444);
++MODULE_PARM_DESC(autopower,
++		 "power the camera sockets up at probe (default: no — write 1 to socket_power instead)");
++
++struct gemini_cam_socket {
++	const char *name;
++	unsigned int seninf;		/* SENINF instance carrying its MCLK */
++	struct gpio_desc *reset;
++	struct gpio_desc *powerdown;
++};
++
++struct gemini_cam {
++	struct device *dev;
++	void __iomem *seninf_base;
++
++	struct clk *camsys;
++	struct clk *seninf;
++	struct clk *camtg;
++	struct clk *camtg_sel;
++	struct clk *camtg_parent;
++
++	struct regulator *vcama;	/* AVDD  2.8 V */
++	struct regulator *vcamd;	/* DVDD  1.2 V */
++	struct regulator *vcamio;	/* DOVDD 1.8 V */
++
++	struct gemini_cam_socket socket[2];
++
++	bool powered;
++	struct mutex lock;		/* serialises power on/off */
++};
++
++static void gemini_cam_mclk_set(struct gemini_cam *cam, unsigned int seninf,
++				bool on)
++{
++	void __iomem *reg = cam->seninf_base + seninf * SENINF_STRIDE +
++			    SENINF_MCLK_REG;
++	u32 val = readl(reg);
++
++	if (on)
++		val |= SENINF_MCLK_EN;
++	else
++		val &= ~SENINF_MCLK_EN;
++
++	writel(val, reg);
++	dev_dbg(cam->dev, "seninf%u MCLK %s, reg now 0x%08x\n",
++		seninf, on ? "on" : "off", readl(reg));
++}
++
++static void gemini_cam_assert_resets(struct gemini_cam *cam)
++{
++	int i;
++
++	/* Both lines are described active-low in DT; 1 == asserted. */
++	for (i = 0; i < ARRAY_SIZE(cam->socket); i++) {
++		gpiod_set_value_cansleep(cam->socket[i].reset, 1);
++		gpiod_set_value_cansleep(cam->socket[i].powerdown, 1);
++	}
++}
++
++static void gemini_cam_rail_off(struct gemini_cam *cam, struct regulator *reg,
++				const char *what)
++{
++	int ret = regulator_disable(reg);
++
++	if (ret)
++		dev_err(cam->dev, "%s: failed to disable: %d\n", what, ret);
++}
++
++static void gemini_cam_power_off(struct gemini_cam *cam)
++{
++	int i;
++
++	gemini_cam_assert_resets(cam);
++
++	for (i = 0; i < ARRAY_SIZE(cam->socket); i++)
++		gemini_cam_mclk_set(cam, cam->socket[i].seninf, false);
++
++	/*
++	 * Rails down in the reverse of the order they came up. A failure here
++	 * is not recoverable and there is nobody to return it to, but it must
++	 * not be silent: a rail that would not turn off is exactly the kind of
++	 * thing that later looks like "the sensor answers sometimes".
++	 */
++	gemini_cam_rail_off(cam, cam->vcamd, "DVDD/vcamd");
++	gemini_cam_rail_off(cam, cam->vcama, "AVDD/vcama");
++	gemini_cam_rail_off(cam, cam->vcamio, "DOVDD/vcamio");
++
++	clk_disable_unprepare(cam->camtg);
++	clk_disable_unprepare(cam->seninf);
++	clk_disable_unprepare(cam->camsys);
++
++	pm_runtime_put_sync(cam->dev);
++	cam->powered = false;
++	dev_info(cam->dev, "camera sockets powered down\n");
++}
++
++static void gemini_cam_check_rail(struct gemini_cam *cam, struct regulator *reg,
++				  const char *what, int expect_uv)
++{
++	int uv = regulator_get_voltage(reg);
++
++	if (uv < 0) {
++		dev_warn(cam->dev, "%s: cannot read voltage: %d\n", what, uv);
++		return;
++	}
++
++	if (uv != expect_uv)
++		dev_warn(cam->dev, "%s: %d uV, vendor sequence wants %d uV\n",
++			 what, uv, expect_uv);
++	else
++		dev_info(cam->dev, "%s: %d uV\n", what, uv);
++}
++
++static int gemini_cam_power_on(struct gemini_cam *cam)
++{
++	int ret, i;
++
++	/* ISP MTCMOS domain first — nothing in camsys answers without it. */
++	ret = pm_runtime_resume_and_get(cam->dev);
++	if (ret) {
++		dev_err(cam->dev, "ISP power domain did not come up: %d\n", ret);
++		return ret;
++	}
++
++	ret = clk_prepare_enable(cam->camsys);
++	if (ret) {
++		dev_err(cam->dev, "camsys clock: %d\n", ret);
++		goto err_pd;
++	}
++
++	ret = clk_prepare_enable(cam->seninf);
++	if (ret) {
++		dev_err(cam->dev, "seninf clock: %d\n", ret);
++		goto err_camsys;
++	}
++
++	/*
++	 * Park the MCLK mux on the parent the vendor uses before ungating it
++	 * (kd_sensorlist.c kdSetSensorMclk, CAM_PLL_48_GROUP = univpll_d26).
++	 */
++	ret = clk_set_parent(cam->camtg_sel, cam->camtg_parent);
++	if (ret) {
++		dev_err(cam->dev, "camtg_sel reparent: %d\n", ret);
++		goto err_seninf;
++	}
++
++	ret = clk_prepare_enable(cam->camtg);
++	if (ret) {
++		dev_err(cam->dev, "camtg clock: %d\n", ret);
++		goto err_seninf;
++	}
++
++	dev_info(cam->dev, "camtg_sel at %lu Hz\n", clk_get_rate(cam->camtg_sel));
++
++	/* Hold both sensors in reset while the rails come up. */
++	gemini_cam_assert_resets(cam);
++
++	for (i = 0; i < ARRAY_SIZE(cam->socket); i++)
++		gemini_cam_mclk_set(cam, cam->socket[i].seninf, true);
++
++	ret = regulator_enable(cam->vcamio);
++	if (ret) {
++		dev_err(cam->dev, "vcamio (DOVDD): %d\n", ret);
++		goto err_camtg;
++	}
++	msleep(CAM_STEP_DELAY_MS);
++
++	ret = regulator_enable(cam->vcama);
++	if (ret) {
++		dev_err(cam->dev, "vcama (AVDD): %d\n", ret);
++		goto err_vcamio;
++	}
++	msleep(CAM_STEP_DELAY_MS);
++
++	ret = regulator_enable(cam->vcamd);
++	if (ret) {
++		dev_err(cam->dev, "vcamd (DVDD): %d\n", ret);
++		goto err_vcama;
++	}
++	msleep(CAM_STEP_DELAY_MS);
++
++	for (i = 0; i < ARRAY_SIZE(cam->socket); i++) {
++		gpiod_set_value_cansleep(cam->socket[i].reset, 0);
++		msleep(CAM_STEP_DELAY_MS);
++		gpiod_set_value_cansleep(cam->socket[i].powerdown, 0);
++		msleep(CAM_STEP_DELAY_MS);
++		dev_info(cam->dev, "%s socket released from reset\n",
++			 cam->socket[i].name);
++	}
++
++	cam->powered = true;
++
++	/*
++	 * Report what the rails actually read back rather than what was
++	 * asked for, and say so loudly if the two differ: a rail sitting at
++	 * the wrong voltage is a plausible reason for a sensor not to answer,
++	 * and it must not be discovered later by inference.
++	 */
++	gemini_cam_check_rail(cam, cam->vcamio, "DOVDD/vcamio", CAM_DOVDD_UV);
++	gemini_cam_check_rail(cam, cam->vcama, "AVDD/vcama", CAM_AVDD_UV);
++	gemini_cam_check_rail(cam, cam->vcamd, "DVDD/vcamd", CAM_DVDD_UV);
++	return 0;
++
++err_vcama:
++	gemini_cam_rail_off(cam, cam->vcama, "AVDD/vcama");
++err_vcamio:
++	gemini_cam_rail_off(cam, cam->vcamio, "DOVDD/vcamio");
++err_camtg:
++	for (i = 0; i < ARRAY_SIZE(cam->socket); i++)
++		gemini_cam_mclk_set(cam, cam->socket[i].seninf, false);
++	clk_disable_unprepare(cam->camtg);
++err_seninf:
++	clk_disable_unprepare(cam->seninf);
++err_camsys:
++	clk_disable_unprepare(cam->camsys);
++err_pd:
++	pm_runtime_put_sync(cam->dev);
++	return ret;
++}
++
++/*
++ * Named socket_power, not power: every struct device already owns a "power"
++ * directory (the runtime-PM one), so a "power" attribute collides with it and
++ * device_add_groups() fails, which unbinds the driver. Measured on build #71.
++ */
++static ssize_t socket_power_show(struct device *dev,
++				 struct device_attribute *attr, char *buf)
++{
++	struct gemini_cam *cam = dev_get_drvdata(dev);
++
++	return sysfs_emit(buf, "%d\n", cam->powered ? 1 : 0);
++}
++
++static ssize_t socket_power_store(struct device *dev,
++				  struct device_attribute *attr,
++				  const char *buf, size_t count)
++{
++	struct gemini_cam *cam = dev_get_drvdata(dev);
++	bool want;
++	int ret;
++
++	ret = kstrtobool(buf, &want);
++	if (ret)
++		return ret;
++
++	ret = 0;
++	mutex_lock(&cam->lock);
++	if (want && !cam->powered)
++		ret = gemini_cam_power_on(cam);
++	else if (!want && cam->powered)
++		gemini_cam_power_off(cam);
++	mutex_unlock(&cam->lock);
++
++	return ret ? ret : count;
++}
++static DEVICE_ATTR_RW(socket_power);
++
++static struct attribute *gemini_cam_attrs[] = {
++	&dev_attr_socket_power.attr,
++	NULL,
++};
++ATTRIBUTE_GROUPS(gemini_cam);
++
++static int gemini_cam_get_socket(struct gemini_cam *cam, int idx,
++				 const char *name, unsigned int seninf)
++{
++	struct gemini_cam_socket *s = &cam->socket[idx];
++	char prop[32];
++
++	s->name = name;
++	s->seninf = seninf;
++
++	scnprintf(prop, sizeof(prop), "%s-reset", name);
++	s->reset = devm_gpiod_get(cam->dev, prop, GPIOD_OUT_HIGH);
++	if (IS_ERR(s->reset))
++		return dev_err_probe(cam->dev, PTR_ERR(s->reset),
++				     "%s-reset-gpios\n", name);
++
++	scnprintf(prop, sizeof(prop), "%s-powerdown", name);
++	s->powerdown = devm_gpiod_get(cam->dev, prop, GPIOD_OUT_HIGH);
++	if (IS_ERR(s->powerdown))
++		return dev_err_probe(cam->dev, PTR_ERR(s->powerdown),
++				     "%s-powerdown-gpios\n", name);
++
++	return 0;
++}
++
++static int gemini_cam_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct gemini_cam *cam;
++	struct resource *res;
++	int ret;
++
++	dev_info(dev, "probing Gemini camera bring-up power controller\n");
++
++	cam = devm_kzalloc(dev, sizeof(*cam), GFP_KERNEL);
++	if (!cam)
++		return -ENOMEM;
++
++	cam->dev = dev;
++	mutex_init(&cam->lock);
++
++	/*
++	 * devm_ioremap(), not devm_platform_ioremap_resource(): this node
++	 * covers the SENINF block that #65 will give a real driver, and a
++	 * request_mem_region() here would make the two mutually exclusive
++	 * for no benefit. One bit in one register is written.
++	 */
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	if (!res)
++		return dev_err_probe(dev, -EINVAL, "no SENINF reg range\n");
++
++	cam->seninf_base = devm_ioremap(dev, res->start, resource_size(res));
++	if (!cam->seninf_base)
++		return dev_err_probe(dev, -ENOMEM, "cannot map SENINF\n");
++
++	cam->camsys = devm_clk_get(dev, "camsys");
++	if (IS_ERR(cam->camsys))
++		return dev_err_probe(dev, PTR_ERR(cam->camsys), "camsys clock\n");
++
++	cam->seninf = devm_clk_get(dev, "seninf");
++	if (IS_ERR(cam->seninf))
++		return dev_err_probe(dev, PTR_ERR(cam->seninf), "seninf clock\n");
++
++	cam->camtg = devm_clk_get(dev, "camtg");
++	if (IS_ERR(cam->camtg))
++		return dev_err_probe(dev, PTR_ERR(cam->camtg), "camtg clock\n");
++
++	cam->camtg_sel = devm_clk_get(dev, "camtg_sel");
++	if (IS_ERR(cam->camtg_sel))
++		return dev_err_probe(dev, PTR_ERR(cam->camtg_sel),
++				     "camtg_sel clock\n");
++
++	cam->camtg_parent = devm_clk_get(dev, "univpll_d26");
++	if (IS_ERR(cam->camtg_parent))
++		return dev_err_probe(dev, PTR_ERR(cam->camtg_parent),
++				     "univpll_d26 clock\n");
++
++	cam->vcama = devm_regulator_get(dev, "vcama");
++	if (IS_ERR(cam->vcama))
++		return dev_err_probe(dev, PTR_ERR(cam->vcama), "vcama supply\n");
++
++	cam->vcamd = devm_regulator_get(dev, "vcamd");
++	if (IS_ERR(cam->vcamd))
++		return dev_err_probe(dev, PTR_ERR(cam->vcamd), "vcamd supply\n");
++
++	cam->vcamio = devm_regulator_get(dev, "vcamio");
++	if (IS_ERR(cam->vcamio))
++		return dev_err_probe(dev, PTR_ERR(cam->vcamio), "vcamio supply\n");
++
++	/*
++	 * Socket -> SENINF instance: the vendor drives the main sensor's MCLK
++	 * from SENINF0 (ISP_MCLK1_EN) and the sub sensor's from SENINF1
++	 * (ISP_MCLK2_EN). CMMCLK0/CMMCLK1 (GPIO30/31) are the matching pads.
++	 */
++	ret = gemini_cam_get_socket(cam, 0, "main", 0);
++	if (ret)
++		return ret;
++
++	ret = gemini_cam_get_socket(cam, 1, "sub", 1);
++	if (ret)
++		return ret;
++
++	platform_set_drvdata(pdev, cam);
++
++	ret = devm_pm_runtime_enable(dev);
++	if (ret)
++		return dev_err_probe(dev, ret, "runtime PM\n");
++
++	/*
++	 * Probe deliberately touches no hardware and leaves everything off.
++	 * The module has a modalias and udev will autoload it, so a probe
++	 * that powered the sensors would silently power the camera on every
++	 * boot — on a machine that is somebody's daily desktop and whose
++	 * power budget is already tight (#59). Powering up is an explicit
++	 * act:
++	 *
++	 *     echo 1 > /sys/devices/platform/.../socket_power
++	 */
++	if (autopower) {
++		mutex_lock(&cam->lock);
++		ret = gemini_cam_power_on(cam);
++		mutex_unlock(&cam->lock);
++		if (ret)
++			return ret;
++	}
++
++	dev_info(dev, "bound, sockets %s; write 1 to its sysfs 'socket_power' to enable\n",
++		 cam->powered ? "powered" : "off");
++	return 0;
++}
++
++static void gemini_cam_remove(struct platform_device *pdev)
++{
++	struct gemini_cam *cam = platform_get_drvdata(pdev);
++
++	mutex_lock(&cam->lock);
++	if (cam->powered)
++		gemini_cam_power_off(cam);
++	mutex_unlock(&cam->lock);
++}
++
++static const struct of_device_id gemini_cam_of_match[] = {
++	{ .compatible = "planet,gemini-camera-power" },
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(of, gemini_cam_of_match);
++
++static struct platform_driver gemini_cam_driver = {
++	.driver = {
++		.name = "gemini-camera-power",
++		.of_match_table = gemini_cam_of_match,
++		.dev_groups = gemini_cam_groups,
++	},
++	.probe = gemini_cam_probe,
++	.remove_new = gemini_cam_remove,
++};
++module_platform_driver(gemini_cam_driver);
++
++MODULE_AUTHOR("Gemini PDA Linux port");
++MODULE_DESCRIPTION("Gemini PDA camera bring-up power controller (issue #63)");
++MODULE_LICENSE("GPL");

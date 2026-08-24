@@ -1,0 +1,153 @@
+diff --git a/Documentation/devicetree/bindings/arm/mediatek/mediatek,camsys.txt b/Documentation/devicetree/bindings/arm/mediatek/mediatek,camsys.txt
+--- a/Documentation/devicetree/bindings/arm/mediatek/mediatek,camsys.txt
++++ b/Documentation/devicetree/bindings/arm/mediatek/mediatek,camsys.txt
+@@ -8,6 +8,7 @@
+ - compatible: Should be one of:
+ 	- "mediatek,mt6765-camsys", "syscon"
+ 	- "mediatek,mt6779-camsys", "syscon"
++	- "mediatek,mt6797-camsys", "syscon"
+ 	- "mediatek,mt8183-camsys", "syscon"
+ - #clock-cells: Must be 1
+ 
+diff --git a/include/dt-bindings/clock/mt6797-clk.h b/include/dt-bindings/clock/mt6797-clk.h
+--- a/include/dt-bindings/clock/mt6797-clk.h
++++ b/include/dt-bindings/clock/mt6797-clk.h
+@@ -218,6 +218,23 @@
+ #define	CLK_INFRA_13M				84
+ #define	CLK_INFRA_NR				85
+ 
++/*
++ * CAM_SYS (camsys_config@1a000000).
++ *
++ * Numbered from 0, unlike the IMG_SYS/MM_SYS blocks above: the MediaTek
++ * clock core sizes its clk_hw_onecell_data from ARRAY_SIZE(gate table) and
++ * then indexes it by gate id, so a table of N gates whose ids run 1..N
++ * writes one entry past the end. Starting at 0 keeps max(id) < N.
++ */
++#define	CLK_CAM_LARB2				0
++#define	CLK_CAM_CAMSYS				1
++#define	CLK_CAM_CAMTG				2
++#define	CLK_CAM_SENINF				3
++#define	CLK_CAM_CAMSV0				4
++#define	CLK_CAM_CAMSV1				5
++#define	CLK_CAM_CAMSV2				6
++#define	CLK_CAM_NR				7
++
+ /* IMG_SYS */
+ #define	CLK_IMG_FDVT				1
+ #define	CLK_IMG_DPE				2
+diff --git a/drivers/clk/mediatek/Kconfig b/drivers/clk/mediatek/Kconfig
+--- a/drivers/clk/mediatek/Kconfig
++++ b/drivers/clk/mediatek/Kconfig
+@@ -355,6 +355,15 @@
+ 
+ 	  Built in rather than modular: cpufreq needs these clocks at boot.
+ 
++config COMMON_CLK_MT6797_CAMSYS
++	tristate "Clock driver for MediaTek MT6797 camsys"
++	depends on COMMON_CLK_MT6797
++	help
++	  This driver supports MediaTek MT6797 camsys clocks: the LARB2,
++	  CAMSYS, CAMTG (sensor MCLK), SENINF and CAMSV gates. Mainline has
++	  MT6797 providers for img/mm/vdec/venc but not cam, and without this
++	  one nothing can ungate the camera block.
++
+ config COMMON_CLK_MT7622
+ 	tristate "Clock driver for MediaTek MT7622"
+ 	depends on ARCH_MEDIATEK || COMPILE_TEST
+diff --git a/drivers/clk/mediatek/Makefile b/drivers/clk/mediatek/Makefile
+--- a/drivers/clk/mediatek/Makefile
++++ b/drivers/clk/mediatek/Makefile
+@@ -31,6 +31,7 @@
+ obj-$(CONFIG_COMMON_CLK_MT6797_MMSYS) += clk-mt6797-mm.o
+ obj-$(CONFIG_COMMON_CLK_MT6797_VDECSYS) += clk-mt6797-vdec.o
+ obj-$(CONFIG_COMMON_CLK_MT6797_VENCSYS) += clk-mt6797-venc.o
++obj-$(CONFIG_COMMON_CLK_MT6797_CAMSYS) += clk-mt6797-cam.o
+ obj-$(CONFIG_COMMON_CLK_MT2701) += clk-mt2701.o
+ obj-$(CONFIG_COMMON_CLK_MT2701_AUDSYS) += clk-mt2701-aud.o
+ obj-$(CONFIG_COMMON_CLK_MT2701_BDPSYS) += clk-mt2701-bdp.o
+diff --git a/drivers/clk/mediatek/clk-mt6797-cam.c b/drivers/clk/mediatek/clk-mt6797-cam.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/clk/mediatek/clk-mt6797-cam.c
+@@ -0,0 +1,80 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * MT6797 camsys (camera subsystem) clock gates.
++ *
++ * Mainline carries MT6797 subsystem clock providers for img, mm, vdec, venc
++ * and mfgcfg but not for cam, so nothing could ever ungate the camera block.
++ * This provider is the img one with the camsys gate table substituted.
++ *
++ * Gate table transcribed from the vendor 3.18 tree
++ * drivers/clk/mediatek/clk-mt6797.c (cam_cg_regs / cam_clks[]):
++ *
++ *	set 0x0004, clr 0x0008, sta 0x0000
++ *	CAM_CAMSV2  bit 11  parent mm_sel
++ *	CAM_CAMSV1  bit 10  parent mm_sel
++ *	CAM_CAMSV0  bit  9  parent mm_sel
++ *	CAM_SENINF  bit  8  parent mm_sel
++ *	CAM_CAMTG   bit  7  parent camtg_sel
++ *	CAM_CAMSYS  bit  6  parent mm_sel
++ *	CAM_LARB2   bit  0  parent mm_sel
++ *
++ * The camsys registers are inside the ISP MTCMOS power domain
++ * (MT6797_POWER_DOMAIN_ISP), which the vendor sequence brings up after MM
++ * and smi_common: see the vendor cameraisp camera_isp.c ISP_EnableClock(),
++ * which enables SCP_SYS_DIS -> MM_SMI_COMMON -> SCP_SYS_ISP before touching
++ * any CAM_* gate. A consumer must therefore hold that domain before enabling
++ * any clock from this provider.
++ */
++
++#include <linux/clk-provider.h>
++#include <linux/platform_device.h>
++#include <dt-bindings/clock/mt6797-clk.h>
++
++#include "clk-mtk.h"
++#include "clk-gate.h"
++
++static const struct mtk_gate_regs cam_cg_regs = {
++	.set_ofs = 0x0004,
++	.clr_ofs = 0x0008,
++	.sta_ofs = 0x0000,
++};
++
++#define GATE_CAM(_id, _name, _parent, _shift)			\
++	GATE_MTK(_id, _name, _parent, &cam_cg_regs, _shift, &mtk_clk_gate_ops_setclr)
++
++static const struct mtk_gate cam_clks[] = {
++	GATE_CAM(CLK_CAM_LARB2, "cam_larb2", "mm_sel", 0),
++	GATE_CAM(CLK_CAM_CAMSYS, "cam_camsys", "mm_sel", 6),
++	GATE_CAM(CLK_CAM_CAMTG, "cam_camtg", "camtg_sel", 7),
++	GATE_CAM(CLK_CAM_SENINF, "cam_seninf", "mm_sel", 8),
++	GATE_CAM(CLK_CAM_CAMSV0, "cam_camsv0", "mm_sel", 9),
++	GATE_CAM(CLK_CAM_CAMSV1, "cam_camsv1", "mm_sel", 10),
++	GATE_CAM(CLK_CAM_CAMSV2, "cam_camsv2", "mm_sel", 11),
++};
++
++static const struct mtk_clk_desc cam_desc = {
++	.clks = cam_clks,
++	.num_clks = ARRAY_SIZE(cam_clks),
++};
++
++static const struct of_device_id of_match_clk_mt6797_cam[] = {
++	{
++		.compatible = "mediatek,mt6797-camsys",
++		.data = &cam_desc,
++	}, {
++		/* sentinel */
++	}
++};
++MODULE_DEVICE_TABLE(of, of_match_clk_mt6797_cam);
++
++static struct platform_driver clk_mt6797_cam_drv = {
++	.probe = mtk_clk_simple_probe,
++	.remove_new = mtk_clk_simple_remove,
++	.driver = {
++		.name = "clk-mt6797-cam",
++		.of_match_table = of_match_clk_mt6797_cam,
++	},
++};
++module_platform_driver(clk_mt6797_cam_drv);
++MODULE_DESCRIPTION("MediaTek MT6797 camsys clock driver");
++MODULE_LICENSE("GPL");

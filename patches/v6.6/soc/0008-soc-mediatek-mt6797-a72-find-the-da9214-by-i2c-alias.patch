@@ -1,0 +1,45 @@
+diff --git a/drivers/soc/mediatek/mt6797-a72.c b/drivers/soc/mediatek/mt6797-a72.c
+--- a/drivers/soc/mediatek/mt6797-a72.c
++++ b/drivers/soc/mediatek/mt6797-a72.c
+@@ -81,7 +81,18 @@
+ #define WDT_SWSYSRST_KEY	0x88000000
+ #define WDT_PWRAP_SPI_CTL_RST	0x800
+ 
+-/* DA9214 on i2c6 (adapter 2). Code to volts: mV = 300 + code * 10. */
++/*
++ * DA9214 (VPROC2 = BUCKB) on i2c6. Code to volts: mV = 300 + code * 10.
++ *
++ * The adapter is resolved through the board's "i2c6" /aliases entry rather
++ * than by adapter number: i2c-mt65xx takes whatever number the core hands out
++ * in probe order, so before the aliases existed this was adapter 2, and
++ * enabling one more controller (the camera bus, #63) renumbered it to 6 and
++ * silently cost the A72s a boot. Going through the alias makes the lookup
++ * mean "the sixth I2C controller on this SoC" instead of "whatever was
++ * probed third".
++ */
++#define DA9214_I2C_ALIAS	"i2c6"
+ #define DA9214_ADDR		0x68
+ #define DA9214_PAGE_CON		0x00
+ #define DA9214_BUCKB_CONT	0x5e
+@@ -199,10 +210,20 @@
+  */
+ static int mt6797_a72_enable_vproc2(void)
+ {
+-	struct i2c_adapter *ad = i2c_get_adapter(2);
+ 	u8 code = (VPROC2_MV - 300) / 10;
++	struct i2c_adapter *ad;
++	struct device_node *np;
+ 	int r, cont;
+ 
++	np = of_find_node_by_path(DA9214_I2C_ALIAS);
++	if (!np) {
++		pr_err("no \"%s\" alias in the device tree; cannot reach the DA9214\n",
++		       DA9214_I2C_ALIAS);
++		return -ENODEV;
++	}
++
++	ad = of_find_i2c_adapter_by_node(np);
++	of_node_put(np);
+ 	if (!ad) {
+ 		pr_err("i2c6 adapter not available; cannot enable VPROC2\n");
+ 		return -ENODEV;

@@ -1,0 +1,261 @@
+diff --git a/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts b/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
+--- a/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
++++ b/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
+@@ -31,6 +31,43 @@
+ 	aliases {
+ 		serial0 = &uart0;
+ 		/*
++		 * I2C bus numbering. Without these, i2c-mt65xx takes whatever
++		 * number the core hands out in probe order, so enabling one
++		 * more controller renumbers every /dev/i2c-N below it — which
++		 * has already cost this project time twice (see
++		 * 04-docs/HANDOFF-FULL-HARDWARE-2026-08-21.md). Pinning them
++		 * to the SoC's own bus numbers makes /dev/i2c-N mean the same
++		 * thing as "i2cN" in the vendor documentation and in every
++		 * note in 04-docs/, and makes the number stable when the
++		 * remaining controllers are enabled.
++		 *
++		 * i2c_add_adapter() honours these via of_alias_get_id(); the
++		 * "id = <N>" property already in each node is a vendor
++		 * leftover that mainline ignores.
++		 *
++		 * NOTE this MOVES buses relative to build #70 and earlier.
++		 * Measured on #70, then recomputed from the alias:
++		 *
++		 *   controller        was          now
++		 *   i2c4 touchscreen  /dev/i2c-4   /dev/i2c-4
++		 *   i2c5 AW9523B kbd  /dev/i2c-6   /dev/i2c-5
++		 *   i2c6 DA9214 CPU   /dev/i2c-2   /dev/i2c-6
++		 *   i2c7 RT5735 vgpu  /dev/i2c-3   /dev/i2c-7
++		 *   i2c3 HDMI/cam sub /dev/i2c-5   /dev/i2c-3
++		 *   i2c2 cam main     (disabled)   /dev/i2c-2
++		 *
++		 * Everything in-kernel binds by DT and is unaffected; the
++		 * numbers only matter to i2cget/i2cdetect by hand.
++		 */
++		i2c0 = &i2c0;
++		i2c1 = &i2c1;
++		i2c2 = &i2c2;
++		i2c3 = &i2c3;
++		i2c4 = &i2c4;
++		i2c5 = &i2c5;
++		i2c6 = &i2c6;
++		i2c7 = &i2c7;
++		/*
+ 		 * Display component instance aliases. mediatek-drm resolves an
+ 		 * OVL/RDMA node to its DDP_COMPONENT_* id via of_alias_get_id();
+ 		 * with two OVL and two RDMA instances (primary DSI vs external
+@@ -1610,6 +1647,61 @@
+ 					regulator-min-microvolt = <3000000>;
+ 					regulator-max-microvolt = <3000000>;
+ 				};
++
++				/*
++				 * Camera rails (Track 4, #62/#63).
++				 *
++				 * Every one of the four sensors the vendor
++				 * k97 build carries (sp5506/OV5675,
++				 * sp5509 x2, st55a/S5K5E2YA) uses the same
++				 * three voltages in its power sequence
++				 * (vendor kd_camera_hw.c PowerOnList):
++				 *
++				 *     DOVDD 1.8 V  -> vcamio
++				 *     AVDD  2.8 V  -> vcama
++				 *     DVDD  1.2 V  -> vcamd
++				 *
++				 * min == max at exactly those values: the
++				 * VOSEL fields select from a small table
++				 * and nothing on this board has any reason
++				 * to move them. Both cameras share these
++				 * rails — the vendor kd_camera_hw1 node has
++				 * a single vcama/vcamd/vcamio supply and no
++				 * *_sub variants.
++				 */
++				mt6351_vcama_reg: vcama {
++					regulator-name = "vcama";
++					regulator-min-microvolt = <2800000>;
++					regulator-max-microvolt = <2800000>;
++				};
++
++				mt6351_vcamd_reg: vcamd {
++					regulator-name = "vcamd";
++					regulator-min-microvolt = <1200000>;
++					regulator-max-microvolt = <1200000>;
++				};
++
++				mt6351_vcamio_reg: vcamio {
++					regulator-name = "vcamio";
++					regulator-min-microvolt = <1800000>;
++					regulator-max-microvolt = <1800000>;
++				};
++
++				/*
++				 * AFVDD. Fixed 2.8 V, no VOSEL. The vendor
++				 * k97 DTS supplies vcamaf from vldo28
++				 * (kd_camera_hw1: vcamaf-supply =
++				 * <&mt_pmic_vldo28_ldo_reg>). Autofocus is
++				 * out of scope for #62, so nothing enables
++				 * this yet — it exists so the sensor power
++				 * sequences that list AFVDD can be followed
++				 * verbatim later.
++				 */
++				mt6351_vldo28_reg: vldo28 {
++					regulator-name = "vldo28";
++					regulator-min-microvolt = <2800000>;
++					regulator-max-microvolt = <2800000>;
++				};
+ 			};
+ 		};
+ 
+@@ -2553,3 +2645,151 @@
+ 		};
+ 	};
+ };
++
++/*
++ * ============================================================================
++ * CAMERA (Track 4 — issue #62, slice #63)
++ * ============================================================================
++ *
++ * Everything below is the bottom of the camera stack: power, clocks, memory
++ * arbitration and the two sensors' control buses. Nothing here produces an
++ * image; #64 onwards does that.
++ *
++ * Board facts, all from the vendor k97 device tree
++ * (07-kernel/ubports-3.18/arch/arm64/boot/dts/k97v1_64_bsp.dts, the
++ * "CAMERA GPIO standardization" block) unless stated otherwise:
++ *
++ *   cam0 (main/rear)   RST GPIO32   PDN GPIO28   MCLK CMMCLK0 = GPIO30
++ *   cam1 (sub/front)   RST GPIO33   PDN GPIO29   MCLK CMMCLK1 = GPIO31
++ *   cam2               commented out in the vendor DTS — not populated
++ *
++ * The vendor's cam2 pinctrl states are all empty bodies and its GPIO-driven
++ * external LDO states (GPIO73 for AVDD, GPIO254 for DVDD) are only reachable
++ * through PowerCustList entries that this board leaves GPIO_UNSUPPORTED for
++ * AVDD/DVDD/DOVDD (vendor kd_camera_hw.c). So on this board the main and sub
++ * sensors are powered from the PMIC rails above, not from GPIO LDOs, and
++ * there are exactly two cameras.
++ *
++ * Sensor I2C buses come from the vendor kd_sensorlist.c defaults for MT6797:
++ * SUPPORT_I2C_BUS_NUM1 = 2 (main), SUPPORT_I2C_BUS_NUM2 = 3 (sub).
++ */
++
++/*
++ * i2c2 — main (rear) camera control bus. Not previously enabled on this
++ * board. Pins from mt6797.dtsi i2c2_pins_a (SCL2_0 = GPIO96, SDA2_0 =
++ * GPIO95); the vendor DT carries no i2c pinmux at all (the preloader sets
++ * it), and GPIO95/96 are the only pins that carry SDA2/SCL2 at all in
++ * mt6797-pinfunc.h, so there is nothing else it could be.
++ *
++ * 100 kHz, not 400 kHz: nothing has yet proven what is on this bus, and the
++ * slower rate is the one every candidate sensor supports.
++ */
++&i2c2 {
++	pinctrl-names = "default";
++	pinctrl-0 = <&i2c2_pins_a>;
++	clock-frequency = <100000>;
++	status = "okay";
++};
++
++/*
++ * i2c3 is the sub (front) camera bus as well as the SiI9024A HDMI bridge's
++ * bus (bridge at 0x39, disabled). It is already enabled further up this
++ * file; nothing to add here.
++ *
++ * i2c3 has two pin options in mt6797-pinfunc.h — SCL3_0/SDA3_0 on GPIO74/75
++ * and SCL3_1/SDA3_1 on GPIO139/138 — and i2c3_pins_a (GPIO74/75) is the right
++ * one. That was an assumption inherited from the HDMI slice; it is not any
++ * more. The Gemini's own vendor DTB assigns GPIO135-141 to the SiI9024's I2S
++ * bundle (pinctrl state sil9022_i2s_func1, pins 0x8700..0x8d01), so GPIO138
++ * and GPIO139 are spoken for and GPIO74/75 is the only thing i2c3 can be.
++ */
++
++/* SMI LARB2 — camera memory arbiter. */
++&larb2 {
++	status = "okay";
++};
++
++&pio {
++	/*
++	 * Sensor master clocks. pinctrl-mt6797 implements pinmux only (no
++	 * pinconf), so the vendor's ISP_DRIVING_8MA drive strength cannot be
++	 * expressed here and the pads keep whatever the preloader left.
++	 */
++	camera_mclk_pins: camera-mclk-pins {
++		pins-mclk {
++			pinmux = <MT6797_GPIO30__FUNC_CMMCLK0>,
++				 <MT6797_GPIO31__FUNC_CMMCLK1>;
++		};
++	};
++};
++
++/*
++ * Camera bring-up power controller (#63 only).
++ *
++ * This node is scaffolding, and is meant to be deleted by #64: it exists
++ * because the rails, the MCLK and the reset/power-down lines cannot be
++ * driven from userspace, and until they are driven nobody can find out
++ * which sensors this board is fitted with. Once a sensor subdev driver
++ * exists, these properties move onto the sensor's own I2C node, which is
++ * where V4L2 expects them.
++ *
++ * The driver is a module, and udev does autoload it — so binding powers
++ * nothing. Writing 1 to its "socket_power" sysfs attribute runs the vendor
++ * power-on sequence and leaves both sockets up, so that an ordinary
++ * i2cdetect / i2ctransfer can talk to whatever is there; writing 0, or
++ * unloading the module, powers them down.
++ */
++/ {
++	camera_power: camera-power@1a040000 {
++		compatible = "planet,gemini-camera-power";
++
++		/*
++		 * SENINF0..2, for the per-sensor MCLK output enable only:
++		 * bit 29 of SENINFn + 0x600 (vendor cameraisp
++		 * camera_isp.c ISP_MCLK1_EN/ISP_MCLK2_EN/ISP_MCLK3_EN, which
++		 * read-modify-write exactly that bit at
++		 * ISP_SENINF{0,1,2}_BASE + 0x0600). Nothing else in the
++		 * SENINF block is touched — that is #65's business.
++		 */
++		reg = <0 0x1a040000 0 0x3000>;
++
++		power-domains = <&scpsys MT6797_POWER_DOMAIN_ISP>;
++
++		/*
++		 * camtg is the sensor MCLK gate; camtg_sel is the topckgen
++		 * mux feeding it. The vendor sets that mux to univpll_d26
++		 * ("CAM_PLL_48_GROUP", 48 MHz) — kd_sensorlist.c
++		 * kdSetSensorMclk — and every candidate sensor asks for a
++		 * 24 MHz MCLK (imgsensor_info.mclk = 24), so the SENINF MCLK
++		 * block divides by two. camsys and seninf gate the register
++		 * banks themselves.
++		 */
++		clocks = <&camsys CLK_CAM_CAMSYS>,
++			 <&camsys CLK_CAM_SENINF>,
++			 <&camsys CLK_CAM_CAMTG>,
++			 <&topckgen CLK_TOP_MUX_CAMTG>,
++			 <&topckgen CLK_TOP_UNIVPLL_D26>;
++		clock-names = "camsys", "seninf", "camtg",
++			      "camtg_sel", "univpll_d26";
++
++		vcama-supply = <&mt6351_vcama_reg>;
++		vcamd-supply = <&mt6351_vcamd_reg>;
++		vcamio-supply = <&mt6351_vcamio_reg>;
++
++		/*
++		 * RST is active low (vendor sequence drives it low, then
++		 * high at the end). PDN is the sensors' PWDNB pin, also
++		 * active low: the vendor drives it low with the rails off
++		 * and high once they are up.
++		 */
++		main-reset-gpios = <&pio 32 GPIO_ACTIVE_LOW>;
++		main-powerdown-gpios = <&pio 28 GPIO_ACTIVE_LOW>;
++		sub-reset-gpios = <&pio 33 GPIO_ACTIVE_LOW>;
++		sub-powerdown-gpios = <&pio 29 GPIO_ACTIVE_LOW>;
++
++		pinctrl-names = "default";
++		pinctrl-0 = <&camera_mclk_pins>;
++
++		status = "okay";
++	};
++};

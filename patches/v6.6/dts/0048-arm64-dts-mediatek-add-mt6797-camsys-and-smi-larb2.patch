@@ -1,0 +1,60 @@
+diff --git a/arch/arm64/boot/dts/mediatek/mt6797.dtsi b/arch/arm64/boot/dts/mediatek/mt6797.dtsi
+--- a/arch/arm64/boot/dts/mediatek/mt6797.dtsi
++++ b/arch/arm64/boot/dts/mediatek/mt6797.dtsi
+@@ -880,4 +880,56 @@
+ 		      <0 0x19200000 0 0x200000>,   /* GICR */
+ 		      <0 0x10240000 0 0x2000>;     /* GICC */
+ 	};
++
++	/*
++	 * ------------------------------------------------------------------
++	 * Camera subsystem. Addresses and interrupts from the vendor 3.18 DT
++	 * (arch/arm64/boot/dts/mt6797.dts, nodes camsys_config@1a000000 and
++	 * smi_larb2@1a001000). Track 4 / issue #62.
++	 * ------------------------------------------------------------------
++	 */
++
++	/*
++	 * camsys clock gates. Driven by clk-mt6797-cam.c; the gate table is
++	 * transcribed there from the vendor clk-mt6797.c cam_clks[].
++	 *
++	 * These registers live inside the ISP MTCMOS power domain, so a
++	 * consumer must hold MT6797_POWER_DOMAIN_ISP before enabling any
++	 * clock from here. The provider itself takes no power-domain
++	 * reference (mtk_clk_simple_probe has no runtime-PM support), which
++	 * matches how mainline already treats imgsys/vdecsys/vencsys on this
++	 * SoC.
++	 */
++	camsys: camsys_config@1a000000 {
++		compatible = "mediatek,mt6797-camsys", "syscon";
++		reg = <0 0x1a000000 0 0x1000>;
++		#clock-cells = <1>;
++	};
++
++	/*
++	 * SMI LARB2 — the camera pipeline's local arbiter onto the memory
++	 * bus. IRQ 258 level-low from the vendor DT node smi_larb2@1a001000.
++	 *
++	 * No "iommus"/M4U wiring here: the m4u node lists only larb0 today
++	 * (see its comment), and adding larb2 to that list is a change to
++	 * the display path's IOMMU that belongs with the slice that actually
++	 * DMAs camera frames (#65), not with bring-up of the clocks.
++	 *
++	 * Both clock cells are CLK_CAM_LARB2: the vendor gate table has a
++	 * single LARB2 gate, and mtk-smi requires two ("apb" and "smi") —
++	 * the same doubling larb0 already uses for CLK_MM_SMI_LARB0.
++	 *
++	 * Left disabled at SoC level; the board enables it.
++	 */
++	larb2: larb@1a001000 {
++		compatible = "mediatek,mt6797-smi-larb";
++		reg = <0 0x1a001000 0 0x1000>;
++		interrupts = <GIC_SPI 258 IRQ_TYPE_LEVEL_LOW>;
++		mediatek,smi = <&smi_common>;
++		power-domains = <&scpsys MT6797_POWER_DOMAIN_ISP>;
++		clocks = <&camsys CLK_CAM_LARB2>,
++			 <&camsys CLK_CAM_LARB2>;
++		clock-names = "apb", "smi";
++		status = "disabled";
++	};
+ };
