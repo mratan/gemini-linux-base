@@ -174,7 +174,7 @@ diff --git a/drivers/misc/gemini-camera-power.c b/drivers/misc/gemini-camera-pow
 new file mode 100644
 --- /dev/null
 +++ b/drivers/misc/gemini-camera-power.c
-@@ -0,0 +1,736 @@
+@@ -0,0 +1,741 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Gemini PDA camera bring-up power controller.
@@ -298,7 +298,7 @@ new file mode 100644
 +
 +#define SENINF_TOP_CTRL_EN		(BIT(10) | BIT(11))
 +
-+#define SENINF_MCLK_ENABLE		BIT(31)		/* HAL enable, NOT bit 29 */
++#define SENINF_MCLK_ENABLE		(BIT(31) | BIT(0))  /* vendor active value 0x80000001 */
 +#define SENINF_MCLK_BIT28		BIT(28)
 +#define SENINF_MCLK_LOW			(BIT(0) | BIT(1))
 +
@@ -428,13 +428,18 @@ new file mode 100644
 +	 * earlier revision of this driver set (which drives the pad to a static
 +	 * level) is wrong.
 +	 *
-+	 * IMPORTANT: this is necessary but not sufficient. Setting this value
-+	 * does NOT by itself clock the sensor — verified on both kernels, the
-+	 * sensor does not answer on I2C and the vendor's own camera_info stays
-+	 * empty when only the registers are set. The working clock additionally
-+	 * needs the vendor userspace HAL's CAMTG-PLL setup (the SET_MCLK_PLL
-+	 * ioctl's sendCommand path in libcam.halsensor.so), which this driver
-+	 * does not yet replicate. See 04-docs/CAMERA-SENSORS-2026-08-24.md.
++	 * The vendor's exact active value is 0x80000001 (bit 31 + bit 0),
++	 * captured from the running vendor HAL. But this is necessary and NOT
++	 * sufficient: with the ENTIRE SENINF page, camsys/imgsys clock gates,
++	 * ISP power domain and reset controllers all matching the vendor
++	 * byte-for-byte (verified 2026-08-24 by capturing the live vendor state
++	 * while its camera enumerated the sensor), the CMMCLK pad still does not
++	 * toggle and the sensor still does not answer on I2C. The remaining
++	 * difference is not any register value — it is the ISP clock-enable
++	 * SEQUENCE the vendor kernel performs (order and timing of the CCF
++	 * clock bring-up in cameraisp Prepare_Enable_ccf_clock), which a
++	 * register snapshot cannot reproduce. See
++	 * 04-docs/CAMERA-SENSORS-2026-08-24.md.
 +	 */
 +	writel(SENINF_MCLK_ENABLE, base + SENINF_MCLK_REG);
 +	dev_info(cam->dev, "seninf%u MCLK = 0x%08x (vendor value; see driver note)\n",
