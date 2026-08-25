@@ -174,7 +174,7 @@ diff --git a/drivers/misc/gemini-camera-power.c b/drivers/misc/gemini-camera-pow
 new file mode 100644
 --- /dev/null
 +++ b/drivers/misc/gemini-camera-power.c
-@@ -0,0 +1,845 @@
+@@ -0,0 +1,873 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Gemini PDA camera bring-up power controller.
@@ -612,6 +612,39 @@ new file mode 100644
 +	cam->img_on = false;
 +}
 +
++/*
++ * The complete vendor SENINF register state, captured live during the vendor
++ * camera stack's sensor enumeration (2026-08-25). {offset-from-seninf_base,
++ * value}. Writing all of this makes CMMCLK0 (pin30) and CMMCLK1 (pin31) toggle
++ * on the pads, which the single-register MCLK write never did.
++ */
++static const struct { u32 off; u32 val; } gemini_seninf_cfg[] = {
++	{ 0x0000, 0x00000c00 }, { 0x0008, 0x00043210 }, { 0x0010, 0x76543210 },
++	{ 0x0014, 0x00001100 }, { 0x0018, 0x00001100 },
++	{ 0x0200, 0x00000001 },
++	{ 0x0600, 0xa0000001 }, { 0x0604, 0x00010001 }, { 0x0608, 0x00300004 },
++	{ 0x0700, 0x018861e0 }, { 0x0a00, 0x01886160 }, { 0x0d00, 0x86df0080 },
++	{ 0x1200, 0x00000001 },
++	{ 0x1600, 0xa0000001 }, { 0x1604, 0x00010001 }, { 0x1608, 0x00300004 },
++	{ 0x1700, 0x018861e0 }, { 0x1a00, 0x01886160 }, { 0x1d00, 0x86df0080 },
++	{ 0x2600, 0x80000001 },
++};
++
++static void gemini_cam_seninf_config(struct gemini_cam *cam)
++{
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(gemini_seninf_cfg); i++)
++		writel(gemini_seninf_cfg[i].val,
++		       cam->seninf_base + gemini_seninf_cfg[i].off);
++
++	dev_info(cam->dev,
++		 "SENINF configured; CMMCLK top=0x%08x mux1=0x%08x TG1=0x%08x\n",
++		 readl(cam->seninf_base + 0x0000),
++		 readl(cam->seninf_base + 0x0d00),
++		 readl(cam->seninf_base + 0x0600));
++}
++
 +static int gemini_cam_power_on(struct gemini_cam *cam)
 +{
 +	int ret, i;
@@ -671,22 +704,17 @@ new file mode 100644
 +	/* Hold both sensors in reset while the rails come up. */
 +	gemini_cam_assert_resets(cam);
 +
-+	for (i = 0; i < ARRAY_SIZE(cam->socket); i++)
-+		gemini_cam_mclk_set(cam, cam->socket[i].seninf, true);
-+
-+	if (seninf_sen_ck) {
-+		for (i = 0; i < ARRAY_SIZE(cam->socket); i++) {
-+			void __iomem *r = cam->seninf_base +
-+					  cam->socket[i].seninf * SENINF_STRIDE +
-+					  SENINF_SEN_CK_REG;
-+
-+			writel(seninf_sen_ck, r);
-+		}
-+		dev_info(cam->dev, "SEN_CK forced to 0x%08x (readback 0x%08x)\n",
-+			 seninf_sen_ck,
-+			 readl(cam->seninf_base + cam->socket[1].seninf *
-+			       SENINF_STRIDE + SENINF_SEN_CK_REG));
-+	}
++	/*
++	 * Program the full SENINF pipeline, captured live from the vendor stack
++	 * (2026-08-25). This is the config that actually latches both CMMCLK
++	 * master clocks onto the pads; the earlier single-register MCLK write did
++	 * not, because it missed the seninf_mux enables (0x86df0080), the TG
++	 * +0x608 fields and the seninf-instance enables. Offsets are absolute
++	 * from seninf_base (0x1a040000); the real MT6797 map is seninf_top at +0,
++	 * SENINF1_TG at +0x600, seninf1_mux at +0xd00, SENINF2_TG at +0x1600, etc.
++	 * (MT6797 Functional Spec §6.10). See 04-docs/CAMERA-SENSORS-2026-08-24.md.
++	 */
++	gemini_cam_seninf_config(cam);
 +
 +	ret = regulator_enable(cam->vcamio);
 +	if (ret) {
