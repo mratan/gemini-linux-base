@@ -174,7 +174,7 @@ diff --git a/drivers/misc/gemini-camera-power.c b/drivers/misc/gemini-camera-pow
 new file mode 100644
 --- /dev/null
 +++ b/drivers/misc/gemini-camera-power.c
-@@ -0,0 +1,558 @@
+@@ -0,0 +1,672 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Gemini PDA camera bring-up power controller.
@@ -260,14 +260,24 @@ new file mode 100644
 + * 0 on this board — and an RMW of bit 29 alone yields 0x20000000, which is
 + * not a state the vendor ever produces.
 + *
-+ * What bit 0 selects is not documented anywhere available; setting it alone
-+ * did not make the sensor answer (2026-08-24). It is written here because
-+ * matching the vendor's known-good register value is strictly better than
-+ * matching half of it, not because it is understood.
++ * Bit 28 was found by bisecting this register against the CMMCLK pad's own
++ * DIN bit, with the pad muxed to CMMCLK and every other bit clear: it is the
++ * only bit of the 32 that makes the pad leave a static low. So it is the pad
++ * output enable, and since the vendor only ever read-modify-writes bit 29,
++ * bit 28 must already be set in the vendor's world — by something Linux does
++ * not run. It is set here for the same reason bit 0 is: matching the vendor's
++ * known-good register value is strictly better than matching part of it.
++ *
++ * Neither bit is understood, and neither makes the sensor answer. With bit 28
++ * set the pad goes to a STATIC HIGH, never a clock — measured, see
++ * 04-docs/CAMERA-SENSORS-2026-08-24.md. Whatever feeds the TG its clock is
++ * still missing, and that is the open end of #63.
 + */
 +#define SENINF_STRIDE			0x1000
 +#define SENINF_MCLK_REG			0x0600
++#define SENINF_SEN_CK_REG		0x0604
 +#define SENINF_MCLK_REST		0x00000001
++#define SENINF_MCLK_OUT_EN		BIT(28)
 +#define SENINF_MCLK_EN			BIT(29)
 +
 +/*
@@ -284,6 +294,44 @@ new file mode 100644
 +
 +/* Vendor power-sequence settle time, in milliseconds, between every step. */
 +#define CAM_STEP_DELAY_MS		10
++
++/*
++ * SENINF_TG<n>_SEN_CK (SENINF + 0x604), the register immediately after the
++ * MCLK enable, reset value 0x00010001.
++ *
++ * The vendor kernel never writes it, so this driver did not either — but the
++ * vendor's userspace mmaps the ISP window and does much of the SENINF setup
++ * there, so "the vendor kernel does not" is not evidence that nothing does.
++ * It matters because the CAMTG mux measures 48 MHz on the SoC's own frequency
++ * meter while every candidate sensor asks for a 24 MHz MCLK, so something has
++ * to halve it, and this is the only register in the path named for a sensor
++ * clock.
++ *
++ * 0 means "leave at whatever reset left", which is the behaviour up to build
++ * #73. Any other value is written during power-on, BEFORE the rails come up,
++ * so that a sensor which latches its configuration out of reset sees it. It
++ * is a sweep knob for bring-up, not a configuration: the field layout is not
++ * known.
++ */
++/*
++ * Override for the whole SENINF MCLK register (SENINF + 0x600) rather than
++ * just its enable bit. 0 keeps the driver's own SENINF_MCLK_REST|EN value.
++ *
++ * Bit 28 was found by bisecting this register against the CMMCLK pad's own
++ * DIN bit: with the pad muxed to CMMCLK and every other bit clear, bit 28 is
++ * the only one that makes the pad leave a static low. The vendor's
++ * ISP_MCLKn_EN only ever read-modify-writes bit 29, which means bit 28 must
++ * already be set in the vendor's world — by something Linux does not run.
++ */
++static unsigned int seninf_mclk;
++module_param(seninf_mclk, uint, 0644);
++MODULE_PARM_DESC(seninf_mclk,
++		 "override for SENINF+0x600 (0 = the driver's own REST|EN value)");
++
++static unsigned int seninf_sen_ck;
++module_param(seninf_sen_ck, uint, 0644);
++MODULE_PARM_DESC(seninf_sen_ck,
++		 "value to write to SENINF+0x604 during power-on (0 = leave at reset)");
 +
 +static bool autopower;
 +module_param(autopower, bool, 0444);
@@ -324,7 +372,11 @@ new file mode 100644
 +{
 +	void __iomem *reg = cam->seninf_base + seninf * SENINF_STRIDE +
 +			    SENINF_MCLK_REG;
-+	u32 val = SENINF_MCLK_REST | (on ? SENINF_MCLK_EN : 0);
++	u32 val = SENINF_MCLK_REST |
++		  (on ? (SENINF_MCLK_EN | SENINF_MCLK_OUT_EN) : 0);
++
++	if (on && seninf_mclk)
++		val = seninf_mclk;
 +
 +	writel(val, reg);
 +	dev_dbg(cam->dev, "seninf%u MCLK %s, reg now 0x%08x\n",
@@ -457,6 +509,20 @@ new file mode 100644
 +	for (i = 0; i < ARRAY_SIZE(cam->socket); i++)
 +		gemini_cam_mclk_set(cam, cam->socket[i].seninf, true);
 +
++	if (seninf_sen_ck) {
++		for (i = 0; i < ARRAY_SIZE(cam->socket); i++) {
++			void __iomem *r = cam->seninf_base +
++					  cam->socket[i].seninf * SENINF_STRIDE +
++					  SENINF_SEN_CK_REG;
++
++			writel(seninf_sen_ck, r);
++		}
++		dev_info(cam->dev, "SEN_CK forced to 0x%08x (readback 0x%08x)\n",
++			 seninf_sen_ck,
++			 readl(cam->seninf_base + cam->socket[1].seninf *
++			       SENINF_STRIDE + SENINF_SEN_CK_REG));
++	}
++
 +	ret = regulator_enable(cam->vcamio);
 +	if (ret) {
 +		dev_err(cam->dev, "vcamio (DOVDD): %d\n", ret);
@@ -558,8 +624,56 @@ new file mode 100644
 +}
 +static DEVICE_ATTR_RW(socket_power);
 +
++/*
++ * Re-run just the reset/power-down half of the power-on sequence, leaving the
++ * rails and clocks alone.
++ *
++ * This exists so that a register hypothesis can be tested without rebuilding
++ * the module. Many sensors latch configuration out of reset, so poking a
++ * SENINF register while the sensor is already running proves nothing; what is
++ * needed is "change the register, then release reset again", and the
++ * reset/power-down lines are held by this driver, so userspace cannot do the
++ * second half. With this, a sweep is an ordinary shell loop:
++ *
++ *	devmem <seninf reg> 32 <value>
++ *	echo 1 > reset_cycle
++ *	i2cdetect -y -r 3
++ *
++ * Bring-up scaffolding, like the rest of this driver. Goes away with it.
++ */
++static ssize_t reset_cycle_store(struct device *dev,
++				 struct device_attribute *attr,
++				 const char *buf, size_t count)
++{
++	struct gemini_cam *cam = dev_get_drvdata(dev);
++	int ret = 0, i;
++
++	mutex_lock(&cam->lock);
++	if (!cam->powered) {
++		dev_err(dev, "sockets are not powered; nothing to reset\n");
++		ret = -EINVAL;
++		goto out;
++	}
++
++	gemini_cam_assert_resets(cam);
++	msleep(CAM_STEP_DELAY_MS);
++
++	for (i = 0; i < ARRAY_SIZE(cam->socket); i++) {
++		gpiod_set_value_cansleep(cam->socket[i].reset, 0);
++		msleep(CAM_STEP_DELAY_MS);
++		gpiod_set_value_cansleep(cam->socket[i].powerdown, 0);
++		msleep(CAM_STEP_DELAY_MS);
++	}
++	dev_dbg(dev, "reset cycled on both sockets\n");
++out:
++	mutex_unlock(&cam->lock);
++	return ret ? ret : count;
++}
++static DEVICE_ATTR_WO(reset_cycle);
++
 +static struct attribute *gemini_cam_attrs[] = {
 +	&dev_attr_socket_power.attr,
++	&dev_attr_reset_cycle.attr,
 +	NULL,
 +};
 +ATTRIBUTE_GROUPS(gemini_cam);
