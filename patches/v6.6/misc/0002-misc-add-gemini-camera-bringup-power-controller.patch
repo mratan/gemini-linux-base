@@ -174,7 +174,7 @@ diff --git a/drivers/misc/gemini-camera-power.c b/drivers/misc/gemini-camera-pow
 new file mode 100644
 --- /dev/null
 +++ b/drivers/misc/gemini-camera-power.c
-@@ -0,0 +1,741 @@
+@@ -0,0 +1,845 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Gemini PDA camera bring-up power controller.
@@ -235,7 +235,9 @@ new file mode 100644
 +
 +#include <linux/bitops.h>
 +#include <linux/clk.h>
++#include <linux/clk-provider.h>
 +#include <linux/delay.h>
++#include <dt-bindings/clock/mt6797-clk.h>
 +#include <linux/gpio/consumer.h>
 +#include <linux/io.h>
 +#include <linux/module.h>
@@ -369,6 +371,30 @@ new file mode 100644
 +
 +static bool autopower;
 +module_param(autopower, bool, 0444);
++
++/*
++ * Diagnostic: enable the four imgsys CCF clocks (IMG_LARB6/DIP/DPE/FDVT) in the
++ * vendor's Prepare_Enable_ccf_clock order, between the ISP power domain and the
++ * CAM gates. The vendor enables these and we did not, so they were the last
++ * remaining difference from the captured working state. Fetched at runtime from
++ * the imgsys provider node so no DT phandle is needed (keeps this inside the =m
++ * module, which loads after userspace and cannot affect boot — unlike a DT
++ * phandle, whose effect on boot was never cleanly confirmed).
++ *
++ * RESULT (2026-08-24, on hardware): enabling all four imgsys clocks brings the
++ * live imgsys CG register to 0x3be, matching the vendor byte-for-byte, and the
++ * CMMCLK1 pad STILL does not toggle and the sensor STILL NAKs on I2C. So the
++ * imgsys clocks are NOT the missing piece. (img_larb6 needs the clk-mt6797-img
++ * onecell-size fix to come out of the provider — CLK_IMG_LARB6 == 4 but the
++ * onecell is sized 4; here it was ungated via devmem to complete the test.)
++ * Left in, default off, as a reproducible record of that negative result.
++ */
++static bool enable_img;
++module_param(enable_img, bool, 0644);
++
++struct gemini_cam;
++static void gemini_cam_img_enable(struct gemini_cam *cam);
++static void gemini_cam_img_disable(struct gemini_cam *cam);
 +MODULE_PARM_DESC(autopower,
 +		 "power the camera sockets up at probe (default: no — write 1 to socket_power instead)");
 +
@@ -390,6 +416,9 @@ new file mode 100644
 +	struct clk *camtg;
 +	struct clk *camtg_sel;
 +	struct clk *camtg_parent;
++	/* imgsys CCF clocks, fetched at runtime from the provider (no DT ref) */
++	struct clk *img_clk[4];
++	bool img_on;
 +
 +	struct regulator *vcama;	/* AVDD  2.8 V */
 +	struct regulator *vcamd;	/* DVDD  1.2 V */
@@ -489,6 +518,9 @@ new file mode 100644
 +	clk_disable_unprepare(cam->camsys);
 +	clk_disable_unprepare(cam->larb2);
 +
++	/* Drop the imgsys clocks while the ISP domain is still powered. */
++	gemini_cam_img_disable(cam);
++
 +	pm_runtime_put_sync(cam->dev);
 +	clk_disable_unprepare(cam->smi_common);
 +	cam->powered = false;
@@ -512,6 +544,74 @@ new file mode 100644
 +		dev_info(cam->dev, "%s: %d uV\n", what, uv);
 +}
 +
++/*
++ * Enable the imgsys CCF clocks by fetching them straight from the imgsys
++ * provider node (no consumer phandle in our DT). Must run with the ISP power
++ * domain already up — the CG registers live at 0x15000000, inside that domain.
++ */
++static const unsigned int gemini_img_ids[4] = {
++	CLK_IMG_LARB6, CLK_IMG_DIP, CLK_IMG_DPE, CLK_IMG_FDVT,
++};
++static const char *const gemini_img_names[4] = {
++	"img_larb6", "img_dip", "img_dpe", "img_fdvt",
++};
++
++static void gemini_cam_img_enable(struct gemini_cam *cam)
++{
++	struct device_node *np;
++	int i;
++
++	if (!enable_img || cam->img_on)
++		return;
++
++	np = of_find_compatible_node(NULL, NULL, "mediatek,mt6797-imgsys");
++	if (!np) {
++		dev_warn(cam->dev, "imgsys node not found; enable_img no-op\n");
++		return;
++	}
++
++	for (i = 0; i < 4; i++) {
++		struct of_phandle_args spec = {
++			.np = np, .args_count = 1,
++		};
++		int ret;
++
++		spec.args[0] = gemini_img_ids[i];
++		cam->img_clk[i] = of_clk_get_from_provider(&spec);
++		if (IS_ERR(cam->img_clk[i])) {
++			dev_warn(cam->dev, "img clk %s get: %ld\n",
++				 gemini_img_names[i], PTR_ERR(cam->img_clk[i]));
++			cam->img_clk[i] = NULL;
++			continue;
++		}
++		ret = clk_prepare_enable(cam->img_clk[i]);
++		if (ret)
++			dev_warn(cam->dev, "img clk %s enable: %d\n",
++				 gemini_img_names[i], ret);
++		else
++			dev_info(cam->dev, "img clk %s enabled\n",
++				 gemini_img_names[i]);
++	}
++	of_node_put(np);
++	cam->img_on = true;
++}
++
++static void gemini_cam_img_disable(struct gemini_cam *cam)
++{
++	int i;
++
++	if (!cam->img_on)
++		return;
++	for (i = 0; i < 4; i++) {
++		if (cam->img_clk[i]) {
++			clk_disable_unprepare(cam->img_clk[i]);
++			clk_put(cam->img_clk[i]);
++			cam->img_clk[i] = NULL;
++		}
++	}
++	cam->img_on = false;
++}
++
 +static int gemini_cam_power_on(struct gemini_cam *cam)
 +{
 +	int ret, i;
@@ -528,6 +628,9 @@ new file mode 100644
 +		dev_err(cam->dev, "ISP power domain did not come up: %d\n", ret);
 +		goto err_smi;
 +	}
++
++	/* Vendor order puts IMG_LARB6/DIP/DPE/FDVT here, after the ISP domain. */
++	gemini_cam_img_enable(cam);
 +
 +	ret = clk_prepare_enable(cam->larb2);
 +	if (ret) {
@@ -642,6 +745,7 @@ new file mode 100644
 +	clk_disable_unprepare(cam->camsys);
 +err_larb2:
 +	clk_disable_unprepare(cam->larb2);
++	gemini_cam_img_disable(cam);
 +err_pd:
 +	pm_runtime_put_sync(cam->dev);
 +err_smi:
