@@ -3,7 +3,7 @@ Subject: [PATCH] arm64: dts: mediatek: gemini: CAMSV0 capture node and its IOMMU
 diff --git a/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts b/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
 --- a/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
 +++ b/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
-@@ -2752,14 +2752,65 @@
+@@ -2752,14 +2752,75 @@
  };
  
  /*
@@ -32,10 +32,20 @@ diff --git a/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts b/arch/arm64/boo
 +		 * 0x8000 covers seninf_top through seninf8_mux (MT6797
 +		 * Functional Spec §6.10). CAMSV0 is 0x1a050000; the six CAMSV
 +		 * instances are 0x1000 apart and only the first is used.
++		 *
++		 * The third window is mipi_RX_ana, the CSI-2 analog receiver.
++		 * The datasheet bank table puts it at 0x10217000 and the
++		 * vendor DT calls the page after it "mipi_rx_ana_csi1" -- the
++		 * datasheet wins: 0x10218000 is mipi_TX_cphy and reads
++		 * nothing like a receiver. One page holds SIX banks 0x200
++		 * apart (CSI0A/B, CSI1A/B, CSI2A/B), which is why the
++		 * per-PHY-page layout of the MT8183 and MT8365 drivers does
++		 * not transfer.
 +		 */
 +		reg = <0 0x1a040000 0 0x8000>,
-+		      <0 0x1a050000 0 0x1000>;
-+		reg-names = "seninf", "camsv";
++		      <0 0x1a050000 0 0x1000>,
++		      <0 0x10217000 0 0x1000>;
++		reg-names = "seninf", "camsv", "mipi-ana";
 +
 +		/*
 +		 * CAMSV_0 pass-1 done, GIC SPI 252 (vendor DT node

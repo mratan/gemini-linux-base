@@ -3,7 +3,7 @@ Subject: [PATCH] misc: gemini-cam-bridge: SENINF CSI-2 receiver and CAMSV captur
 diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 --- a/drivers/misc/gemini-cam-bridge.c
 +++ b/drivers/misc/gemini-cam-bridge.c
-@@ -1,155 +1,1685 @@
+@@ -1,155 +1,1895 @@
  // SPDX-License-Identifier: GPL-2.0-only
  /*
 - * Gemini PDA camera media-graph bridge.
@@ -134,7 +134,23 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 +#define SENINF_TG_TM_CLK			0x0610
 +#define SENINF_TG_TM_STP			0x0614
 +
++/*
++ * mipi_RX_config_csi<n>, at seninf instance + 0x800 (MT6797 Functional Spec
++ * §6.10 bank table). This is the digital half of the D-PHY, and it is the
++ * piece neither the MT8183 RFC nor the MT8365 upstream driver configures --
++ * they were written for parts where it comes up usable at reset. Offsets and
++ * values are transcribed from SeninfDrvImp::setSeninfCSI2 in the vendor HAL
++ * (libcam.halsensor.so, /vendor/lib64 of the stock system image).
++ */
 +#define SENINF_MIPI_RX_CON24			0x0824
++#define SENINF_MIPI_RX_LANE_EN(n)		(0x088c + (n) * 4)  /* 0..3 data */
++#define SENINF_MIPI_RX_CLK_LANE_EN		0x08a0
++#define SENINF_MIPI_RX_CONB0			0x08b0
++#define SENINF_MIPI_RX_CONB4			0x08b4
++#define SENINF_MIPI_RX_CONB8			0x08b8
++#define SENINF_MIPI_RX_CONBC			0x08bc
++#define SENINF_MIPI_RX_CONC0			0x08c0
++#define SENINF_MIPI_RX_COND0			0x08d0
 +#define SENINF_MIPI_RX_CON24_LN0_MUX		GENMASK(25, 24)
 +#define SENINF_MIPI_RX_CON24_LN1_MUX		GENMASK(27, 26)
 +#define SENINF_MIPI_RX_CON24_LN2_MUX		GENMASK(29, 28)
@@ -155,7 +171,18 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 +#define SENINF_CSI2_DGB_SEL_DEBUG_EN		BIT(31)
 +#define SENINF_CSI2_DGB_PORT			0x0a1c
 +#define SENINF_CSI2_SPARE0			0x0a20
++#define SENINF_CSI2_INT_EN			0x0a10
++#define SENINF_CSI2_INT_STATUS			0x0a14
 +#define SENINF_CSI2_LNRC_FSM			0x0a28
++#define SENINF_CSI2_LNRD_FSM			0x0a2c
++#define SENINF_CSI2_FRAME_LINE_NUM		0x0a30
++#define SENINF_CSI2_HSRX_DBG			0x0a38
++#define SENINF_CSI2_HSRX_DBG_EN_ALL		0x1f
++#define SENINF_CSI2_CTRL_TRIO_CON		0x0a7c
++#define SENINF_CSI2_SYNC_RESYNC_CTL		0x0aa8
++#define SENINF_CSI2_POST_DETECT_CTL		0x0aac
++#define SENINF_CSI2_INT_EN_EXT			0x0b10
++#define SENINF_CSI2_INT_STATUS_EXT		0x0b14
 +#define SENINF_CSI2_HS_TRAIL			0x0a40
 +#define SENINF_CSI2_HS_TRAIL_PARAM		GENMASK(7, 0)
 +#define SENINF_CSI2_RESYNC_MERGE_CTL		0x0a74
@@ -168,6 +195,39 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 +#define SENINF_CSI2_DPHY_SYNC			0x0b20
 +#define SENINF_CSI2_DPHY_SYNC_MASK_0		GENMASK(15, 0)
 +#define SENINF_CSI2_DPHY_SYNC_PAT_0		GENMASK(31, 16)
+ 
+-struct gemini_cam_bridge {
++/*
++ * mipi_RX_ana (0x10217000). One page, but NOT one PHY: MT6797 packs six
++ * identical banks 0x200 apart -- CSI0A, CSI0B, CSI1A, CSI1B, CSI2A, CSI2B --
++ * where MT8183 gave each its own 0x1000 page. Which bank belongs to which
++ * socket is board wiring; on this device the front sensor answers on the bank
++ * at +0x400, established by configuring one bank at a time and watching which
++ * one makes the SENINF lane state machines leave idle.
++ */
++#define MIPI_RX_ANA_BANK_STRIDE			0x200
++#define MIPI_RX_ANA00				0x0000
++#define MIPI_RX_ANA00_CPHY_EN			BIT(0)
++#define MIPI_RX_ANA00_BG_LPF_EN			BIT(2)
++#define MIPI_RX_ANA00_BG_CORE_EN		BIT(3)
++#define MIPI_RX_ANA00_L0_CKMODE_EN		BIT(5)
++#define MIPI_RX_ANA00_L0_CKSEL			BIT(6)
++#define MIPI_RX_ANA00_L1_CKMODE_EN		BIT(8)
++#define MIPI_RX_ANA00_L1_CKSEL			BIT(9)
++#define MIPI_RX_ANA00_L2_CKMODE_EN		BIT(11)
++#define MIPI_RX_ANA00_L2_CKSEL			BIT(12)
++/* Bits 4, 7 and 10 are set at reset and the vendor clears all three. */
++#define MIPI_RX_ANA00_RESET_BITS		(BIT(4) | BIT(7) | BIT(10))
++#define MIPI_RX_ANA04				0x0004
++#define MIPI_RX_ANA04_F1			GENMASK(10, 8)
++#define MIPI_RX_ANA04_F2			GENMASK(15, 12)
++#define MIPI_RX_ANA18				0x0018
++#define MIPI_RX_ANA1C				0x001c
++#define MIPI_RX_ANA20				0x0020
++#define MIPI_RX_ANA_EQ_IS			GENMASK(7, 6)
++#define MIPI_RX_ANA_EQ_BW			GENMASK(23, 22)
++#define MIPI_RX_WRAPPER80			0x0080
++#define MIPI_RX_WRAPPER80_F			GENMASK(7, 4)
 +
 +/* Per-mux, relative to seninf_top + mux * SENINF_INST_STRIDE. */
 +#define SENINF_MUX_CTRL				0x0d00
@@ -333,6 +393,23 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 +module_param(use_fbc, bool, 0644);
 +MODULE_PARM_DESC(use_fbc, "use the CAMSV frame-buffer controller (default yes)");
 +
++/*
++ * Which mipi_RX_ana bank drives this socket's D-PHY, as a byte offset into the
++ * page. 0x400 (CSI1A) is the front sensor's on this board; the others are
++ * 0x000, 0x200, 0x600, 0x800 and 0xa00.
++ */
++static unsigned int phy_bank = 0x400;
++module_param(phy_bank, uint, 0644);
++MODULE_PARM_DESC(phy_bank, "mipi_RX_ana bank offset for this socket's D-PHY");
++
++/*
++ * Which of the three analog lanes in that bank carries the DDR clock. The
++ * vendor's 2D1C configuration uses lane 1, leaving lanes 0 and 2 for data.
++ */
++static unsigned int phy_clock_lane = 1;
++module_param(phy_clock_lane, uint, 0644);
++MODULE_PARM_DESC(phy_clock_lane, "analog lane carrying the CSI-2 clock (0, 1 or 2)");
++
 +static int lane_mux = -1;
 +module_param(lane_mux, int, 0644);
 +MODULE_PARM_DESC(lane_mux,
@@ -363,9 +440,13 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 +	u32 csi2_packets;	/* CSI-2 debug port, sampled at stream stop */
 +	u32 tg_frmsize;		/* TG-reported frame size, sampled at stop */
 +	u32 fbc;		/* CAMSV_IMGO_FBC, sampled at stop */
++	u32 csi2_int;		/* CSI-2 error word */
++	u32 csi2_int_ext;
++	u32 lane_fsm;		/* data-lane state machines */
++	u32 clk_fsm;		/* clock-lane state machine */
++	u32 frame_line;		/* CSI-2 frame/line counter */
 +};
- 
--struct gemini_cam_bridge {
++
 +struct gemini_cam {
  	struct device *dev;
  	struct v4l2_device v4l2_dev;
@@ -374,6 +455,7 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 +
 +	void __iomem *seninf;
 +	void __iomem *camsv;
++	void __iomem *mipi_ana;
 +	struct clk_bulk_data clks[3];
 +	int num_clks;
 +	int irq;
@@ -398,8 +480,11 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 +
 +	struct gemini_cam_stats stats;
 +	struct dentry *debugfs;
-+};
-+
+ };
+ 
+-static int gemini_bridge_bound(struct v4l2_async_notifier *notifier,
+-			       struct v4l2_subdev *sd,
+-			       struct v4l2_async_connection *asc)
 +static inline struct gemini_cam *sd_to_cam(struct v4l2_subdev *sd)
 +{
 +	return container_of(sd, struct gemini_cam, sd);
@@ -489,7 +574,9 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 + * Both crossbars are nibble-per-consumer tables.
 + */
 +static void gemini_cam_seninf_route(struct gemini_cam *cam)
-+{
+ {
+-	struct gemini_cam_bridge *b =
+-		container_of(notifier, struct gemini_cam_bridge, notifier);
 +	u32 val;
 +
 +	val = readl(cam->seninf + SENINF_TOP_MUX_CTRL) & ~(0xf << (seninf_mux * 4));
@@ -545,6 +632,112 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 +		 readl(cam->seninf + SENINF_TOP_CAM_MUX_CTRL));
 +}
 +
++/*
++ * The analog D-PHY, 2D1C. Transcribed from SeninfDrvImp::setSeninfCSI2 in the
++ * vendor HAL: CPHY off, exactly one analog lane put in clock mode and the
++ * other two left as data, the three reset bits cleared, an equaliser tune, and
++ * only then the bandgap core and its filter switched on. The bandgap must come
++ * last -- the vendor powers it up after every other field is settled, with a
++ * pause between the core and the filter.
++ */
++static void gemini_cam_phy_setup(struct gemini_cam *cam)
++{
++	void __iomem *ana = cam->mipi_ana + phy_bank;
++	static const u32 ckmode[3] = {
++		MIPI_RX_ANA00_L0_CKMODE_EN,
++		MIPI_RX_ANA00_L1_CKMODE_EN,
++		MIPI_RX_ANA00_L2_CKMODE_EN,
++	};
++	u32 val;
++	int i;
++
++	val = readl(ana + MIPI_RX_ANA00);
++	val &= ~(MIPI_RX_ANA00_CPHY_EN | MIPI_RX_ANA00_RESET_BITS |
++		 MIPI_RX_ANA00_L0_CKMODE_EN | MIPI_RX_ANA00_L0_CKSEL |
++		 MIPI_RX_ANA00_L1_CKMODE_EN | MIPI_RX_ANA00_L1_CKSEL |
++		 MIPI_RX_ANA00_L2_CKMODE_EN | MIPI_RX_ANA00_L2_CKSEL);
++	val |= ckmode[phy_clock_lane % 3];
++	writel(val, ana + MIPI_RX_ANA00);
++
++	reg_update(ana + MIPI_RX_WRAPPER80, MIPI_RX_WRAPPER80_F,
++		   FIELD_PREP(MIPI_RX_WRAPPER80_F, 1));
++	reg_update(ana + MIPI_RX_ANA04, MIPI_RX_ANA04_F1,
++		   FIELD_PREP(MIPI_RX_ANA04_F1, 6));
++	reg_update(ana + MIPI_RX_ANA04, MIPI_RX_ANA04_F2,
++		   FIELD_PREP(MIPI_RX_ANA04_F2, 1));
++
++	for (i = 0; i < 3; i++) {
++		void __iomem *eq = ana + MIPI_RX_ANA18 + i * 4;
++
++		reg_update(eq, MIPI_RX_ANA_EQ_IS, FIELD_PREP(MIPI_RX_ANA_EQ_IS, 1));
++		reg_update(eq, MIPI_RX_ANA_EQ_BW, FIELD_PREP(MIPI_RX_ANA_EQ_BW, 1));
++	}
++
++	writel(readl(ana + MIPI_RX_ANA00) | MIPI_RX_ANA00_BG_CORE_EN,
++	       ana + MIPI_RX_ANA00);
++	udelay(30);
++	writel(readl(ana + MIPI_RX_ANA00) | MIPI_RX_ANA00_BG_LPF_EN,
++	       ana + MIPI_RX_ANA00);
++	udelay(1);
++
++	dev_dbg(cam->dev, "D-PHY bank 0x%x: ANA00 0x%08x (clock lane %u)\n",
++		phy_bank, readl(ana + MIPI_RX_ANA00), phy_clock_lane);
++}
+ 
+-	dev_info(b->dev, "sensor subdev '%s' bound to the media graph\n",
++/*
++ * The digital half of the receiver: which physical lanes are enabled, the
++ * deskew/timing block, and the HS receiver enable pulse. None of this is in
++ * the upstream MediaTek SENINF drivers; all of it is in the vendor HAL, and
++ * without it the clock lane never leaves its low-power state.
++ */
++static void gemini_cam_rx_config(struct gemini_cam *cam)
++{
++	void __iomem *inst = seninf_inst_base(cam);
++	unsigned int num_lanes = cam->bus.num_data_lanes;
++	unsigned int i;
++
++	/* Pulse every HS receiver on, then off: the vendor's wake sequence. */
++	writel(readl(inst + SENINF_CSI2_HSRX_DBG) |
++	       SENINF_CSI2_HSRX_DBG_EN_ALL, inst + SENINF_CSI2_HSRX_DBG);
++	writel(readl(inst + SENINF_CSI2_HSRX_DBG) &
++	       ~SENINF_CSI2_HSRX_DBG_EN_ALL, inst + SENINF_CSI2_HSRX_DBG);
++
++	writel(SENINF_SETTLE_DELAY << 8, inst + SENINF_CSI2_LNRD_TIMING);
++
++	/* One enable per physical data lane, plus the clock lane's own. */
++	for (i = 0; i < 4; i++) {
++		void __iomem *en = inst + SENINF_MIPI_RX_LANE_EN(i);
++
++		writel(i < num_lanes ? (readl(en) | 1) : (readl(en) & ~1u), en);
++	}
++	writel(readl(inst + SENINF_MIPI_RX_CLK_LANE_EN) | 1,
++	       inst + SENINF_MIPI_RX_CLK_LANE_EN);
++
++	/* Deskew / timing block, vendor values. */
++	reg_update(inst + SENINF_MIPI_RX_CONB0, 0xc00f0000u, 0x80010000u);
++	reg_update(inst + SENINF_MIPI_RX_CONB0, 0x0000f70fu, 0x00000400u);
++	writel(0xffffffff, inst + SENINF_MIPI_RX_CONB4);
++	writel(0x01ff0000, inst + SENINF_MIPI_RX_CONB8);
++	writel(0x800000ff, inst + SENINF_MIPI_RX_CONC0);
++	reg_update(inst + SENINF_MIPI_RX_CONB8, 0x00000f0fu, 0x00000101u);
++	reg_update(inst + SENINF_MIPI_RX_CONBC, 0x030f7f0fu, 0x00050400u);
++	reg_update(inst + SENINF_MIPI_RX_COND0, 0x0000003fu, 0x0000000fu);
++
++	/* Decode configuration the upstream drivers leave at zero. */
++	writel(0x15, inst + SENINF_CSI2_CTRL_TRIO_CON);
++	writel(0x402, inst + SENINF_CSI2_MODE);
++	reg_update(inst + SENINF_CSI2_RESYNC_MERGE_CTL, 0x17u, 0x15u);
++	reg_update(inst + SENINF_CSI2_SYNC_RESYNC_CTL, 0x7u, 0x1u);
++	writel(readl(inst + SENINF_CSI2_POST_DETECT_CTL) | 2,
++	       inst + SENINF_CSI2_POST_DETECT_CTL);
++
++	/* Report every CSI-2 error the block can raise. */
++	writel(0x9fffffff, inst + SENINF_CSI2_INT_EN);
++	writel(0x9fffffff, inst + SENINF_CSI2_INT_STATUS);
++	writel(SENINF_CSI2_HSRX_DBG_EN_ALL, inst + SENINF_CSI2_INT_EN_EXT);
++}
++
 +static void gemini_cam_seninf_start(struct gemini_cam *cam)
 +{
 +	void __iomem *inst = seninf_inst_base(cam);
@@ -562,15 +755,14 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 +		   SENINF_TOP_CTRL_PCLK_EN | SENINF_TOP_CTRL_PCLK2_EN,
 +		   SENINF_TOP_CTRL_PCLK_EN | SENINF_TOP_CTRL_PCLK2_EN);
 +
-+	/* D-PHY: 4D1C mode, clock lane select, lane mux enable. */
-+	seninf_top_update(cam, SENINF_TOP_PHY_CTL(seninf_csi),
-+			  SENINF_TOP_PHY_CTL_DPHY_MODE, 0);
-+	seninf_top_update(cam, SENINF_TOP_PHY_CTL(seninf_csi),
-+			  SENINF_TOP_PHY_CTL_CK_SEL_1, cam->bus.clock_lane);
-+	seninf_top_update(cam, SENINF_TOP_PHY_CTL(seninf_csi),
-+			  SENINF_TOP_PHY_CTL_CK_SEL_2, 2);
-+	seninf_top_update(cam, SENINF_TOP_PHY_CTL(seninf_csi),
-+			  SENINF_TOP_PHY_CTL_LANE_MUX_EN, 1);
++	/*
++	 * SENINF_TOP_PHY_SENINF_CTL_CSI<n> (+0x1c/0x20/0x24) is deliberately
++	 * NOT written. That is where MT8183 and MT8365 put the D-PHY lane-mux
++	 * enable; on MT6797 those three words read back zero and drop writes,
++	 * because the part predates them. The analog PHY is configured through
++	 * mipi_RX_ana instead, and the SENINF-to-PHY mapping is fixed.
++	 */
++	gemini_cam_phy_setup(cam);
 +
 +	reg_update(inst + SENINF_MIPI_RX_CON24,
 +		   SENINF_MIPI_RX_CON24_LN0_MUX | SENINF_MIPI_RX_CON24_LN1_MUX |
@@ -649,6 +841,8 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 +
 +	writel(0xfffffffe, inst + SENINF_CSI2_SPARE0);
 +
++	gemini_cam_rx_config(cam);
++
 +	/* Commit the CSI-2 configuration. */
 +	inst_update(cam, SENINF_CTRL, SENINF_CTRL_CSI2_SW_RST, 1);
 +	udelay(1);
@@ -701,6 +895,11 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 +
 +	/* Sample the instruments before tearing the receiver down. */
 +	cam->stats.csi2_packets = readl(inst + SENINF_CSI2_DGB_PORT);
++	cam->stats.csi2_int = readl(inst + SENINF_CSI2_INT_STATUS);
++	cam->stats.csi2_int_ext = readl(inst + SENINF_CSI2_INT_STATUS_EXT);
++	cam->stats.lane_fsm = readl(inst + SENINF_CSI2_LNRD_FSM);
++	cam->stats.clk_fsm = readl(inst + SENINF_CSI2_LNRC_FSM);
++	cam->stats.frame_line = readl(inst + SENINF_CSI2_FRAME_LINE_NUM);
 +
 +	val = readl(inst + SENINF_CSI2_CTL);
 +	val &= ~(SENINF_CSI2_CTL_CLOCK_LANE_EN | 0xf);
@@ -1139,6 +1338,11 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 +		 cam->stats.tg_err, cam->stats.tg_gberr, cam->stats.imgo_err,
 +		 cam->stats.imgo_overrun, cam->stats.mux_intsta,
 +		 cam->stats.csi2_packets, cam->stats.tg_frmsize);
++	dev_info(cam->dev,
++		 "  csi-2: int 0x%08x/0x%08x, lane fsm 0x%08x, clock fsm 0x%08x, frame/line 0x%08x\n",
++		 cam->stats.csi2_int, cam->stats.csi2_int_ext,
++		 cam->stats.lane_fsm, cam->stats.clk_fsm,
++		 cam->stats.frame_line);
 +
 +	pm_runtime_put(cam->dev);
 +}
@@ -1151,11 +1355,8 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 +	.stop_streaming = gemini_cam_stop_streaming,
 +	.wait_prepare = vb2_ops_wait_prepare,
 +	.wait_finish = vb2_ops_wait_finish,
- };
- 
--static int gemini_bridge_bound(struct v4l2_async_notifier *notifier,
--			       struct v4l2_subdev *sd,
--			       struct v4l2_async_connection *asc)
++};
++
 +/* -------------------------------------------------------------------------
 + * V4L2 ioctls
 + */
@@ -1178,12 +1379,9 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 +
 +static int gemini_cam_g_fmt(struct file *file, void *priv,
 +			    struct v4l2_format *f)
- {
--	struct gemini_cam_bridge *b =
--		container_of(notifier, struct gemini_cam_bridge, notifier);
++{
 +	struct gemini_cam *cam = video_drvdata(file);
- 
--	dev_info(b->dev, "sensor subdev '%s' bound to the media graph\n",
++
 +	f->fmt.pix = cam->format;
 +	return 0;
 +}
@@ -1301,6 +1499,13 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 +	seq_printf(s, "csi2_packets   %u\n", st->csi2_packets);
 +	seq_printf(s, "tg_frmsize     0x%08x\n", st->tg_frmsize);
 +	seq_printf(s, "fbc            0x%08x\n", st->fbc);
++	seq_printf(s, "csi2_int       0x%08x\n", st->csi2_int);
++	seq_printf(s, "csi2_int_ext   0x%08x\n", st->csi2_int_ext);
++	seq_printf(s, "lane_fsm       0x%08x\n", st->lane_fsm);
++	seq_printf(s, "clk_fsm        0x%08x\n", st->clk_fsm);
++	seq_printf(s, "frame_line     0x%08x\n", st->frame_line);
++	seq_printf(s, "phy            bank 0x%x clock lane %u\n",
++		   phy_bank, phy_clock_lane);
 +
 +	if (pm_runtime_get_if_in_use(cam->dev) > 0) {
 +		void __iomem *inst = seninf_inst_base(cam);
@@ -1514,6 +1719,11 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 +		return dev_err_probe(dev, PTR_ERR(cam->camsv),
 +				     "cannot map CAMSV\n");
 +
++	cam->mipi_ana = devm_platform_ioremap_resource_byname(pdev, "mipi-ana");
++	if (IS_ERR(cam->mipi_ana))
++		return dev_err_probe(dev, PTR_ERR(cam->mipi_ana),
++				     "cannot map the MIPI RX analog PHY\n");
++
 +	cam->clks[0].id = "camsv0";
 +	cam->clks[1].id = "camsv1";
 +	cam->clks[2].id = "camsv2";
@@ -1588,17 +1798,17 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 +	if (ret) {
 +		dev_err(dev, "register seninf subdev: %d\n", ret);
 +		goto err_sd_entity;
- 	}
- 
--	asc = v4l2_async_nf_add_fwnode_remote(&b->notifier, ep,
++	}
++
 +	/* The capture video node. */
 +	vdev_pad = devm_kzalloc(dev, sizeof(*vdev_pad), GFP_KERNEL);
 +	if (!vdev_pad) {
 +		ret = -ENOMEM;
 +		goto err_sd;
-+	}
+ 	}
 +	vdev_pad->flags = MEDIA_PAD_FL_SINK;
-+
+ 
+-	asc = v4l2_async_nf_add_fwnode_remote(&b->notifier, ep,
 +	cam->format.width = 1296;
 +	cam->format.height = 972;
 +	gemini_cam_fill_format(&cam->format);
@@ -1700,6 +1910,18 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 +}
 +
 +static int gemini_cam_runtime_resume(struct device *dev)
++{
++	struct gemini_cam *cam = dev_get_drvdata(dev);
++
++	/*
++	 * The genpd (gemini-camera) has already brought the rails, the ISP
++	 * domain and the camsys gates up by the time this runs; the CAMSV
++	 * gates live in that same domain and are ours to hold.
++	 */
++	return clk_bulk_prepare_enable(cam->num_clks, cam->clks);
++}
++
++static int gemini_cam_runtime_suspend(struct device *dev)
  {
 -	struct gemini_cam_bridge *b = platform_get_drvdata(pdev);
 +	struct gemini_cam *cam = dev_get_drvdata(dev);
@@ -1709,23 +1931,11 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 -	media_device_unregister(&b->mdev);
 -	v4l2_device_unregister(&b->v4l2_dev);
 -	media_device_cleanup(&b->mdev);
-+	/*
-+	 * The genpd (gemini-camera) has already brought the rails, the ISP
-+	 * domain and the camsys gates up by the time this runs; the CAMSV
-+	 * gates live in that same domain and are ours to hold.
-+	 */
-+	return clk_bulk_prepare_enable(cam->num_clks, cam->clks);
++	clk_bulk_disable_unprepare(cam->num_clks, cam->clks);
++	return 0;
  }
  
 -static const struct of_device_id gemini_bridge_of_match[] = {
-+static int gemini_cam_runtime_suspend(struct device *dev)
-+{
-+	struct gemini_cam *cam = dev_get_drvdata(dev);
-+
-+	clk_bulk_disable_unprepare(cam->num_clks, cam->clks);
-+	return 0;
-+}
-+
 +static const struct dev_pm_ops gemini_cam_pm_ops = {
 +	RUNTIME_PM_OPS(gemini_cam_runtime_suspend, gemini_cam_runtime_resume,
 +		       NULL)
