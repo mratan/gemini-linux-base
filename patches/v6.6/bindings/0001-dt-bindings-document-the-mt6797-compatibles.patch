@@ -1,0 +1,257 @@
+Subject: [PATCH] dt-bindings: document the MT6797 display, PHY and IOMMU compatibles
+
+diff --git a/Documentation/devicetree/bindings/arm/mediatek.yaml b/Documentation/devicetree/bindings/arm/mediatek.yaml
+--- a/Documentation/devicetree/bindings/arm/mediatek.yaml
++++ b/Documentation/devicetree/bindings/arm/mediatek.yaml
+@@ -64,6 +64,7 @@
+           - enum:
+               - archermind,mt6797-x20-dev
+               - mediatek,mt6797-evb
++              - planet,gemini-pda
+           - const: mediatek,mt6797
+       - items:
+           - enum:
+diff --git a/Documentation/devicetree/bindings/vendor-prefixes.yaml b/Documentation/devicetree/bindings/vendor-prefixes.yaml
+--- a/Documentation/devicetree/bindings/vendor-prefixes.yaml
++++ b/Documentation/devicetree/bindings/vendor-prefixes.yaml
+@@ -1053,6 +1053,8 @@
+     description: Shenzhen PineRiver Designs Co., Ltd.
+   "^pixcir,.*":
+     description: PIXCIR MICROELECTRONICS Co., Ltd
++  "^planet,.*":
++    description: Planet Computers Ltd.
+   "^plantower,.*":
+     description: Plantower Co., Ltd
+   "^plathome,.*":
+diff --git a/Documentation/devicetree/bindings/display/mediatek/mediatek,aal.yaml b/Documentation/devicetree/bindings/display/mediatek/mediatek,aal.yaml
+--- a/Documentation/devicetree/bindings/display/mediatek/mediatek,aal.yaml
++++ b/Documentation/devicetree/bindings/display/mediatek/mediatek,aal.yaml
+@@ -22,6 +22,7 @@
+   compatible:
+     oneOf:
+       - enum:
++          - mediatek,mt6797-disp-aal
+           - mediatek,mt8173-disp-aal
+           - mediatek,mt8183-disp-aal
+       - items:
+diff --git a/Documentation/devicetree/bindings/display/mediatek/mediatek,ccorr.yaml b/Documentation/devicetree/bindings/display/mediatek/mediatek,ccorr.yaml
+--- a/Documentation/devicetree/bindings/display/mediatek/mediatek,ccorr.yaml
++++ b/Documentation/devicetree/bindings/display/mediatek/mediatek,ccorr.yaml
+@@ -30,6 +30,10 @@
+               - mediatek,mt8188-disp-ccorr
+               - mediatek,mt8195-disp-ccorr
+           - const: mediatek,mt8192-disp-ccorr
++      - items:
++          - enum:
++              - mediatek,mt6797-disp-ccorr
++          - const: mediatek,mt8183-disp-ccorr
+ 
+   reg:
+     maxItems: 1
+diff --git a/Documentation/devicetree/bindings/display/mediatek/mediatek,color.yaml b/Documentation/devicetree/bindings/display/mediatek/mediatek,color.yaml
+--- a/Documentation/devicetree/bindings/display/mediatek/mediatek,color.yaml
++++ b/Documentation/devicetree/bindings/display/mediatek/mediatek,color.yaml
+@@ -34,6 +34,7 @@
+       - items:
+           - enum:
+               - mediatek,mt6795-disp-color
++              - mediatek,mt6797-disp-color
+               - mediatek,mt8183-disp-color
+               - mediatek,mt8186-disp-color
+               - mediatek,mt8188-disp-color
+diff --git a/Documentation/devicetree/bindings/display/mediatek/mediatek,dither.yaml b/Documentation/devicetree/bindings/display/mediatek/mediatek,dither.yaml
+--- a/Documentation/devicetree/bindings/display/mediatek/mediatek,dither.yaml
++++ b/Documentation/devicetree/bindings/display/mediatek/mediatek,dither.yaml
+@@ -26,6 +26,7 @@
+           - mediatek,mt8183-disp-dither
+       - items:
+           - enum:
++              - mediatek,mt6797-disp-dither
+               - mediatek,mt8186-disp-dither
+               - mediatek,mt8188-disp-dither
+               - mediatek,mt8192-disp-dither
+diff --git a/Documentation/devicetree/bindings/display/mediatek/mediatek,dsc.yaml b/Documentation/devicetree/bindings/display/mediatek/mediatek,dsc.yaml
+--- a/Documentation/devicetree/bindings/display/mediatek/mediatek,dsc.yaml
++++ b/Documentation/devicetree/bindings/display/mediatek/mediatek,dsc.yaml
+@@ -22,6 +22,10 @@
+     oneOf:
+       - enum:
+           - mediatek,mt8195-disp-dsc
++      - items:
++          - enum:
++              - mediatek,mt6797-disp-dsc
++          - const: mediatek,mt8195-disp-dsc
+ 
+   reg:
+     maxItems: 1
+diff --git a/Documentation/devicetree/bindings/display/mediatek/mediatek,dsi.yaml b/Documentation/devicetree/bindings/display/mediatek/mediatek,dsi.yaml
+--- a/Documentation/devicetree/bindings/display/mediatek/mediatek,dsi.yaml
++++ b/Documentation/devicetree/bindings/display/mediatek/mediatek,dsi.yaml
+@@ -27,6 +27,7 @@
+           - mediatek,mt2701-dsi
+           - mediatek,mt7623-dsi
+           - mediatek,mt8167-dsi
++          - mediatek,mt6797-dsi
+           - mediatek,mt8173-dsi
+           - mediatek,mt8183-dsi
+           - mediatek,mt8186-dsi
+diff --git a/Documentation/devicetree/bindings/display/mediatek/mediatek,gamma.yaml b/Documentation/devicetree/bindings/display/mediatek/mediatek,gamma.yaml
+--- a/Documentation/devicetree/bindings/display/mediatek/mediatek,gamma.yaml
++++ b/Documentation/devicetree/bindings/display/mediatek/mediatek,gamma.yaml
+@@ -22,6 +22,7 @@
+   compatible:
+     oneOf:
+       - enum:
++          - mediatek,mt6797-disp-gamma
+           - mediatek,mt8173-disp-gamma
+           - mediatek,mt8183-disp-gamma
+       - items:
+diff --git a/Documentation/devicetree/bindings/display/mediatek/mediatek,od.yaml b/Documentation/devicetree/bindings/display/mediatek/mediatek,od.yaml
+--- a/Documentation/devicetree/bindings/display/mediatek/mediatek,od.yaml
++++ b/Documentation/devicetree/bindings/display/mediatek/mediatek,od.yaml
+@@ -25,7 +25,9 @@
+           - mediatek,mt2712-disp-od
+           - mediatek,mt8173-disp-od
+       - items:
+-          - const: mediatek,mt6795-disp-od
++          - enum:
++              - mediatek,mt6795-disp-od
++              - mediatek,mt6797-disp-od
+           - const: mediatek,mt8173-disp-od
+ 
+   reg:
+@@ -34,6 +36,12 @@
+   interrupts:
+     maxItems: 1
+ 
++  power-domains:
++    maxItems: 1
++    description:
++      Power domain the overdrive block belongs to, when the SoC gates the
++      display island separately from the rest of the multimedia subsystem.
++
+   clocks:
+     items:
+       - description: OD Clock
+diff --git a/Documentation/devicetree/bindings/display/mediatek/mediatek,ovl.yaml b/Documentation/devicetree/bindings/display/mediatek/mediatek,ovl.yaml
+--- a/Documentation/devicetree/bindings/display/mediatek/mediatek,ovl.yaml
++++ b/Documentation/devicetree/bindings/display/mediatek/mediatek,ovl.yaml
+@@ -34,6 +34,7 @@
+       - items:
+           - enum:
+               - mediatek,mt6795-disp-ovl
++              - mediatek,mt6797-disp-ovl
+           - const: mediatek,mt8173-disp-ovl
+       - items:
+           - enum:
+@@ -64,6 +65,14 @@
+     description:
+       This property should point to the respective IOMMU block with master port as argument,
+       see Documentation/devicetree/bindings/iommu/mediatek,iommu.yaml for details.
++  mediatek,larb:
++    $ref: /schemas/types.yaml#/definitions/phandle
++    description:
++      The SMI local arbiter this block issues its memory traffic through.
++      The driver takes a runtime-PM link to it so the arbiter is powered
++      whenever the block is. Boards that describe the same relationship
++      with "iommus" alone do not need it.
++
+ 
+   mediatek,gce-client-reg:
+     description: The register of client driver can be configured by gce with
+diff --git a/Documentation/devicetree/bindings/display/mediatek/mediatek,ovl-2l.yaml b/Documentation/devicetree/bindings/display/mediatek/mediatek,ovl-2l.yaml
+--- a/Documentation/devicetree/bindings/display/mediatek/mediatek,ovl-2l.yaml
++++ b/Documentation/devicetree/bindings/display/mediatek/mediatek,ovl-2l.yaml
+@@ -22,6 +22,7 @@
+   compatible:
+     oneOf:
+       - enum:
++          - mediatek,mt6797-disp-ovl-2l
+           - mediatek,mt8183-disp-ovl-2l
+           - mediatek,mt8192-disp-ovl-2l
+       - items:
+@@ -48,6 +49,14 @@
+     description:
+       This property should point to the respective IOMMU block with master port as argument,
+       see Documentation/devicetree/bindings/iommu/mediatek,iommu.yaml for details.
++  mediatek,larb:
++    $ref: /schemas/types.yaml#/definitions/phandle
++    description:
++      The SMI local arbiter this block issues its memory traffic through.
++      The driver takes a runtime-PM link to it so the arbiter is powered
++      whenever the block is. Boards that describe the same relationship
++      with "iommus" alone do not need it.
++
+ 
+   mediatek,gce-client-reg:
+     description: The register of client driver can be configured by gce with
+diff --git a/Documentation/devicetree/bindings/display/mediatek/mediatek,rdma.yaml b/Documentation/devicetree/bindings/display/mediatek/mediatek,rdma.yaml
+--- a/Documentation/devicetree/bindings/display/mediatek/mediatek,rdma.yaml
++++ b/Documentation/devicetree/bindings/display/mediatek/mediatek,rdma.yaml
+@@ -40,6 +40,7 @@
+       - items:
+           - enum:
+               - mediatek,mt6795-disp-rdma
++              - mediatek,mt6797-disp-rdma
+           - const: mediatek,mt8173-disp-rdma
+       - items:
+           - enum:
+@@ -66,6 +67,14 @@
+     description:
+       This property should point to the respective IOMMU block with master port as argument,
+       see Documentation/devicetree/bindings/iommu/mediatek,iommu.yaml for details.
++  mediatek,larb:
++    $ref: /schemas/types.yaml#/definitions/phandle
++    description:
++      The SMI local arbiter this block issues its memory traffic through.
++      The driver takes a runtime-PM link to it so the arbiter is powered
++      whenever the block is. Boards that describe the same relationship
++      with "iommus" alone do not need it.
++
+ 
+   mediatek,rdma-fifo-size:
+     description:
+diff --git a/Documentation/devicetree/bindings/soc/mediatek/mediatek,mutex.yaml b/Documentation/devicetree/bindings/soc/mediatek/mediatek,mutex.yaml
+--- a/Documentation/devicetree/bindings/soc/mediatek/mediatek,mutex.yaml
++++ b/Documentation/devicetree/bindings/soc/mediatek/mediatek,mutex.yaml
+@@ -28,6 +28,7 @@
+       - mediatek,mt2712-disp-mutex
+       - mediatek,mt6795-disp-mutex
+       - mediatek,mt8167-disp-mutex
++      - mediatek,mt6797-disp-mutex
+       - mediatek,mt8173-disp-mutex
+       - mediatek,mt8183-disp-mutex
+       - mediatek,mt8186-disp-mutex
+diff --git a/Documentation/devicetree/bindings/phy/mediatek,dsi-phy.yaml b/Documentation/devicetree/bindings/phy/mediatek,dsi-phy.yaml
+--- a/Documentation/devicetree/bindings/phy/mediatek,dsi-phy.yaml
++++ b/Documentation/devicetree/bindings/phy/mediatek,dsi-phy.yaml
+@@ -33,6 +33,7 @@
+               - mediatek,mt8365-mipi-tx
+           - const: mediatek,mt8183-mipi-tx
+       - const: mediatek,mt2701-mipi-tx
++      - const: mediatek,mt6797-mipi-tx
+       - const: mediatek,mt8173-mipi-tx
+       - const: mediatek,mt8183-mipi-tx
+ 
+diff --git a/Documentation/devicetree/bindings/iommu/mediatek,iommu.yaml b/Documentation/devicetree/bindings/iommu/mediatek,iommu.yaml
+--- a/Documentation/devicetree/bindings/iommu/mediatek,iommu.yaml
++++ b/Documentation/devicetree/bindings/iommu/mediatek,iommu.yaml
+@@ -157,6 +157,7 @@
+               - mediatek,mt2701-m4u
+               - mediatek,mt2712-m4u
+               - mediatek,mt6795-m4u
++              - mediatek,mt6797-m4u
+               - mediatek,mt8173-m4u
+               - mediatek,mt8186-iommu-mm
+               - mediatek,mt8188-iommu-vdo
+diff --git a/Documentation/devicetree/bindings/pwm/mediatek,pwm-disp.yaml b/Documentation/devicetree/bindings/pwm/mediatek,pwm-disp.yaml
+--- a/Documentation/devicetree/bindings/pwm/mediatek,pwm-disp.yaml
++++ b/Documentation/devicetree/bindings/pwm/mediatek,pwm-disp.yaml
+@@ -24,6 +24,7 @@
+       - items:
+           - enum:
+               - mediatek,mt6795-disp-pwm
++              - mediatek,mt6797-disp-pwm
+               - mediatek,mt8167-disp-pwm
+           - const: mediatek,mt8173-disp-pwm
+       - items:

@@ -1,0 +1,15 @@
+Subject: [PATCH] arm64: dts: mediatek: gemini: schema conformance
+
+diff --git a/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts b/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
+--- a/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
++++ b/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
+@@ -1140,7 +1140,8 @@
+  */
+ / {
+ 	disp_pwm0: pwm@1100f000 {
+-		compatible = "mediatek,mt6797-disp-pwm";
++		compatible = "mediatek,mt6797-disp-pwm",
++			     "mediatek,mt8173-disp-pwm";
+ 		reg = <0 0x1100f000 0 0x1000>;
+ 		#pwm-cells = <2>;
+ 		clocks = <&topckgen CLK_TOP_MUX_PWM>,

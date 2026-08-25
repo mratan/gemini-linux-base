@@ -1,0 +1,118 @@
+Subject: [PATCH] arm64: dts: mediatek: mt6797: schema conformance
+
+diff --git a/arch/arm64/boot/dts/mediatek/mt6797.dtsi b/arch/arm64/boot/dts/mediatek/mt6797.dtsi
+--- a/arch/arm64/boot/dts/mediatek/mt6797.dtsi
++++ b/arch/arm64/boot/dts/mediatek/mt6797.dtsi
+@@ -670,7 +670,8 @@
+ 		status = "disabled";
+ 	};
+ 	disp_ovl0: disp-ovl0@1400b000 {
+-		compatible = "mediatek,mt6797-disp-ovl";
++		compatible = "mediatek,mt6797-disp-ovl",
++		             "mediatek,mt8173-disp-ovl";
+ 		reg = <0 0x1400b000 0 0x1000>;
+ 		interrupts = <GIC_SPI 213 IRQ_TYPE_LEVEL_LOW>;
+ 		power-domains = <&scpsys MT6797_POWER_DOMAIN_MM>;
+@@ -698,7 +699,8 @@
+ 		status = "disabled";
+ 	};
+ 	disp_rdma0: disp-rdma0@1400f000 {
+-		compatible = "mediatek,mt6797-disp-rdma";
++		compatible = "mediatek,mt6797-disp-rdma",
++		             "mediatek,mt8173-disp-rdma";
+ 		reg = <0 0x1400f000 0 0x1000>;
+ 		interrupts = <GIC_SPI 217 IRQ_TYPE_LEVEL_LOW>;
+ 		power-domains = <&scpsys MT6797_POWER_DOMAIN_MM>;
+@@ -710,7 +712,8 @@
+ 		status = "disabled";
+ 	};
+ 	disp_color0: disp-color0@14013000 {
+-		compatible = "mediatek,mt6797-disp-color";
++		compatible = "mediatek,mt6797-disp-color",
++		             "mediatek,mt8173-disp-color";
+ 		reg = <0 0x14013000 0 0x1000>;
+ 		interrupts = <GIC_SPI 221 IRQ_TYPE_LEVEL_LOW>;
+ 		power-domains = <&scpsys MT6797_POWER_DOMAIN_MM>;
+@@ -718,7 +721,8 @@
+ 		status = "disabled";
+ 	};
+ 	disp_ccorr0: disp-ccorr0@14014000 {
+-		compatible = "mediatek,mt6797-disp-ccorr";
++		compatible = "mediatek,mt6797-disp-ccorr",
++		             "mediatek,mt8183-disp-ccorr";
+ 		reg = <0 0x14014000 0 0x1000>;
+ 		interrupts = <GIC_SPI 222 IRQ_TYPE_LEVEL_LOW>;
+ 		power-domains = <&scpsys MT6797_POWER_DOMAIN_MM>;
+@@ -742,7 +746,8 @@
+ 		status = "disabled";
+ 	};
+ 	disp_od0: disp-od0@14017000 {
+-		compatible = "mediatek,mt6797-disp-od";
++		compatible = "mediatek,mt6797-disp-od",
++		             "mediatek,mt8173-disp-od";
+ 		reg = <0 0x14017000 0 0x1000>;
+ 		interrupts = <GIC_SPI 225 IRQ_TYPE_LEVEL_LOW>;
+ 		power-domains = <&scpsys MT6797_POWER_DOMAIN_MM>;
+@@ -750,7 +755,8 @@
+ 		status = "disabled";
+ 	};
+ 	disp_dither0: disp-dither0@14018000 {
+-		compatible = "mediatek,mt6797-disp-dither";
++		compatible = "mediatek,mt6797-disp-dither",
++		             "mediatek,mt8183-disp-dither";
+ 		reg = <0 0x14018000 0 0x1000>;
+ 		interrupts = <GIC_SPI 226 IRQ_TYPE_LEVEL_LOW>;
+ 		power-domains = <&scpsys MT6797_POWER_DOMAIN_MM>;
+@@ -768,7 +774,8 @@
+ 		 * per-instance); the board /aliases disambiguate the instance.
+ 		 */
+ 		disp_ovl1: disp-ovl1@1400c000 {
+-			compatible = "mediatek,mt6797-disp-ovl";
++			compatible = "mediatek,mt6797-disp-ovl",
++			             "mediatek,mt8173-disp-ovl";
+ 			reg = <0 0x1400c000 0 0x1000>;
+ 			interrupts = <GIC_SPI 214 IRQ_TYPE_LEVEL_LOW>;
+ 			power-domains = <&scpsys MT6797_POWER_DOMAIN_MM>;
+@@ -777,7 +784,8 @@
+ 			status = "disabled";
+ 		};
+ 		disp_rdma1: disp-rdma1@14010000 {
+-			compatible = "mediatek,mt6797-disp-rdma";
++			compatible = "mediatek,mt6797-disp-rdma",
++			             "mediatek,mt8173-disp-rdma";
+ 			reg = <0 0x14010000 0 0x1000>;
+ 			interrupts = <GIC_SPI 218 IRQ_TYPE_LEVEL_LOW>;
+ 			power-domains = <&scpsys MT6797_POWER_DOMAIN_MM>;
+@@ -799,7 +807,8 @@
+ 		 * mt6797-gemini-pda-hdmi variant.
+ 		 */
+ 		disp_dsc0: disp-dsc0@1401a000 {
+-			compatible = "mediatek,mt6797-disp-dsc";
++			compatible = "mediatek,mt6797-disp-dsc",
++			             "mediatek,mt8195-disp-dsc";
+ 			reg = <0 0x1401a000 0 0x1000>;
+ 			power-domains = <&scpsys MT6797_POWER_DOMAIN_MM>;
+ 			clocks = <&mmsys CLK_MM_DISP_DSC>;
+@@ -859,7 +868,7 @@
+ 		};
+ 	};
+ 
+-	mipi_tx0: mipi-dphy@10215000 {
++	mipi_tx0: dsi-phy@10215000 {
+ 		compatible = "mediatek,mt6797-mipi-tx";
+ 		reg = <0 0x10215000 0 0x90>;
+ 		clocks = <&clk26m>;
+@@ -942,7 +951,12 @@
+ 		compatible = "mediatek,mt6797-smi-larb";
+ 		reg = <0 0x1a001000 0 0x1000>;
+ 		mediatek,larb-id = <2>;
+-		interrupts = <GIC_SPI 258 IRQ_TYPE_LEVEL_LOW>;
++		/*
++		 * No "interrupts": mtk-smi never requests one, the binding does
++		 * not describe one, and the vendor DT's GIC SPI 258 for this
++		 * node is recorded here rather than carried as a property
++		 * nothing reads.
++		 */
+ 		mediatek,smi = <&smi_common>;
+ 		power-domains = <&scpsys MT6797_POWER_DOMAIN_ISP>;
+ 		clocks = <&camsys CLK_CAM_LARB2>,

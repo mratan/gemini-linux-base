@@ -1,8 +1,10 @@
+Subject: [PATCH] media: hi556: add device tree support
+
 diff --git a/Documentation/devicetree/bindings/media/hynix,hi556.yaml b/Documentation/devicetree/bindings/media/hynix,hi556.yaml
 new file mode 100644
 --- /dev/null
 +++ b/Documentation/devicetree/bindings/media/hynix,hi556.yaml
-@@ -0,0 +1,119 @@
+@@ -0,0 +1,126 @@
 +# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
 +%YAML 1.2
 +---
@@ -52,6 +54,13 @@ new file mode 100644
 +
 +  dvdd-supply:
 +    description: Digital core supply, 1.2 V (1.21 V on MediaTek platforms).
++
++  power-domains:
++    maxItems: 1
++    description:
++      Power domain the sensor belongs to. On boards where the rails, the
++      master clock and the sensor-interface block come up together, taking a
++      runtime-PM reference on the sensor is what powers all of them.
 +
 +  reset-gpios:
 +    maxItems: 1

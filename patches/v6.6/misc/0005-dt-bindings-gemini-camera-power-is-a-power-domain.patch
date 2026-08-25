@@ -1,0 +1,40 @@
+Subject: [PATCH] dt-bindings: planet,gemini-camera-power: it is a power domain now
+
+diff --git a/Documentation/devicetree/bindings/misc/planet,gemini-camera-power.yaml b/Documentation/devicetree/bindings/misc/planet,gemini-camera-power.yaml
+--- a/Documentation/devicetree/bindings/misc/planet,gemini-camera-power.yaml
++++ b/Documentation/devicetree/bindings/misc/planet,gemini-camera-power.yaml
+@@ -50,6 +50,15 @@
+       - const: camtg_sel
+       - const: univpll_d26
+ 
++  "#power-domain-cells":
++    const: 0
++    description:
++      This node provides the camera power domain. A consumer taking a runtime-PM
++      reference on it gets the rails, the camsys clock gates, the ISP MTCMOS
++      domain and the SENINF master clocks, and drops them again at idle - which
++      is how the sensor comes up at boot with no autoload hack and costs nothing
++      when nobody has it open.
++
+   power-domains:
+     maxItems: 1
+     description: the ISP MTCMOS domain containing camsys and SENINF
+@@ -71,6 +80,9 @@
+     maxItems: 1
+     description: rear sensor power-down (PWDNB), active low
+ 
++  # The sub socket's reset and power-down lines are NOT here. They moved onto
++  # the sensor's own I2C node with #64, which is where V4L2 expects to find
++  # them; only the unpopulated main socket is still driven from this node.
+   sub-reset-gpios:
+     maxItems: 1
+     description: front sensor reset, active low
+@@ -95,8 +107,6 @@
+   - vcamio-supply
+   - main-reset-gpios
+   - main-powerdown-gpios
+-  - sub-reset-gpios
+-  - sub-powerdown-gpios
+ 
+ additionalProperties: false
+ 
