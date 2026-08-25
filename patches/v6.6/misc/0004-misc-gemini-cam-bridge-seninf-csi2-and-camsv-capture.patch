@@ -3,7 +3,7 @@ Subject: [PATCH] misc: gemini-cam-bridge: SENINF CSI-2 receiver and CAMSV captur
 diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 --- a/drivers/misc/gemini-cam-bridge.c
 +++ b/drivers/misc/gemini-cam-bridge.c
-@@ -1,155 +1,1895 @@
+@@ -1,155 +1,1931 @@
  // SPDX-License-Identifier: GPL-2.0-only
  /*
 - * Gemini PDA camera media-graph bridge.
@@ -480,11 +480,9 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 +
 +	struct gemini_cam_stats stats;
 +	struct dentry *debugfs;
- };
- 
--static int gemini_bridge_bound(struct v4l2_async_notifier *notifier,
--			       struct v4l2_subdev *sd,
--			       struct v4l2_async_connection *asc)
++	bool streaming;
++};
++
 +static inline struct gemini_cam *sd_to_cam(struct v4l2_subdev *sd)
 +{
 +	return container_of(sd, struct gemini_cam, sd);
@@ -574,9 +572,7 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 + * Both crossbars are nibble-per-consumer tables.
 + */
 +static void gemini_cam_seninf_route(struct gemini_cam *cam)
- {
--	struct gemini_cam_bridge *b =
--		container_of(notifier, struct gemini_cam_bridge, notifier);
++{
 +	u32 val;
 +
 +	val = readl(cam->seninf + SENINF_TOP_MUX_CTRL) & ~(0xf << (seninf_mux * 4));
@@ -683,8 +679,7 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 +	dev_dbg(cam->dev, "D-PHY bank 0x%x: ANA00 0x%08x (clock lane %u)\n",
 +		phy_bank, readl(ana + MIPI_RX_ANA00), phy_clock_lane);
 +}
- 
--	dev_info(b->dev, "sensor subdev '%s' bound to the media graph\n",
++
 +/*
 + * The digital half of the receiver: which physical lanes are enabled, the
 + * deskew/timing block, and the HS receiver enable pulse. None of this is in
@@ -1174,8 +1169,11 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 +
 +static const struct v4l2_subdev_ops gemini_cam_sd_ops = {
 +	.video = &gemini_cam_sd_video_ops,
-+};
-+
+ };
+ 
+-static int gemini_bridge_bound(struct v4l2_async_notifier *notifier,
+-			       struct v4l2_subdev *sd,
+-			       struct v4l2_async_connection *asc)
 +static const struct media_entity_operations gemini_cam_media_ops = {
 +	.link_validate = v4l2_subdev_link_validate,
 +};
@@ -1311,6 +1309,8 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 +	if (ret)
 +		goto err_pipeline;
 +
++	cam->streaming = true;
++	sysfs_notify(&cam->dev->kobj, NULL, "streaming");
 +	return 0;
 +
 +err_pipeline:
@@ -1326,6 +1326,9 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 +static void gemini_cam_stop_streaming(struct vb2_queue *vq)
 +{
 +	struct gemini_cam *cam = vb2_get_drv_priv(vq);
++
++	cam->streaming = false;
++	sysfs_notify(&cam->dev->kobj, NULL, "streaming");
 +
 +	v4l2_subdev_call(&cam->sd, video, s_stream, 0);
 +	gemini_cam_camsv_vf_disable(cam);
@@ -1479,10 +1482,41 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 +};
 +
 +/* -------------------------------------------------------------------------
++ * "the camera shows when it is in use" (#67)
++ *
++ * The panel needs a signal that means the sensor is actually delivering
++ * frames, not merely that somebody has the device node open -- an application
++ * can hold /dev/video0 for a long time without streaming, and an indicator
++ * that lit for that would train the owner to ignore it.
++ *
++ * This flag is set and cleared in vb2's start/stop_streaming, which is the
++ * narrowest place that is true. It also handles the case the issue calls out:
++ * when an application crashes rather than exiting cleanly, the kernel closes
++ * its file descriptor, vb2 runs stop_streaming, and the flag clears. There is
++ * no path where the hardware streams and this reads 0.
++ */
++static ssize_t streaming_show(struct device *dev,
++			      struct device_attribute *attr, char *buf)
++{
++	struct gemini_cam *cam = dev_get_drvdata(dev);
++
++	return sysfs_emit(buf, "%d\n", cam->streaming ? 1 : 0);
++}
++static DEVICE_ATTR_RO(streaming);
++
++static struct attribute *gemini_cam_attrs[] = {
++	&dev_attr_streaming.attr,
++	NULL,
++};
++ATTRIBUTE_GROUPS(gemini_cam);
++
++/* -------------------------------------------------------------------------
 + * debugfs: the bring-up instrument
 + */
 +static int gemini_cam_stats_show(struct seq_file *s, void *unused)
-+{
+ {
+-	struct gemini_cam_bridge *b =
+-		container_of(notifier, struct gemini_cam_bridge, notifier);
 +	struct gemini_cam *cam = s->private;
 +	struct gemini_cam_stats *st = &cam->stats;
 +
@@ -1563,7 +1597,8 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 +	}
 +
 +	cam->sensor_pad = media_pad_remote_pad_first(&cam->pads[GEMINI_CAM_PAD_SINK]);
-+
+ 
+-	dev_info(b->dev, "sensor subdev '%s' bound to the media graph\n",
 +	dev_info(cam->dev, "sensor subdev '%s' bound to the media graph\n",
  		 sd->name);
  	return 0;
@@ -1630,7 +1665,8 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 -static int gemini_bridge_probe(struct platform_device *pdev)
 +static int gemini_cam_parse_endpoint(struct gemini_cam *cam,
 +				     struct fwnode_handle *ep)
-+{
+ {
+-	struct gemini_cam_bridge *b;
 +	struct v4l2_fwnode_endpoint vep = {
 +		.bus_type = V4L2_MBUS_CSI2_DPHY,
 +	};
@@ -1655,8 +1691,7 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 +}
 +
 +static int gemini_cam_probe(struct platform_device *pdev)
- {
--	struct gemini_cam_bridge *b;
++{
 +	struct device *dev = &pdev->dev;
 +	struct gemini_cam *cam;
 +	struct media_pad *vdev_pad;
@@ -1748,16 +1783,16 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 +	ep = fwnode_graph_get_next_endpoint(dev_fwnode(dev), NULL);
 +	if (!ep)
 +		return dev_err_probe(dev, -ENODEV, "no port endpoint in DT\n");
-+
+ 
+-	b->mdev.dev = b->dev;
+-	strscpy(b->mdev.model, "gemini-camera", sizeof(b->mdev.model));
+-	media_device_init(&b->mdev);
 +	ret = gemini_cam_parse_endpoint(cam, ep);
 +	if (ret) {
 +		fwnode_handle_put(ep);
 +		return ret;
 +	}
- 
--	b->mdev.dev = b->dev;
--	strscpy(b->mdev.model, "gemini-camera", sizeof(b->mdev.model));
--	media_device_init(&b->mdev);
++
 +	cam->mdev.dev = dev;
 +	strscpy(cam->mdev.model, "gemini-camera", sizeof(cam->mdev.model));
 +	media_device_init(&cam->mdev);
@@ -1958,6 +1993,7 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
  		.name = "gemini-cam-bridge",
 -		.of_match_table = gemini_bridge_of_match,
 +		.of_match_table = gemini_cam_of_match,
++		.dev_groups = gemini_cam_groups,
 +		.pm = pm_ptr(&gemini_cam_pm_ops),
  	},
  };
@@ -1997,3 +2033,137 @@ diff --git a/drivers/misc/Kconfig b/drivers/misc/Kconfig
  
  	  If unsure, say N. If built as a module it is called
  	  gemini-cam-bridge.
+diff --git a/Documentation/devicetree/bindings/media/planet,gemini-camera-bridge.yaml b/Documentation/devicetree/bindings/media/planet,gemini-camera-bridge.yaml
+new file mode 100644
+--- /dev/null
++++ b/Documentation/devicetree/bindings/media/planet,gemini-camera-bridge.yaml
+@@ -0,0 +1,129 @@
++# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/media/planet,gemini-camera-bridge.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: Planet Computers Gemini PDA camera capture pipeline
++
++maintainers:
++  - Gemini PDA Linux port <https://github.com/mratan/gemini-linux>
++
++description: |
++  The camera data path on the Gemini PDA (MT6797): the media device the
++  sensor's async subdev attaches to, the SENINF CSI-2 receiver in front of it,
++  and the CAMSV0 DMA engine behind it, which writes raw Bayer frames straight
++  to memory with no image processing.
++
++  Three register windows, because the blocks are not contiguous and two of them
++  are shared:
++
++    * SENINF (0x1a040000) is shared with planet,gemini-camera-power, which owns
++      the per-socket master clocks inside it. Neither driver claims the region.
++    * CAMSV0 (0x1a050000) is the first of six identical DMA engines 0x1000
++      apart; only the first is used.
++    * mipi_RX_ana (0x10217000) is the CSI-2 analog receiver. On this SoC one
++      page holds six banks 0x200 apart -- CSI0A, CSI0B, CSI1A, CSI1B, CSI2A,
++      CSI2B -- rather than a page per PHY as on later parts.
++
++properties:
++  compatible:
++    const: planet,gemini-camera-bridge
++
++  reg:
++    maxItems: 3
++
++  reg-names:
++    items:
++      - const: seninf
++      - const: camsv
++      - const: mipi-ana
++
++  interrupts:
++    maxItems: 1
++    description: CAMSV0 pass-1-done.
++
++  clocks:
++    maxItems: 3
++    description:
++      The three CAMSV gates. The vendor gate table has one gate per CAMSV pair
++      and the vendor enables all three together whenever any CAMSV runs.
++
++  clock-names:
++    items:
++      - const: camsv0
++      - const: camsv1
++      - const: camsv2
++
++  power-domains:
++    maxItems: 1
++    description:
++      The camera domain. Its rails, camsys gates, ISP MTCMOS domain and SENINF
++      master clocks come up with it and go back down when nothing is streaming.
++
++  iommus:
++    maxItems: 1
++    description:
++      The CAMSV output DMA port on SMI larb2. This is not optional - the M4U
++      translates the port whether or not the kernel has mapped it, so a device
++      without this property faults on every burst.
++
++  port:
++    $ref: /schemas/graph.yaml#/$defs/port-base
++    unevaluatedProperties: false
++    description: Input port, connected to the image sensor.
++
++    properties:
++      endpoint:
++        $ref: video-interfaces.yaml#
++        unevaluatedProperties: false
++
++        properties:
++          data-lanes:
++            minItems: 1
++            maxItems: 4
++
++        required:
++          - data-lanes
++
++required:
++  - compatible
++  - reg
++  - reg-names
++  - interrupts
++  - clocks
++  - clock-names
++  - power-domains
++  - iommus
++  - port
++
++additionalProperties: false
++
++examples:
++  - |
++    #include <dt-bindings/interrupt-controller/arm-gic.h>
++    #include <dt-bindings/interrupt-controller/irq.h>
++    #include <dt-bindings/clock/mt6797-clk.h>
++    #include <dt-bindings/memory/mt6797-larb-port.h>
++
++    camera-bridge@1a050000 {
++        compatible = "planet,gemini-camera-bridge";
++        reg = <0x1a040000 0x8000>,
++              <0x1a050000 0x1000>,
++              <0x10217000 0x1000>;
++        reg-names = "seninf", "camsv", "mipi-ana";
++        interrupts = <GIC_SPI 252 IRQ_TYPE_LEVEL_LOW>;
++        clocks = <&camsys CLK_CAM_CAMSV0>,
++                 <&camsys CLK_CAM_CAMSV1>,
++                 <&camsys CLK_CAM_CAMSV2>;
++        clock-names = "camsv0", "camsv1", "camsv2";
++        power-domains = <&camera_power>;
++        iommus = <&m4u M4U_PORT_CAM_SV0>;
++
++        port {
++            cam_bridge_in: endpoint {
++                remote-endpoint = <&hi556_out>;
++                data-lanes = <1 2>;
++            };
++        };
++    };
