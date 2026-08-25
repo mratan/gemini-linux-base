@@ -1,0 +1,193 @@
+Subject: [PATCH] misc: add gemini camera media-graph bridge (slice #64)
+
+diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/misc/gemini-cam-bridge.c
+@@ -0,0 +1,155 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Gemini PDA camera media-graph bridge.
++ *
++ * Bring-up scaffolding for Track 4, slice #64: the minimal media device that
++ * binds the sensor's async V4L2 subdev and exposes it as a /dev/v4l-subdev with
++ * a media-controller entity. It deliberately does NO CSI/SENINF data-path work
++ * (that is #65) — it is only the "media graph seam" the sensor attaches to, so
++ * media-ctl and v4l2-ctl can enumerate the sensor, its formats and its controls.
++ *
++ * =m and self-contained, like the rest of the camera bring-up.
++ */
++#include <linux/module.h>
++#include <linux/platform_device.h>
++#include <linux/property.h>
++#include <media/v4l2-async.h>
++#include <media/v4l2-device.h>
++#include <media/media-device.h>
++
++struct gemini_cam_bridge {
++	struct device *dev;
++	struct v4l2_device v4l2_dev;
++	struct media_device mdev;
++	struct v4l2_async_notifier notifier;
++};
++
++static int gemini_bridge_bound(struct v4l2_async_notifier *notifier,
++			       struct v4l2_subdev *sd,
++			       struct v4l2_async_connection *asc)
++{
++	struct gemini_cam_bridge *b =
++		container_of(notifier, struct gemini_cam_bridge, notifier);
++
++	dev_info(b->dev, "sensor subdev '%s' bound to the media graph\n",
++		 sd->name);
++	return 0;
++}
++
++static int gemini_bridge_complete(struct v4l2_async_notifier *notifier)
++{
++	struct gemini_cam_bridge *b =
++		container_of(notifier, struct gemini_cam_bridge, notifier);
++	int ret;
++
++	ret = v4l2_device_register_subdev_nodes(&b->v4l2_dev);
++	if (ret) {
++		dev_err(b->dev, "register subdev nodes: %d\n", ret);
++		return ret;
++	}
++
++	ret = media_device_register(&b->mdev);
++	if (ret) {
++		dev_err(b->dev, "media_device_register: %d\n", ret);
++		return ret;
++	}
++
++	dev_info(b->dev, "media graph up: %s\n", b->mdev.model);
++	return 0;
++}
++
++static const struct v4l2_async_notifier_operations gemini_bridge_ops = {
++	.bound = gemini_bridge_bound,
++	.complete = gemini_bridge_complete,
++};
++
++static int gemini_bridge_probe(struct platform_device *pdev)
++{
++	struct gemini_cam_bridge *b;
++	struct fwnode_handle *ep;
++	struct v4l2_async_connection *asc;
++	int ret;
++
++	b = devm_kzalloc(&pdev->dev, sizeof(*b), GFP_KERNEL);
++	if (!b)
++		return -ENOMEM;
++	b->dev = &pdev->dev;
++	platform_set_drvdata(pdev, b);
++
++	b->mdev.dev = b->dev;
++	strscpy(b->mdev.model, "gemini-camera", sizeof(b->mdev.model));
++	media_device_init(&b->mdev);
++
++	b->v4l2_dev.mdev = &b->mdev;
++	ret = v4l2_device_register(b->dev, &b->v4l2_dev);
++	if (ret) {
++		dev_err(b->dev, "v4l2_device_register: %d\n", ret);
++		goto err_mdev;
++	}
++
++	v4l2_async_nf_init(&b->notifier, &b->v4l2_dev);
++
++	ep = fwnode_graph_get_next_endpoint(dev_fwnode(b->dev), NULL);
++	if (!ep) {
++		dev_err(b->dev, "no port endpoint in DT\n");
++		ret = -ENODEV;
++		goto err_v4l2;
++	}
++
++	asc = v4l2_async_nf_add_fwnode_remote(&b->notifier, ep,
++					      struct v4l2_async_connection);
++	fwnode_handle_put(ep);
++	if (IS_ERR(asc)) {
++		ret = PTR_ERR(asc);
++		dev_err(b->dev, "add_fwnode_remote: %d\n", ret);
++		goto err_nf;
++	}
++
++	b->notifier.ops = &gemini_bridge_ops;
++	ret = v4l2_async_nf_register(&b->notifier);
++	if (ret) {
++		dev_err(b->dev, "nf_register: %d\n", ret);
++		goto err_nf;
++	}
++
++	dev_info(b->dev, "camera media bridge ready\n");
++	return 0;
++
++err_nf:
++	v4l2_async_nf_cleanup(&b->notifier);
++err_v4l2:
++	v4l2_device_unregister(&b->v4l2_dev);
++err_mdev:
++	media_device_cleanup(&b->mdev);
++	return ret;
++}
++
++static void gemini_bridge_remove(struct platform_device *pdev)
++{
++	struct gemini_cam_bridge *b = platform_get_drvdata(pdev);
++
++	v4l2_async_nf_unregister(&b->notifier);
++	v4l2_async_nf_cleanup(&b->notifier);
++	media_device_unregister(&b->mdev);
++	v4l2_device_unregister(&b->v4l2_dev);
++	media_device_cleanup(&b->mdev);
++}
++
++static const struct of_device_id gemini_bridge_of_match[] = {
++	{ .compatible = "planet,gemini-camera-bridge" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, gemini_bridge_of_match);
++
++static struct platform_driver gemini_bridge_driver = {
++	.probe = gemini_bridge_probe,
++	.remove_new = gemini_bridge_remove,
++	.driver = {
++		.name = "gemini-cam-bridge",
++		.of_match_table = gemini_bridge_of_match,
++	},
++};
++module_platform_driver(gemini_bridge_driver);
++
++MODULE_DESCRIPTION("Gemini PDA camera media-graph bridge (slice #64 seam)");
++MODULE_LICENSE("GPL");
+--- a/drivers/misc/Kconfig	2026-08-25 01:42:46.341808622 -0700
++++ b/drivers/misc/Kconfig	2026-08-25 01:42:46.341862722 -0700
+@@ -597,6 +597,21 @@
+ 	  If unsure, say N. If built as a module it is called
+ 	  gemini-camera-power.
+ 
++config GEMINI_CAMERA_BRIDGE
++	tristate "Planet Gemini PDA camera media-graph bridge"
++	depends on OF
++	depends on VIDEO_DEV
++	depends on MEDIA_CONTROLLER
++	help
++	  Minimal media device (issue #64) that binds the Gemini camera
++	  sensor's async V4L2 subdev and exposes it as a media-controller
++	  entity and a /dev/v4l-subdev node, so media-ctl and v4l2-ctl can
++	  enumerate the sensor, its formats and its controls. It does no
++	  CSI/SENINF data-path work — it is only the media-graph seam.
++
++	  If unsure, say N. If built as a module it is called
++	  gemini-cam-bridge.
++
+ source "drivers/misc/c2port/Kconfig"
+ source "drivers/misc/eeprom/Kconfig"
+ source "drivers/misc/cb710/Kconfig"
+--- a/drivers/misc/Makefile	2026-08-25 01:42:46.342948946 -0700
++++ b/drivers/misc/Makefile	2026-08-25 01:42:46.342972170 -0700
+@@ -69,3 +69,4 @@
+ obj-$(CONFIG_TPS6594_PFSM)	+= tps6594-pfsm.o
+ obj-$(CONFIG_GEMINI_RIGHTPORT_MUX)	+= gemini-rightport-mux.o
+ obj-$(CONFIG_GEMINI_CAMERA_POWER)	+= gemini-camera-power.o
++obj-$(CONFIG_GEMINI_CAMERA_BRIDGE)	+= gemini-cam-bridge.o

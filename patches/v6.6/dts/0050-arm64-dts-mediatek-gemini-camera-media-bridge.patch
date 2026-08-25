@@ -1,0 +1,35 @@
+Subject: [PATCH] arm64: dts: mediatek: gemini camera media-graph bridge
+
+--- a/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts	2026-08-25 01:42:46.344081847 -0700
++++ b/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts	2026-08-25 01:42:46.344254648 -0700
+@@ -2735,11 +2735,30 @@
+ 
+ 		port {
+ 			hi556_out: endpoint {
++				remote-endpoint = <&cam_bridge_in>;
+ 				data-lanes = <1 2>;
+ 				link-frequencies = /bits/ 64 <437000000>;
+ 			};
+ 		};
+ 	};
++};
++
++/*
++ * The media-graph seam for slice #64: a bare, root-level media device that
++ * binds the sensor's async subdev so media-ctl / v4l2-ctl can enumerate it. No
++ * CSI or SENINF data-path work here — that is #65.
++ */
++&{/} {
++	camera_bridge: camera-bridge {
++		compatible = "planet,gemini-camera-bridge";
++
++		port {
++			cam_bridge_in: endpoint {
++				remote-endpoint = <&hi556_out>;
++				data-lanes = <1 2>;
++			};
++		};
++	};
+ };
+ 
+ /*
