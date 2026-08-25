@@ -1,0 +1,32 @@
+Subject: [PATCH] arm64: dts: mediatek: gemini camera as a power domain
+
+Wire the camera-power controller as a power domain and attach the hi556 sensor to
+it, so the sensor's runtime PM powers the SENINF/MCLK on only while it is open.
+
+--- a/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts	2026-08-25 08:25:57.553693120 -0700
++++ b/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts	2026-08-25 08:25:57.553905611 -0700
+@@ -2726,6 +2726,14 @@
+ 		clocks = <&camsys CLK_CAM_CAMTG>;
+ 		clock-frequency = <24000000>;
+ 
++		/*
++		 * The camera power domain: its runtime PM powers the SENINF/MCLK
++		 * up while the sensor is open and back down at idle. This also
++		 * orders probe after gemini-camera-power via fw_devlink, so no
++		 * autopower/softdep is needed.
++		 */
++		power-domains = <&camera_power>;
++
+ 		dovdd-supply = <&mt6351_vcamio_reg>;
+ 		avdd-supply = <&mt6351_vcama_reg>;
+ 		dvdd-supply = <&mt6351_vcamd_reg>;
+@@ -2823,6 +2831,9 @@
+ 		 */
+ 		reg = <0 0x1a040000 0 0x3000>;
+ 
++		/* Provides the camera power domain the sensor attaches to. */
++		#power-domain-cells = <0>;
++
+ 		power-domains = <&scpsys MT6797_POWER_DOMAIN_ISP>;
+ 
+ 		/*

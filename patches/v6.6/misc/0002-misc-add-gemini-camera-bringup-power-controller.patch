@@ -174,7 +174,7 @@ diff --git a/drivers/misc/gemini-camera-power.c b/drivers/misc/gemini-camera-pow
 new file mode 100644
 --- /dev/null
 +++ b/drivers/misc/gemini-camera-power.c
-@@ -0,0 +1,873 @@
+@@ -0,0 +1,930 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Gemini PDA camera bring-up power controller.
@@ -244,6 +244,7 @@ new file mode 100644
 +#include <linux/mutex.h>
 +#include <linux/of.h>
 +#include <linux/platform_device.h>
++#include <linux/pm_domain.h>
 +#include <linux/pm_runtime.h>
 +#include <linux/regulator/consumer.h>
 +#include <linux/sysfs.h>
@@ -428,6 +429,16 @@ new file mode 100644
 +
 +	bool powered;
 +	struct mutex lock;		/* serialises power on/off */
++
++	/*
++	 * The camera domain as a power domain: the sensor subdev attaches to it
++	 * (power-domains = <&camera_power>) and its runtime PM powers the whole
++	 * camera up only while the sensor is open, then back down. This is what
++	 * lets the sensor come up at boot with no autopower/softdep and draw
++	 * nothing at idle.
++	 */
++	struct generic_pm_domain genpd;
++	bool genpd_registered;
 +};
 +
 +static void gemini_cam_mclk_set(struct gemini_cam *cam, unsigned int seninf,
@@ -903,6 +914,28 @@ new file mode 100644
 +	return 0;
 +}
 +
++static int gemini_cam_genpd_power_on(struct generic_pm_domain *domain)
++{
++	struct gemini_cam *cam = container_of(domain, struct gemini_cam, genpd);
++	int ret;
++
++	mutex_lock(&cam->lock);
++	ret = cam->powered ? 0 : gemini_cam_power_on(cam);
++	mutex_unlock(&cam->lock);
++	return ret;
++}
++
++static int gemini_cam_genpd_power_off(struct generic_pm_domain *domain)
++{
++	struct gemini_cam *cam = container_of(domain, struct gemini_cam, genpd);
++
++	mutex_lock(&cam->lock);
++	if (cam->powered)
++		gemini_cam_power_off(cam);
++	mutex_unlock(&cam->lock);
++	return 0;
++}
++
 +static int gemini_cam_probe(struct platform_device *pdev)
 +{
 +	struct device *dev = &pdev->dev;
@@ -996,6 +1029,25 @@ new file mode 100644
 +		return dev_err_probe(dev, ret, "runtime PM\n");
 +
 +	/*
++	 * Register the camera domain as a power domain. It starts off; the
++	 * sensor subdev attaching to it (and the i2c core's power-on-at-probe)
++	 * brings it up, and the subdev's runtime PM takes it back down at idle.
++	 */
++	cam->genpd.name = "gemini-camera";
++	cam->genpd.power_on = gemini_cam_genpd_power_on;
++	cam->genpd.power_off = gemini_cam_genpd_power_off;
++	ret = pm_genpd_init(&cam->genpd, NULL, true);
++	if (ret)
++		return dev_err_probe(dev, ret, "genpd init\n");
++
++	ret = of_genpd_add_provider_simple(dev->of_node, &cam->genpd);
++	if (ret) {
++		pm_genpd_remove(&cam->genpd);
++		return dev_err_probe(dev, ret, "genpd provider\n");
++	}
++	cam->genpd_registered = true;
++
++	/*
 +	 * Probe deliberately touches no hardware and leaves everything off.
 +	 * The module has a modalias and udev will autoload it, so a probe
 +	 * that powered the sensors would silently power the camera on every
@@ -1021,6 +1073,11 @@ new file mode 100644
 +static void gemini_cam_remove(struct platform_device *pdev)
 +{
 +	struct gemini_cam *cam = platform_get_drvdata(pdev);
++
++	if (cam->genpd_registered) {
++		of_genpd_del_provider(pdev->dev.of_node);
++		pm_genpd_remove(&cam->genpd);
++	}
 +
 +	mutex_lock(&cam->lock);
 +	if (cam->powered)
