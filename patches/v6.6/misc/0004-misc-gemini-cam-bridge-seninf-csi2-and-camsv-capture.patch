@@ -3,7 +3,7 @@ Subject: [PATCH] misc: gemini-cam-bridge: SENINF CSI-2 receiver and CAMSV captur
 diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 --- a/drivers/misc/gemini-cam-bridge.c
 +++ b/drivers/misc/gemini-cam-bridge.c
-@@ -1,155 +1,2143 @@
+@@ -1,155 +1,2160 @@
  // SPDX-License-Identifier: GPL-2.0-only
  /*
 - * Gemini PDA camera media-graph bridge.
@@ -222,8 +222,7 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 +#define SENINF_CSI2_DPHY_SYNC			0x0b20
 +#define SENINF_CSI2_DPHY_SYNC_MASK_0		GENMASK(15, 0)
 +#define SENINF_CSI2_DPHY_SYNC_PAT_0		GENMASK(31, 16)
- 
--struct gemini_cam_bridge {
++
 +/*
 + * mipi_RX_ana (0x10217000). One page, but NOT one PHY: MT6797 packs six
 + * identical banks 0x200 apart -- CSI0A, CSI0B, CSI1A, CSI1B, CSI2A, CSI2B --
@@ -477,7 +476,8 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 +module_param(lane_mux, int, 0644);
 +MODULE_PARM_DESC(lane_mux,
 +		 "override for MIPI_RX_CON24 lane muxing, as the raw [31:24] byte; -1 derives it from the DT data-lanes/clock-lane");
-+
+ 
+-struct gemini_cam_bridge {
 +/* -------------------------------------------------------------------------
 + * Driver state
 + */
@@ -1387,9 +1387,26 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 + * One format only: the SGRBG10 the Hi-556 emits, packed the way CAMSV's PAK
 + * block writes it. Anything else would be a claim this driver has not tested.
 + */
++/*
++ * V4L2_PIX_FMT_SGRBG10P, not ...SGRBG10.
++ *
++ * CAMSV's PAK block is configured for RAW10 and the DMA is given a line length
++ * of width * 10 / 8, so what lands in memory is standard CSI-2 packing: four
++ * pixels in five bytes, four most-significant bytes followed by one byte
++ * holding their four low bit-pairs. V4L2_PIX_FMT_SGRBG10 means something else
++ * entirely -- 10 bits in a 16-bit container, two bytes per pixel -- so
++ * advertising it describes a buffer twice the size of the one written, and
++ * anything that believed us would read garbage.
++ *
++ * Measured rather than reasoned: a captured test-pattern row contains only the
++ * four byte values 0x00, 0x0f, 0xf0 and 0xff, which is exactly what black and
++ * white pixels give under 4-in-5 packing (the MSB bytes saturate, and the
++ * shared low-bits byte takes 0x00, 0xff, or 0x0f/0xf0 across a bar edge). An
++ * unpacked buffer could not produce that set.
++ */
 +static void gemini_cam_fill_format(struct v4l2_pix_format *f)
 +{
-+	f->pixelformat = V4L2_PIX_FMT_SGRBG10;
++	f->pixelformat = V4L2_PIX_FMT_SGRBG10P;
 +	f->field = V4L2_FIELD_NONE;
 +	f->colorspace = V4L2_COLORSPACE_RAW;
 +	f->ycbcr_enc = V4L2_YCBCR_ENC_DEFAULT;
@@ -1579,7 +1596,7 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 +{
 +	if (f->index)
 +		return -EINVAL;
-+	f->pixelformat = V4L2_PIX_FMT_SGRBG10;
++	f->pixelformat = V4L2_PIX_FMT_SGRBG10P;
 +	return 0;
 +}
 +
@@ -1620,7 +1637,7 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 +	 * this only says what the DMA can carry. Userspace picks a mode by
 +	 * setting the format on the sensor subdev.
 +	 */
-+	if (fsize->index || fsize->pixel_format != V4L2_PIX_FMT_SGRBG10)
++	if (fsize->index || fsize->pixel_format != V4L2_PIX_FMT_SGRBG10P)
 +		return -EINVAL;
 +
 +	fsize->type = V4L2_FRMSIZE_TYPE_STEPWISE;
@@ -1673,11 +1690,8 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 +	.vidioc_expbuf			= vb2_ioctl_expbuf,
 +	.vidioc_streamon		= vb2_ioctl_streamon,
 +	.vidioc_streamoff		= vb2_ioctl_streamoff,
- };
- 
--static int gemini_bridge_bound(struct v4l2_async_notifier *notifier,
--			       struct v4l2_subdev *sd,
--			       struct v4l2_async_connection *asc)
++};
++
 +static const struct v4l2_file_operations gemini_cam_fops = {
 +	.owner		= THIS_MODULE,
 +	.open		= v4l2_fh_open,
@@ -1685,8 +1699,11 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 +	.poll		= vb2_fop_poll,
 +	.unlocked_ioctl	= video_ioctl2,
 +	.mmap		= vb2_fop_mmap,
-+};
-+
+ };
+ 
+-static int gemini_bridge_bound(struct v4l2_async_notifier *notifier,
+-			       struct v4l2_subdev *sd,
+-			       struct v4l2_async_connection *asc)
 +/* -------------------------------------------------------------------------
 + * "the camera shows when it is in use" (#67)
 + *
@@ -1703,7 +1720,9 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 + */
 +static ssize_t streaming_show(struct device *dev,
 +			      struct device_attribute *attr, char *buf)
-+{
+ {
+-	struct gemini_cam_bridge *b =
+-		container_of(notifier, struct gemini_cam_bridge, notifier);
 +	struct gemini_cam *cam = dev_get_drvdata(dev);
 +
 +	return sysfs_emit(buf, "%d\n", cam->streaming ? 1 : 0);
@@ -1720,13 +1739,10 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 + * debugfs: the bring-up instrument
 + */
 +static int gemini_cam_stats_show(struct seq_file *s, void *unused)
- {
--	struct gemini_cam_bridge *b =
--		container_of(notifier, struct gemini_cam_bridge, notifier);
++{
 +	struct gemini_cam *cam = s->private;
 +	struct gemini_cam_stats *st = &cam->stats;
- 
--	dev_info(b->dev, "sensor subdev '%s' bound to the media graph\n",
++
 +	seq_printf(s, "routing        inst %u csi %u mux %u cam_mux %u\n",
 +		   seninf_inst, seninf_csi, seninf_mux, seninf_cam_mux);
 +	seq_printf(s, "frames         %u\n", st->frames);
@@ -1800,7 +1816,8 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 +	int ret;
 +
 +	cam->sensor = sd;
-+
+ 
+-	dev_info(b->dev, "sensor subdev '%s' bound to the media graph\n",
 +	ret = v4l2_create_fwnode_links_to_pad(sd, &cam->pads[GEMINI_CAM_PAD_SINK],
 +					      MEDIA_LNK_FL_ENABLED |
 +					      MEDIA_LNK_FL_IMMUTABLE);
@@ -1877,8 +1894,7 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 -static int gemini_bridge_probe(struct platform_device *pdev)
 +static int gemini_cam_parse_endpoint(struct gemini_cam *cam,
 +				     struct fwnode_handle *ep)
- {
--	struct gemini_cam_bridge *b;
++{
 +	struct v4l2_fwnode_endpoint vep = {
 +		.bus_type = V4L2_MBUS_CSI2_DPHY,
 +	};
@@ -1903,7 +1919,8 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 +}
 +
 +static int gemini_cam_probe(struct platform_device *pdev)
-+{
+ {
+-	struct gemini_cam_bridge *b;
 +	struct device *dev = &pdev->dev;
 +	struct gemini_cam *cam;
 +	struct media_pad *vdev_pad;
