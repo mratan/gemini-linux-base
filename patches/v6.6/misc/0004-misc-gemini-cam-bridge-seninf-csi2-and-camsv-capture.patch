@@ -3,7 +3,7 @@ Subject: [PATCH] misc: gemini-cam-bridge: SENINF CSI-2 receiver and CAMSV captur
 diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 --- a/drivers/misc/gemini-cam-bridge.c
 +++ b/drivers/misc/gemini-cam-bridge.c
-@@ -1,155 +1,2259 @@
+@@ -1,155 +1,2279 @@
  // SPDX-License-Identifier: GPL-2.0-only
  /*
 - * Gemini PDA camera media-graph bridge.
@@ -292,8 +292,7 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 + * stats so a marginal link shows up as a non-zero word even before anybody
 + * knows which bit is which.
 + */
- 
--struct gemini_cam_bridge {
++
 +/* -------------------------------------------------------------------------
 + * CAMSV registers (offsets from CAMSV0, 0x1a050000). Vendor camera_isp.c.
 + */
@@ -490,7 +489,8 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 +	struct list_head list;
 +	dma_addr_t daddr;
 +};
-+
+ 
+-struct gemini_cam_bridge {
 +struct gemini_cam_stats {
 +	u32 frames;		/* PASS1_DON seen */
 +	u32 sof;		/* SOF seen */
@@ -779,8 +779,11 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 +	u32 enable;		/* trim-applied bit */
 +	u16 ana;		/* analog status register, from the bank base */
 +	u8 ana_bit;		/* comparator bit within it */
-+};
-+
+ };
+ 
+-static int gemini_bridge_bound(struct v4l2_async_notifier *notifier,
+-			       struct v4l2_subdev *sd,
+-			       struct v4l2_async_connection *asc)
 +static const struct gemini_cam_cal_lane gemini_cam_cal_lanes[] = {
 +	{ SENINF_MIPI_RX_CON00, GENMASK(6, 2),   BIT(1),  BIT(0),  0x0050, 8  },
 +	{ SENINF_MIPI_RX_CON00, GENMASK(30, 26), BIT(25), BIT(24), 0x0054, 24 },
@@ -1340,10 +1343,13 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 + * SENINF subdev
 + */
 +static int gemini_cam_sd_s_stream(struct v4l2_subdev *sd, int enable)
-+{
+ {
+-	struct gemini_cam_bridge *b =
+-		container_of(notifier, struct gemini_cam_bridge, notifier);
 +	struct gemini_cam *cam = sd_to_cam(sd);
 +	int ret;
-+
+ 
+-	dev_info(b->dev, "sensor subdev '%s' bound to the media graph\n",
 +	if (enable) {
 +		gemini_cam_seninf_start(cam);
 +		if (test_pattern)
@@ -1669,9 +1675,22 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 +	return 0;
 +}
 +
++/*
++ * Enumeration is filtered by media bus code, which is what a device that
++ * declares V4L2_CAP_IO_MC is expected to support: userspace asks "given the
++ * sensor is emitting this code, what can you write to memory?" rather than
++ * assuming. libcamera's simple pipeline handler asks exactly that, and
++ * refuses the camera outright if the answer is "filtering not supported" --
++ * which is what this returned before, and why the device enumerated as no
++ * camera at all despite the pipeline handler matching it.
++ *
++ * There is one code and one format, so honouring the filter is a comparison.
++ */
 +static int gemini_cam_enum_fmt(struct file *file, void *priv,
 +			       struct v4l2_fmtdesc *f)
 +{
++	if (f->mbus_code && f->mbus_code != MEDIA_BUS_FMT_SGRBG10_1X10)
++		return -EINVAL;
 +	if (f->index)
 +		return -EINVAL;
 +	f->pixelformat = V4L2_PIX_FMT_SGRBG10P;
@@ -1768,11 +1787,8 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 +	.vidioc_expbuf			= vb2_ioctl_expbuf,
 +	.vidioc_streamon		= vb2_ioctl_streamon,
 +	.vidioc_streamoff		= vb2_ioctl_streamoff,
- };
- 
--static int gemini_bridge_bound(struct v4l2_async_notifier *notifier,
--			       struct v4l2_subdev *sd,
--			       struct v4l2_async_connection *asc)
++};
++
 +static const struct v4l2_file_operations gemini_cam_fops = {
 +	.owner		= THIS_MODULE,
 +	.open		= v4l2_fh_open,
@@ -1798,9 +1814,7 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 + */
 +static ssize_t streaming_show(struct device *dev,
 +			      struct device_attribute *attr, char *buf)
- {
--	struct gemini_cam_bridge *b =
--		container_of(notifier, struct gemini_cam_bridge, notifier);
++{
 +	struct gemini_cam *cam = dev_get_drvdata(dev);
 +
 +	return sysfs_emit(buf, "%d\n", cam->streaming ? 1 : 0);
@@ -1894,8 +1908,7 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 +	int ret;
 +
 +	cam->sensor = sd;
- 
--	dev_info(b->dev, "sensor subdev '%s' bound to the media graph\n",
++
 +	ret = v4l2_create_fwnode_links_to_pad(sd, &cam->pads[GEMINI_CAM_PAD_SINK],
 +					      MEDIA_LNK_FL_ENABLED |
 +					      MEDIA_LNK_FL_IMMUTABLE);
@@ -2184,7 +2197,14 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 +	cam->vdev.fops = &gemini_cam_fops;
 +	cam->vdev.ioctl_ops = &gemini_cam_ioctl_ops;
 +	cam->vdev.release = video_device_release_empty;
-+	cam->vdev.device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_STREAMING;
++	/*
++	 * V4L2_CAP_IO_MC: this node's format is not independently settable --
++	 * it follows the media graph, and the sensor's format is set through
++	 * the subdev chain. Declaring it is also what makes media-bus-code
++	 * filtered enumeration meaningful above.
++	 */
++	cam->vdev.device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_STREAMING |
++				V4L2_CAP_IO_MC;
 +	cam->vdev.lock = &cam->lock;
 +	cam->vdev.entity.function = MEDIA_ENT_F_IO_V4L;
 +	strscpy(cam->vdev.name, "gemini-camsv0", sizeof(cam->vdev.name));
