@@ -1,0 +1,1789 @@
+Subject: [PATCH] misc: gemini-cam-bridge: SENINF CSI-2 receiver and CAMSV capture (#65)
+
+diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
+--- a/drivers/misc/gemini-cam-bridge.c
++++ b/drivers/misc/gemini-cam-bridge.c
+@@ -1,155 +1,1685 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ /*
+- * Gemini PDA camera media-graph bridge.
++ * Gemini PDA camera pipeline: SENINF CSI-2 receiver + CAMSV DMA capture.
+  *
+- * Bring-up scaffolding for Track 4, slice #64: the minimal media device that
+- * binds the sensor's async V4L2 subdev and exposes it as a /dev/v4l-subdev with
+- * a media-controller entity. It deliberately does NO CSI/SENINF data-path work
+- * (that is #65) — it is only the "media graph seam" the sensor attaches to, so
+- * media-ctl and v4l2-ctl can enumerate the sensor, its formats and its controls.
++ * WHAT THIS IS
+  *
+- * =m and self-contained, like the rest of the camera bring-up.
++ * Slice #64 left a bare media device here — enough for the sensor subdev to
++ * attach to, and nothing else. Slice #65 turns it into a real capture path:
++ *
++ *	hi556 (sensor) --> [gemini-seninf] --> /dev/video0 (CAMSV0 DMA)
++ *
++ * The SENINF is the SoC's sensor interface: a CSI-2 receiver per input, a
++ * crossbar (TOP MUX) from inputs to FIFO muxes, and a second crossbar (CAM
++ * MUX) from those muxes to the consumers — CAM_A/CAM_B (the hardware ISP) and
++ * six CAMSV instances. CAMSV is the bypass path: it takes a mux output and
++ * writes it to memory with no image processing at all, which is exactly what
++ * #65 asks for (raw Bayer in memory) and is also what libcamera's software ISP
++ * wants underneath it.
++ *
++ * WHERE THE REGISTER KNOWLEDGE COMES FROM
++ *
++ * Three independent sources, which agree:
++ *
++ *  1. The MT6797 Functional Specification §6.10 register-bank table (in
++ *     07-kernel/wt-main/docs/) gives the bank base addresses:
++ *
++ *		seninf_top   +1a040000	 SENINF1_TG   +1a040600
++ *		seninf1      +1a040200	 SENINF1_NCSI2 +1a040700
++ *		seninf1_csi2 +1a040a00	 seninf1_mux  +1a040d00
++ *		mipi_RX_config_csi0 +1a040800	 mipi_RX_ana +10217000
++ *
++ *     and each further instance at +0x1000. NOTE: 0x1a041000 is reserved
++ *     space, NOT "SENINF1" — an earlier misreading of this map cost this
++ *     project a week and produced a fictitious "DEVAPC lock". See
++ *     04-docs/CAMERA-SENSORS-2026-08-24.md.
++ *
++ *  2. The vendor 3.18 kernel
++ *     (drivers/misc/mediatek/cameraisp/src/mt6797/camera_isp.c) gives the
++ *     complete CAMSV register map, its base addresses (CAMSV0 0x1a050000,
++ *     stride 0x1000) and its interrupt bit assignments.
++ *
++ *  3. The upstream MediaTek ISP3.0 drivers for MT8365 (mtk_seninf.c,
++ *     mtk_camsv_hw.c, posted as "Add Mediatek ISP3.0" v8) give the bit-level
++ *     field definitions. That IP is the same generation as this one: their
++ *     SENINF_MUX_CTRL "normal mode" value computes to exactly 0x86df0080,
++ *     which is byte-for-byte what the vendor stack writes to seninf1_mux and
++ *     seninf2_mux on this device (captured live, 2026-08-25). Their CAMSV
++ *     register block is this one shifted by 0x10, and their TG block is this
++ *     one's +0x4f0 — every offset lines up.
++ *
++ * WHAT IS STILL GUESSED, AND HOW TO SWEEP IT
++ *
++ * Three things are board wiring that no document in hand states: which SENINF
++ * instance the front sensor's CSI-2 lanes land on, which physical D-PHY lanes
++ * carry its clock and data, and which CAM MUX output CAMSV0 consumes. The
++ * defaults below are the best inference (the vendor drives the sub sensor's
++ * MCLK from SENINF2_TG, so SENINF instance 1; CAM MUX 2 is the first consumer
++ * after CAM_A/CAM_B). All three are module parameters so they can be swept on
++ * the device against a real instrument — the CSI-2 packet counter and the TG
++ * frame-size register — rather than argued about. See "stats" in debugfs.
+  */
++
++#include <linux/bitfield.h>
++#include <linux/clk.h>
++#include <linux/debugfs.h>
++#include <linux/delay.h>
++#include <linux/interrupt.h>
++#include <linux/iommu.h>
++#include <linux/iopoll.h>
+ #include <linux/module.h>
+ #include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
+ #include <linux/property.h>
++#include <linux/seq_file.h>
++
++#include <media/media-device.h>
+ #include <media/v4l2-async.h>
++#include <media/v4l2-common.h>
++#include <media/v4l2-ctrls.h>
+ #include <media/v4l2-device.h>
+-#include <media/media-device.h>
++#include <media/v4l2-fwnode.h>
++#include <media/v4l2-ioctl.h>
++#include <media/v4l2-mc.h>
++#include <media/v4l2-subdev.h>
++#include <media/videobuf2-dma-contig.h>
++#include <media/videobuf2-v4l2.h>
++
++/* -------------------------------------------------------------------------
++ * SENINF registers (offsets from seninf_top, 0x1a040000)
++ */
++#define SENINF_INST_STRIDE			0x1000
++
++#define SENINF_TOP_CTRL				0x0000
++#define SENINF_TOP_CTRL_PCLK_EN			BIT(10)
++#define SENINF_TOP_CTRL_PCLK2_EN		BIT(11)
++#define SENINF_TOP_MUX_CTRL			0x0008
++#define SENINF_TOP_CAM_MUX_CTRL			0x0010
++#define SENINF_TOP_PHY_CTL(csi)			(0x001c + (csi) * 4)
++#define SENINF_TOP_PHY_CTL_DPHY_MODE		BIT(0)
++#define SENINF_TOP_PHY_CTL_CK_SEL_1		GENMASK(10, 8)
++#define SENINF_TOP_PHY_CTL_CK_SEL_2		GENMASK(13, 12)
++#define SENINF_TOP_PHY_CTL_LANE_MUX_EN		BIT(31)
++
++/* Per-instance, relative to seninf_top + inst * SENINF_INST_STRIDE. */
++#define SENINF_CTRL				0x0200
++#define SENINF_CTRL_SENINF_EN			BIT(0)
++#define SENINF_CTRL_CSI2_SW_RST			BIT(7)
++#define SENINF_CTRL_SENINF_SRC_SEL		GENMASK(14, 12)
++#define SENINF_CTRL_PAD2CAM_DATA_SEL		GENMASK(30, 28)
++#define SENINF_CTRL_EXT				0x0204
++#define SENINF_CTRL_EXT_TESTMDL_IP_EN		BIT(1)
++#define SENINF_CTRL_EXT_NCSI2_IP_EN		BIT(5)
++#define SENINF_CTRL_EXT_CSI2_IP_EN		BIT(6)
++
++#define SENINF_TG_PH_CNT			0x0600
++#define SENINF_TG_SEN_CK			0x0604
++#define SENINF_TG_SEN_CK_CLKCNT			GENMASK(21, 16)
++#define SENINF_TG_TM_CTL			0x0608
++#define SENINF_TG_TM_SIZE			0x060c
++#define SENINF_TG_TM_CLK			0x0610
++#define SENINF_TG_TM_STP			0x0614
++
++#define SENINF_MIPI_RX_CON24			0x0824
++#define SENINF_MIPI_RX_CON24_LN0_MUX		GENMASK(25, 24)
++#define SENINF_MIPI_RX_CON24_LN1_MUX		GENMASK(27, 26)
++#define SENINF_MIPI_RX_CON24_LN2_MUX		GENMASK(29, 28)
++#define SENINF_MIPI_RX_CON24_LN3_MUX		GENMASK(31, 30)
++
++#define SENINF_CSI2_CTL				0x0a00
++#define SENINF_CSI2_CTL_CLOCK_LANE_EN		BIT(4)
++#define SENINF_CSI2_CTL_HSRX_DET_EN		BIT(7)
++#define SENINF_CSI2_CTL_ED_SEL			BIT(16)
++#define SENINF_CSI2_CTL_HS_TRAIL_EN		BIT(25)
++#define SENINF_CSI2_CTL_CLOCK_HS_OPTION		BIT(27)
++#define SENINF_CSI2_LNRD_TIMING			0x0a08
++#define SENINF_CSI2_LNRD_TIMING_DATA_SETTLE	GENMASK(15, 8)
++#define SENINF_CSI2_DPCM			0x0a0c
++#define SENINF_CSI2_DPCM_DI_30_EN		BIT(7)
++#define SENINF_CSI2_DGB_SEL			0x0a18
++#define SENINF_CSI2_DGB_SEL_DEBUG_SEL		GENMASK(7, 0)
++#define SENINF_CSI2_DGB_SEL_DEBUG_EN		BIT(31)
++#define SENINF_CSI2_DGB_PORT			0x0a1c
++#define SENINF_CSI2_SPARE0			0x0a20
++#define SENINF_CSI2_LNRC_FSM			0x0a28
++#define SENINF_CSI2_HS_TRAIL			0x0a40
++#define SENINF_CSI2_HS_TRAIL_PARAM		GENMASK(7, 0)
++#define SENINF_CSI2_RESYNC_MERGE_CTL		0x0a74
++#define SENINF_CSI2_RESYNC_CPHY_CNT		GENMASK(2, 0)
++#define SENINF_CSI2_RESYNC_BYPASS		BIT(10)
++#define SENINF_CSI2_RESYNC_CDPHY_SEL		BIT(11)
++#define SENINF_CSI2_MODE			0x0ae8
++#define SENINF_CSI2_MODE_CSI2_MODE		GENMASK(7, 0)
++#define SENINF_CSI2_MODE_HEADER_LEN		GENMASK(10, 8)
++#define SENINF_CSI2_DPHY_SYNC			0x0b20
++#define SENINF_CSI2_DPHY_SYNC_MASK_0		GENMASK(15, 0)
++#define SENINF_CSI2_DPHY_SYNC_PAT_0		GENMASK(31, 16)
++
++/* Per-mux, relative to seninf_top + mux * SENINF_INST_STRIDE. */
++#define SENINF_MUX_CTRL				0x0d00
++#define SENINF_MUX_CTRL_MUX_SW_RST		BIT(0)
++#define SENINF_MUX_CTRL_IRQ_SW_RST		BIT(1)
++#define SENINF_MUX_CTRL_PIX_SEL			BIT(8)
++#define SENINF_MUX_CTRL_VSYNC_POL		BIT(9)
++#define SENINF_MUX_CTRL_HSYNC_POL		BIT(10)
++#define SENINF_MUX_CTRL_SRC_SEL			GENMASK(15, 12)
++#define SENINF_MUX_CTRL_FIFO_PUSH_EN		GENMASK(21, 16)
++#define SENINF_MUX_CTRL_FIFO_FLUSH_EN		GENMASK(28, 22)
++#define SENINF_MUX_CTRL_FIFO_FULL_WR_EN		GENMASK(29, 28)
++#define SENINF_MUX_CTRL_MUX_EN			BIT(31)
++#define SENINF_MUX_INTEN			0x0d04
++#define SENINF_MUX_INTSTA			0x0d08
++#define SENINF_MUX_SPARE			0x0d2c
++#define SENINF_MUX_SPARE_FIFO_FULL_SEL		BIT(13)
++#define SENINF_MUX_CTRL_EXT			0x0d3c
++#define SENINF_MUX_CTRL_EXT_SRC_SEL_EXT		GENMASK(1, 0)
++#define SENINF_MUX_CTRL_EXT_PIX_SEL_EXT		BIT(4)
++
++#define FIFO_PUSH_EN_NORMAL_MODE		0x1f
++#define FIFO_FLUSH_EN_NORMAL_MODE		0x1b
++#define SENINF_MIPI_SENSOR			0x8
++#define SENINF_NORMAL_MODEL			1
++#define SENINF_PAD_10BIT			0
++#define SENINF_TIMESTAMP_STEP			0x67
++#define SENINF_SETTLE_DELAY			0x15
++#define SENINF_HS_TRAIL_PARAMETER		0x8
++
++/*
++ * The MUX interrupt status bits are not documented in anything available
++ * here. The vendor's CAMSV path reports the same conditions (TG error, TG
++ * grab error, DMA overrun) through its own interrupt, which is what this
++ * driver counts. SENINF_MUX_INTSTA is read and its raw value latched into the
++ * stats so a marginal link shows up as a non-zero word even before anybody
++ * knows which bit is which.
++ */
++
++/* -------------------------------------------------------------------------
++ * CAMSV registers (offsets from CAMSV0, 0x1a050000). Vendor camera_isp.c.
++ */
++#define CAMSV_MODULE_EN				0x0010
++#define CAMSV_MODULE_EN_TG_EN			BIT(0)
++#define CAMSV_MODULE_EN_PAK_EN			BIT(2)
++#define CAMSV_MODULE_EN_IMGO_EN			BIT(4)
++#define CAMSV_MODULE_EN_DB_EN			BIT(30)
++#define CAMSV_FMT_SEL				0x0014
++#define CAMSV_FMT_SEL_TG1_FMT_RAW_10		0x1
++#define CAMSV_INT_EN				0x0018
++#define CAMSV_INT_STATUS			0x001c
++#define CAMSV_SW_CTL				0x0020
++#define CAMSV_SW_CTL_IMGO_RST_TRIG		BIT(0)
++#define CAMSV_SW_CTL_IMGO_RST_ST		BIT(1)
++#define CAMSV_SW_CTL_SW_RST			BIT(2)
++#define CAMSV_IMGO_FBC				0x002c
++#define CAMSV_IMGO_FBC_RCNT_INC			BIT(11)
++#define CAMSV_IMGO_FBC_EN			BIT(14)
++#define CAMSV_IMGO_FBC_FB_NUM			GENMASK(19, 16)
++#define CAMSV_CLK_EN				0x0030
++#define CAMSV_CLK_EN_TG_DP			BIT(0)
++#define CAMSV_CLK_EN_PAK_DP			BIT(2)
++#define CAMSV_CLK_EN_DMA_DP			BIT(15)
++#define CAMSV_PAK				0x004c
++#define CAMSV_PAK_MODE_RAW_10			0x2
++#define CAMSV_PAK_DBL_MODE_2_PIXELS		BIT(2)
++
++#define CAMSV_IMGO_BASE_ADDR			0x0220
++#define CAMSV_IMGO_XSIZE			0x0230
++#define CAMSV_IMGO_YSIZE			0x0234
++#define CAMSV_IMGO_STRIDE			0x0238
++#define CAMSV_IMGO_STRIDE_BUS_SIZE_32		GENMASK(17, 16)
++#define CAMSV_IMGO_STRIDE_BUS_SIZE_EN		BIT(19)
++#define CAMSV_IMGO_CON				0x023c
++#define CAMSV_IMGO_CON_FIFO_SIZE		GENMASK(7, 0)
++#define CAMSV_IMGO_CON_MAX_BURST_LEN		GENMASK(31, 28)
++#define CAMSV_IMGO_CON2				0x0240
++#define CAMSV_IMGO_CON2_PRI_THRL		GENMASK(15, 8)
++#define CAMSV_IMGO_CON2_PRI_THRH		GENMASK(23, 16)
++#define CAMSV_IMGO_ERR_STAT			0x0444
++
++#define CAMSV_TG_SEN_MODE			0x0500
++#define CAMSV_TG_SEN_MODE_CMOS_EN		BIT(0)
++#define CAMSV_TG_SEN_MODE_DBL_DATA_BUS_EN	BIT(1)
++#define CAMSV_TG_VF_CON				0x0504
++#define CAMSV_TG_VF_CON_VFDATA_EN		BIT(0)
++#define CAMSV_TG_SEN_GRAB_PXL			0x0508
++#define CAMSV_TG_SEN_GRAB_LIN			0x050c
++#define CAMSV_TG_PATH_CFG			0x0510
++#define CAMSV_TG_PATH_CFG_YUV_U2S_DIS		BIT(12)
++#define CAMSV_TG_SOF_CNT			0x0520
++#define CAMSV_TG_FRM_CNT_ST			0x0534
++#define CAMSV_TG_FRMSIZE_ST			0x0538
++#define CAMSV_TG_INTER_ST			0x053c
++
++/* Interrupt bits (vendor camera_isp.c, "CAMSV interrupt status"). */
++#define CAMSV_IRQ_VS1				BIT(0)
++#define CAMSV_IRQ_TG_ST1			BIT(1)
++#define CAMSV_IRQ_TG_ERR			BIT(4)
++#define CAMSV_IRQ_TG_GBERR			BIT(5)
++#define CAMSV_IRQ_SOF				BIT(7)
++#define CAMSV_IRQ_PASS1_DON			BIT(10)
++#define CAMSV_IRQ_IMGO_ERR			BIT(16)
++#define CAMSV_IRQ_IMGO_OVERRUN			BIT(17)
++
++#define CAMSV_INT_ST_MASK			(CAMSV_IRQ_PASS1_DON | CAMSV_IRQ_SOF)
++#define CAMSV_INT_ST_MASK_ERR			(CAMSV_IRQ_TG_ERR | \
++						 CAMSV_IRQ_TG_GBERR | \
++						 CAMSV_IRQ_IMGO_ERR | \
++						 CAMSV_IRQ_IMGO_OVERRUN)
++
++/* -------------------------------------------------------------------------
++ * Board-wiring sweep knobs. See the file header.
++ */
++static unsigned int seninf_inst = 1;
++module_param(seninf_inst, uint, 0644);
++MODULE_PARM_DESC(seninf_inst,
++		 "SENINF instance the sensor's CSI-2 lanes arrive on (0 = seninf1). Default 1: the vendor drives the sub sensor's MCLK from SENINF2_TG.");
++
++static unsigned int seninf_csi = 1;
++module_param(seninf_csi, uint, 0644);
++MODULE_PARM_DESC(seninf_csi,
++		 "D-PHY port index for SENINF_TOP_PHY_CTL (0 = CSI0 at +0x1c)");
++
++static unsigned int seninf_mux = 1;
++module_param(seninf_mux, uint, 0644);
++MODULE_PARM_DESC(seninf_mux, "SENINF FIFO mux index (0 = seninf1_mux)");
++
++static unsigned int seninf_cam_mux = 2;
++module_param(seninf_cam_mux, uint, 0644);
++MODULE_PARM_DESC(seninf_cam_mux,
++		 "CAM MUX output index CAMSV0 consumes. CAM0/CAM1 are CAM_A/CAM_B (the ISP), so 2 is the first CAMSV.");
++
++/*
++ * The SENINF's own test-pattern generator, driven instead of the CSI-2
++ * receiver. It exists so the two halves of this driver can fail separately:
++ * with it on, everything downstream of the SENINF input — the FIFO mux, both
++ * crossbars, CAMSV, the DMA, the interrupt and vb2 — is exercised by a source
++ * that cannot be mis-wired, so "no frames" means the receive path and "frames"
++ * means the D-PHY. Register values are the vendor sequence from the MediaTek
++ * mtk-isp SENINF RFC (seninf_enable_test_pattern, TEST_GEN_PATTERN), whose
++ * register header matches the MT6797 bank table exactly.
++ */
++static bool test_pattern;
++module_param(test_pattern, bool, 0644);
++MODULE_PARM_DESC(test_pattern,
++		 "drive the SENINF test-pattern generator instead of the sensor (bring-up instrument)");
++
++/*
++ * The CAMSV frame-buffer controller. On, the hardware tracks how many buffers
++ * the driver has handed it and drops frames rather than overwriting one that
++ * userspace still holds. Off, the DMA simply writes to whatever base address
++ * was last programmed. FBC is the right answer and the default; the knob
++ * exists because "no frames" and "IMGO_ERR on every burst" look the same from
++ * the outside whether the fault is the FBC or the DMA underneath it.
++ */
++static unsigned int pixel_mode = 1;
++module_param(pixel_mode, uint, 0644);
++MODULE_PARM_DESC(pixel_mode,
++		 "pixels per clock through the SENINF FIFO mux and CAMSV: 1, 2 or 4. The mux and the DMA must agree — they are configured from this one value for exactly that reason.");
++
++static bool use_fbc = true;
++module_param(use_fbc, bool, 0644);
++MODULE_PARM_DESC(use_fbc, "use the CAMSV frame-buffer controller (default yes)");
++
++static int lane_mux = -1;
++module_param(lane_mux, int, 0644);
++MODULE_PARM_DESC(lane_mux,
++		 "override for MIPI_RX_CON24 lane muxing, as the raw [31:24] byte; -1 derives it from the DT data-lanes/clock-lane");
++
++/* -------------------------------------------------------------------------
++ * Driver state
++ */
++
++#define GEMINI_CAM_PAD_SINK	0
++#define GEMINI_CAM_PAD_SOURCE	1
++
++struct gemini_cam_buffer {
++	struct vb2_v4l2_buffer vb;
++	struct list_head list;
++	dma_addr_t daddr;
++};
++
++struct gemini_cam_stats {
++	u32 frames;		/* PASS1_DON seen */
++	u32 sof;		/* SOF seen */
++	u32 tg_err;
++	u32 tg_gberr;
++	u32 imgo_err;
++	u32 imgo_overrun;
++	u32 dropped;		/* PASS1_DON with no queued buffer */
++	u32 mux_intsta;		/* last non-zero SENINF mux interrupt word */
++	u32 csi2_packets;	/* CSI-2 debug port, sampled at stream stop */
++	u32 tg_frmsize;		/* TG-reported frame size, sampled at stop */
++	u32 fbc;		/* CAMSV_IMGO_FBC, sampled at stop */
++};
+ 
+-struct gemini_cam_bridge {
++struct gemini_cam {
+ 	struct device *dev;
+ 	struct v4l2_device v4l2_dev;
+ 	struct media_device mdev;
+ 	struct v4l2_async_notifier notifier;
++
++	void __iomem *seninf;
++	void __iomem *camsv;
++	struct clk_bulk_data clks[3];
++	int num_clks;
++	int irq;
++
++	/* SENINF subdev: sink from the sensor, source to the video node. */
++	struct v4l2_subdev sd;
++	struct media_pad pads[2];
++	struct v4l2_subdev *sensor;
++	struct media_pad *sensor_pad;
++	struct v4l2_mbus_config_mipi_csi2 bus;
++
++	/* Capture video node. */
++	struct video_device vdev;
++	struct vb2_queue queue;
++	struct media_pipeline pipeline;
++	struct mutex lock;		/* serialises ioctls and the queue */
++	struct v4l2_pix_format format;
++
++	spinlock_t buf_lock;		/* buf_list and stats */
++	struct list_head buf_list;
++	unsigned int sequence;
++
++	struct gemini_cam_stats stats;
++	struct dentry *debugfs;
++};
++
++static inline struct gemini_cam *sd_to_cam(struct v4l2_subdev *sd)
++{
++	return container_of(sd, struct gemini_cam, sd);
++}
++
++static inline struct gemini_cam_buffer *to_cam_buffer(struct vb2_buffer *vb)
++{
++	return container_of(to_vb2_v4l2_buffer(vb), struct gemini_cam_buffer,
++			    vb);
++}
++
++/* -------------------------------------------------------------------------
++ * Register helpers
++ */
++static inline void __iomem *seninf_inst_base(struct gemini_cam *cam)
++{
++	return cam->seninf + seninf_inst * SENINF_INST_STRIDE;
++}
++
++static inline void __iomem *seninf_mux_base(struct gemini_cam *cam)
++{
++	return cam->seninf + seninf_mux * SENINF_INST_STRIDE;
++}
++
++static void reg_update(void __iomem *addr, u32 mask, u32 value)
++{
++	u32 val = readl(addr);
++
++	writel((val & ~mask) | (value & mask), addr);
++}
++
++#define seninf_top_update(cam, reg, field, val) \
++	reg_update((cam)->seninf + (reg), field, FIELD_PREP(field, val))
++#define inst_update(cam, reg, field, val) \
++	reg_update(seninf_inst_base(cam) + (reg), field, FIELD_PREP(field, val))
++#define mux_update(cam, reg, field, val) \
++	reg_update(seninf_mux_base(cam) + (reg), field, FIELD_PREP(field, val))
++
++static inline u32 camsv_read(struct gemini_cam *cam, u32 reg)
++{
++	return readl(cam->camsv + reg);
++}
++
++static inline void camsv_write(struct gemini_cam *cam, u32 reg, u32 val)
++{
++	writel(val, cam->camsv + reg);
++}
++
++/* -------------------------------------------------------------------------
++ * SENINF
++ */
++
++/*
++ * Lane muxing. MIPI_RX_CON24's four 2-bit fields say which physical D-PHY
++ * lane feeds each logical CSI-2 lane. The clock lane is skipped when counting,
++ * exactly as the MT8365 driver does: a sensor whose clock is on physical lane
++ * 0 and data on 1 and 2 becomes logical data lanes 0 and 1.
++ */
++static u32 gemini_cam_lane_mux(struct gemini_cam *cam)
++{
++	unsigned int lanes[4] = { 0, 1, 2, 3 };
++	unsigned int i;
++	u32 val = 0;
++
++	if (lane_mux >= 0)
++		return FIELD_PREP(SENINF_MIPI_RX_CON24_LN0_MUX |
++				  SENINF_MIPI_RX_CON24_LN1_MUX |
++				  SENINF_MIPI_RX_CON24_LN2_MUX |
++				  SENINF_MIPI_RX_CON24_LN3_MUX,
++				  lane_mux & 0xff);
++
++	for (i = 0; i < cam->bus.num_data_lanes && i < 4; i++) {
++		lanes[i] = cam->bus.data_lanes[i];
++		if (lanes[i] > cam->bus.clock_lane)
++			lanes[i]--;
++	}
++
++	val |= FIELD_PREP(SENINF_MIPI_RX_CON24_LN0_MUX, lanes[0]);
++	val |= FIELD_PREP(SENINF_MIPI_RX_CON24_LN1_MUX, lanes[1]);
++	val |= FIELD_PREP(SENINF_MIPI_RX_CON24_LN2_MUX, lanes[2]);
++	val |= FIELD_PREP(SENINF_MIPI_RX_CON24_LN3_MUX, lanes[3]);
++	return val;
++}
++
++/*
++ * Route this SENINF instance's FIFO mux to the CAM output CAMSV0 consumes.
++ * Both crossbars are nibble-per-consumer tables.
++ */
++static void gemini_cam_seninf_route(struct gemini_cam *cam)
++{
++	u32 val;
++
++	val = readl(cam->seninf + SENINF_TOP_MUX_CTRL) & ~(0xf << (seninf_mux * 4));
++	val |= (seninf_inst & 0xf) << (seninf_mux * 4);
++	writel(val, cam->seninf + SENINF_TOP_MUX_CTRL);
++
++	val = readl(cam->seninf + SENINF_TOP_CAM_MUX_CTRL)
++	    & ~(0xf << (seninf_cam_mux * 4));
++	val |= (seninf_mux & 0xf) << (seninf_cam_mux * 4);
++	writel(val, cam->seninf + SENINF_TOP_CAM_MUX_CTRL);
++}
++
++static void gemini_cam_seninf_testpat(struct gemini_cam *cam)
++{
++	void __iomem *inst = seninf_inst_base(cam);
++	void __iomem *mux = seninf_mux_base(cam);
++	const struct v4l2_pix_format *f = &cam->format;
++
++	writel(SENINF_TOP_CTRL_PCLK_EN | SENINF_TOP_CTRL_PCLK2_EN,
++	       cam->seninf + SENINF_TOP_CTRL);
++
++	/* SENINF_EN, and SRC_SEL = 1: the test model rather than the CSI-2 RX. */
++	writel(0x1001, inst + SENINF_CTRL);
++
++	writel(0x96df1080, mux + SENINF_MUX_CTRL);
++	mux_update(cam, SENINF_MUX_CTRL, SENINF_MUX_CTRL_PIX_SEL,
++		   pixel_mode == 2 ? 1 : 0);
++	writel(0x8000007f, mux + SENINF_MUX_INTEN);
++	writel(0x0, mux + SENINF_MUX_SPARE);
++	writel(0xe2000, mux + SENINF_MUX_CTRL_EXT);
++	writel(0x0, mux + SENINF_MUX_CTRL_EXT);
++	mux_update(cam, SENINF_MUX_CTRL_EXT, SENINF_MUX_CTRL_EXT_PIX_SEL_EXT,
++		   pixel_mode == 4 ? 1 : 0);
++
++	writel(0x404c1, inst + SENINF_TG_TM_CTL);
++	writel(((f->height + 0x100) << 16) | (f->width + 0x100),
++	       inst + SENINF_TG_TM_SIZE);
++	writel(0x0, inst + SENINF_TG_TM_CLK);
++	writel(0x1, inst + SENINF_TG_TM_STP);
++
++	writel(readl(inst + SENINF_CTRL_EXT) | SENINF_CTRL_EXT_TESTMDL_IP_EN,
++	       inst + SENINF_CTRL_EXT);
++
++	gemini_cam_seninf_route(cam);
++
++	dev_info(cam->dev,
++		 "SENINF test pattern on inst %u mux %u cam_mux %u: ctrl 0x%08x ext 0x%08x mux 0x%08x tm 0x%08x/0x%08x top_mux 0x%08x cam_mux 0x%08x\n",
++		 seninf_inst, seninf_mux, seninf_cam_mux,
++		 readl(inst + SENINF_CTRL), readl(inst + SENINF_CTRL_EXT),
++		 readl(mux + SENINF_MUX_CTRL), readl(inst + SENINF_TG_TM_CTL),
++		 readl(inst + SENINF_TG_TM_SIZE),
++		 readl(cam->seninf + SENINF_TOP_MUX_CTRL),
++		 readl(cam->seninf + SENINF_TOP_CAM_MUX_CTRL));
++}
++
++static void gemini_cam_seninf_start(struct gemini_cam *cam)
++{
++	void __iomem *inst = seninf_inst_base(cam);
++	void __iomem *mux = seninf_mux_base(cam);
++	unsigned int num_lanes = cam->bus.num_data_lanes;
++	u32 val;
++
++	if (test_pattern) {
++		gemini_cam_seninf_testpat(cam);
++		return;
++	}
++
++	/* The SENINF register banks need their own PCLK gates. */
++	reg_update(cam->seninf + SENINF_TOP_CTRL,
++		   SENINF_TOP_CTRL_PCLK_EN | SENINF_TOP_CTRL_PCLK2_EN,
++		   SENINF_TOP_CTRL_PCLK_EN | SENINF_TOP_CTRL_PCLK2_EN);
++
++	/* D-PHY: 4D1C mode, clock lane select, lane mux enable. */
++	seninf_top_update(cam, SENINF_TOP_PHY_CTL(seninf_csi),
++			  SENINF_TOP_PHY_CTL_DPHY_MODE, 0);
++	seninf_top_update(cam, SENINF_TOP_PHY_CTL(seninf_csi),
++			  SENINF_TOP_PHY_CTL_CK_SEL_1, cam->bus.clock_lane);
++	seninf_top_update(cam, SENINF_TOP_PHY_CTL(seninf_csi),
++			  SENINF_TOP_PHY_CTL_CK_SEL_2, 2);
++	seninf_top_update(cam, SENINF_TOP_PHY_CTL(seninf_csi),
++			  SENINF_TOP_PHY_CTL_LANE_MUX_EN, 1);
++
++	reg_update(inst + SENINF_MIPI_RX_CON24,
++		   SENINF_MIPI_RX_CON24_LN0_MUX | SENINF_MIPI_RX_CON24_LN1_MUX |
++		   SENINF_MIPI_RX_CON24_LN2_MUX | SENINF_MIPI_RX_CON24_LN3_MUX,
++		   gemini_cam_lane_mux(cam));
++
++	writel(SENINF_TIMESTAMP_STEP, inst + SENINF_TG_TM_STP);
++
++	/*
++	 * SENINF_TG_PH_CNT (+0x600) is deliberately NOT written.
++	 *
++	 * The MT8365 driver writes 0 there, calling it a phase counter whose
++	 * zero value means "sensor powered up, reset deasserted". On MT6797
++	 * bit 31 of that same register is the sensor MASTER CLOCK ENABLE —
++	 * the vendor's live value is 0x80000001, and it is what makes the
++	 * CMMCLK pad toggle at all. Writing 0 stops the sensor's clock, and
++	 * the sensor then NAKs every I2C write: measured on build #78, where
++	 * hi556 failed its very first mode register with -EIO.
++	 *
++	 * SENINF_TG_SEN_CK is left alone for the same reason: it is exactly
++	 * what gemini-camera-power set it to (0x00010001, the vendor's
++	 * captured value: CLKCNT 1, so the 48 MHz CAMTG becomes the 24 MHz
++	 * MCLK the Hi-556 asks for). Recomputing it
++	 * from the link frequency here, as the MT8365 driver does, would move
++	 * the master clock away from a value already proven to make the sensor
++	 * answer on I2C.
++	 */
++
++	/* Enable the input and point it at the CSI-2 receiver. */
++	inst_update(cam, SENINF_CTRL, SENINF_CTRL_SENINF_EN, 1);
++	inst_update(cam, SENINF_CTRL, SENINF_CTRL_PAD2CAM_DATA_SEL,
++		    SENINF_PAD_10BIT);
++	inst_update(cam, SENINF_CTRL, SENINF_CTRL_SENINF_SRC_SEL, 0);
++	inst_update(cam, SENINF_CTRL_EXT, SENINF_CTRL_EXT_CSI2_IP_EN, 1);
++	inst_update(cam, SENINF_CTRL_EXT, SENINF_CTRL_EXT_NCSI2_IP_EN, 0);
++
++	/* Plain RAW10, no DPCM compression. */
++	writel(SENINF_CSI2_DPCM_DI_30_EN, inst + SENINF_CSI2_DPCM);
++
++	inst_update(cam, SENINF_CSI2_LNRD_TIMING,
++		    SENINF_CSI2_LNRD_TIMING_DATA_SETTLE, SENINF_SETTLE_DELAY);
++
++	val = readl(inst + SENINF_CSI2_CTL)
++	    | FIELD_PREP(SENINF_CSI2_CTL_ED_SEL, 1)
++	    | SENINF_CSI2_CTL_CLOCK_LANE_EN
++	    | (BIT(num_lanes) - 1);
++	writel(val, inst + SENINF_CSI2_CTL);
++
++	inst_update(cam, SENINF_CSI2_RESYNC_MERGE_CTL,
++		    SENINF_CSI2_RESYNC_BYPASS, 0);
++	inst_update(cam, SENINF_CSI2_RESYNC_MERGE_CTL,
++		    SENINF_CSI2_RESYNC_CDPHY_SEL, 0);
++	inst_update(cam, SENINF_CSI2_RESYNC_MERGE_CTL,
++		    SENINF_CSI2_RESYNC_CPHY_CNT, 3);
++	inst_update(cam, SENINF_CSI2_MODE, SENINF_CSI2_MODE_CSI2_MODE, 0);
++	inst_update(cam, SENINF_CSI2_MODE, SENINF_CSI2_MODE_HEADER_LEN, 0);
++	inst_update(cam, SENINF_CSI2_DPHY_SYNC, SENINF_CSI2_DPHY_SYNC_MASK_0,
++		    0xff00);
++	inst_update(cam, SENINF_CSI2_DPHY_SYNC, SENINF_CSI2_DPHY_SYNC_PAT_0,
++		    0x001d);
++
++	inst_update(cam, SENINF_CSI2_CTL, SENINF_CSI2_CTL_CLOCK_HS_OPTION, 0);
++	inst_update(cam, SENINF_CSI2_CTL, SENINF_CSI2_CTL_HSRX_DET_EN, 0);
++	inst_update(cam, SENINF_CSI2_CTL, SENINF_CSI2_CTL_HS_TRAIL_EN, 1);
++	inst_update(cam, SENINF_CSI2_HS_TRAIL, SENINF_CSI2_HS_TRAIL_PARAM,
++		    SENINF_HS_TRAIL_PARAMETER);
++
++	/*
++	 * Debug port 0x1a is the received-packet counter. It is the only
++	 * instrument that distinguishes "the D-PHY is mis-muxed" from "the
++	 * sensor is not transmitting", so it is always on.
++	 */
++	inst_update(cam, SENINF_CSI2_DGB_SEL, SENINF_CSI2_DGB_SEL_DEBUG_EN, 1);
++	inst_update(cam, SENINF_CSI2_DGB_SEL, SENINF_CSI2_DGB_SEL_DEBUG_SEL,
++		    0x1a);
++
++	writel(0xfffffffe, inst + SENINF_CSI2_SPARE0);
++
++	/* Commit the CSI-2 configuration. */
++	inst_update(cam, SENINF_CTRL, SENINF_CTRL_CSI2_SW_RST, 1);
++	udelay(1);
++	inst_update(cam, SENINF_CTRL, SENINF_CTRL_CSI2_SW_RST, 0);
++
++	/* FIFO mux: one pixel per clock, normal (non-JPEG) FIFO thresholds. */
++	mux_update(cam, SENINF_MUX_CTRL, SENINF_MUX_CTRL_MUX_EN, 1);
++	mux_update(cam, SENINF_MUX_CTRL, SENINF_MUX_CTRL_SRC_SEL,
++		   SENINF_MIPI_SENSOR);
++	mux_update(cam, SENINF_MUX_CTRL_EXT, SENINF_MUX_CTRL_EXT_SRC_SEL_EXT,
++		   SENINF_NORMAL_MODEL);
++	mux_update(cam, SENINF_MUX_CTRL_EXT, SENINF_MUX_CTRL_EXT_PIX_SEL_EXT,
++		   pixel_mode == 4 ? 1 : 0);
++	mux_update(cam, SENINF_MUX_CTRL, SENINF_MUX_CTRL_PIX_SEL,
++		   pixel_mode == 2 ? 1 : 0);
++	mux_update(cam, SENINF_MUX_CTRL, SENINF_MUX_CTRL_FIFO_FULL_WR_EN, 2);
++	mux_update(cam, SENINF_MUX_CTRL, SENINF_MUX_CTRL_FIFO_FLUSH_EN,
++		   FIFO_FLUSH_EN_NORMAL_MODE);
++	mux_update(cam, SENINF_MUX_CTRL, SENINF_MUX_CTRL_FIFO_PUSH_EN,
++		   FIFO_PUSH_EN_NORMAL_MODE);
++	mux_update(cam, SENINF_MUX_CTRL, SENINF_MUX_CTRL_HSYNC_POL, 0);
++	mux_update(cam, SENINF_MUX_CTRL, SENINF_MUX_CTRL_VSYNC_POL, 0);
++
++	val = readl(mux + SENINF_MUX_CTRL);
++	writel(val | SENINF_MUX_CTRL_IRQ_SW_RST | SENINF_MUX_CTRL_MUX_SW_RST,
++	       mux + SENINF_MUX_CTRL);
++	writel(val & ~(SENINF_MUX_CTRL_IRQ_SW_RST | SENINF_MUX_CTRL_MUX_SW_RST),
++	       mux + SENINF_MUX_CTRL);
++
++	writel(SENINF_MUX_SPARE_FIFO_FULL_SEL | 0xc0000, mux + SENINF_MUX_SPARE);
++
++	/* Report every mux error the block can raise, so overflows are counted. */
++	writel(0xffffffff, mux + SENINF_MUX_INTEN);
++	writel(readl(mux + SENINF_MUX_INTSTA), mux + SENINF_MUX_INTSTA);
++
++	gemini_cam_seninf_route(cam);
++
++	dev_dbg(cam->dev,
++		"seninf started: inst %u csi %u mux %u cam_mux %u; top_mux 0x%08x cam_mux 0x%08x mux_ctrl 0x%08x csi2_ctl 0x%08x\n",
++		seninf_inst, seninf_csi, seninf_mux, seninf_cam_mux,
++		readl(cam->seninf + SENINF_TOP_MUX_CTRL),
++		readl(cam->seninf + SENINF_TOP_CAM_MUX_CTRL),
++		readl(mux + SENINF_MUX_CTRL), readl(inst + SENINF_CSI2_CTL));
++}
++
++static void gemini_cam_seninf_stop(struct gemini_cam *cam)
++{
++	void __iomem *inst = seninf_inst_base(cam);
++	u32 val;
++
++	/* Sample the instruments before tearing the receiver down. */
++	cam->stats.csi2_packets = readl(inst + SENINF_CSI2_DGB_PORT);
++
++	val = readl(inst + SENINF_CSI2_CTL);
++	val &= ~(SENINF_CSI2_CTL_CLOCK_LANE_EN | 0xf);
++	writel(val, inst + SENINF_CSI2_CTL);
++
++	if (test_pattern) {
++		writel(0, inst + SENINF_TG_TM_CTL);
++		writel(readl(inst + SENINF_CTRL_EXT) &
++		       ~SENINF_CTRL_EXT_TESTMDL_IP_EN, inst + SENINF_CTRL_EXT);
++	}
++
++	writel(0, seninf_mux_base(cam) + SENINF_MUX_INTEN);
++	mux_update(cam, SENINF_MUX_CTRL, SENINF_MUX_CTRL_MUX_EN, 0);
++	inst_update(cam, SENINF_CTRL, SENINF_CTRL_SENINF_EN, 0);
++}
++
++/* -------------------------------------------------------------------------
++ * CAMSV
++ */
++static void gemini_cam_fbc_inc(struct gemini_cam *cam)
++{
++	u32 val = camsv_read(cam, CAMSV_IMGO_FBC);
++
++	camsv_write(cam, CAMSV_IMGO_FBC, val | CAMSV_IMGO_FBC_RCNT_INC);
++	camsv_write(cam, CAMSV_IMGO_FBC, val & ~CAMSV_IMGO_FBC_RCNT_INC);
++}
++
++static void gemini_cam_set_buffer(struct gemini_cam *cam,
++				  struct gemini_cam_buffer *buf)
++{
++	camsv_write(cam, CAMSV_IMGO_BASE_ADDR, lower_32_bits(buf->daddr));
++}
++
++static void gemini_cam_camsv_setup(struct gemini_cam *cam, unsigned int count)
++{
++	const struct v4l2_pix_format *f = &cam->format;
++	struct gemini_cam_buffer *buf;
++	unsigned long flags;
++	unsigned int i;
++	u32 fbc, tmp;
++
++	/*
++	 * The double data bus and the PAK block's 2-pixel mode are the CAMSV
++	 * side of the mux's PIX_SEL. Configuring the two independently is how
++	 * build #79 ended up with the mux delivering one pixel per clock into
++	 * a DMA expecting two, which raised IMGO_ERR on every burst and never
++	 * completed a frame.
++	 */
++	camsv_write(cam, CAMSV_TG_SEN_MODE,
++		    pixel_mode >= 2 ? CAMSV_TG_SEN_MODE_DBL_DATA_BUS_EN : 0);
++	camsv_write(cam, CAMSV_TG_SEN_GRAB_PXL, f->width << 16);
++	camsv_write(cam, CAMSV_TG_SEN_GRAB_LIN, f->height << 16);
++	camsv_write(cam, CAMSV_TG_PATH_CFG, CAMSV_TG_PATH_CFG_YUV_U2S_DIS);
++
++	/* Reset the block and its output DMA. */
++	camsv_write(cam, CAMSV_SW_CTL, CAMSV_SW_CTL_SW_RST);
++	camsv_write(cam, CAMSV_SW_CTL, 0);
++	camsv_write(cam, CAMSV_SW_CTL, CAMSV_SW_CTL_IMGO_RST_TRIG);
++	if (readl_poll_timeout_atomic(cam->camsv + CAMSV_SW_CTL, tmp,
++				      tmp == (CAMSV_SW_CTL_IMGO_RST_TRIG |
++					      CAMSV_SW_CTL_IMGO_RST_ST),
++				      10, 200))
++		dev_warn(cam->dev, "CAMSV IMGO reset did not complete (0x%08x)\n",
++			 camsv_read(cam, CAMSV_SW_CTL));
++	camsv_write(cam, CAMSV_SW_CTL, 0);
++
++	/*
++	 * The frame-buffer controller, AFTER the software reset — the reset
++	 * clears it. Setting it before, the way the code first read, left
++	 * CAMSV_IMGO_FBC reading 0x00000000 with FB_NUM zero, and the DMA
++	 * raised IMGO_ERR on every burst because it had no slot to write
++	 * into (measured, build #79). FB_NUM is the number of buffers the
++	 * driver holds; RCNT_INC is pulsed once per buffer to hand them over.
++	 */
++	if (use_fbc) {
++		fbc = camsv_read(cam, CAMSV_IMGO_FBC);
++		fbc &= ~CAMSV_IMGO_FBC_FB_NUM;
++		fbc |= CAMSV_IMGO_FBC_EN |
++		       FIELD_PREP(CAMSV_IMGO_FBC_FB_NUM, count);
++		camsv_write(cam, CAMSV_IMGO_FBC, fbc);
++
++		for (i = 0; i < count; i++)
++			gemini_cam_fbc_inc(cam);
++	} else {
++		camsv_write(cam, CAMSV_IMGO_FBC, 0);
++	}
++
++	camsv_write(cam, CAMSV_INT_EN, CAMSV_INT_ST_MASK | CAMSV_INT_ST_MASK_ERR);
++
++	camsv_write(cam, CAMSV_MODULE_EN,
++		    CAMSV_MODULE_EN_DB_EN | CAMSV_MODULE_EN_TG_EN |
++		    CAMSV_MODULE_EN_PAK_EN);
++	camsv_write(cam, CAMSV_FMT_SEL, CAMSV_FMT_SEL_TG1_FMT_RAW_10);
++	camsv_write(cam, CAMSV_PAK,
++		    CAMSV_PAK_MODE_RAW_10 |
++		    (pixel_mode >= 2 ? CAMSV_PAK_DBL_MODE_2_PIXELS : 0));
++
++	camsv_write(cam, CAMSV_IMGO_XSIZE, f->bytesperline - 1);
++	camsv_write(cam, CAMSV_IMGO_YSIZE, f->height - 1);
++	camsv_write(cam, CAMSV_IMGO_STRIDE,
++		    CAMSV_IMGO_STRIDE_BUS_SIZE_EN |
++		    CAMSV_IMGO_STRIDE_BUS_SIZE_32 | f->bytesperline);
++	camsv_write(cam, CAMSV_IMGO_CON,
++		    FIELD_PREP(CAMSV_IMGO_CON_MAX_BURST_LEN, 0x8) |
++		    FIELD_PREP(CAMSV_IMGO_CON_FIFO_SIZE, 0x80));
++	camsv_write(cam, CAMSV_IMGO_CON2,
++		    FIELD_PREP(CAMSV_IMGO_CON2_PRI_THRL, 0x2) |
++		    FIELD_PREP(CAMSV_IMGO_CON2_PRI_THRH, 0x2));
++
++	spin_lock_irqsave(&cam->buf_lock, flags);
++	buf = list_first_entry_or_null(&cam->buf_list, struct gemini_cam_buffer,
++				       list);
++	if (buf)
++		gemini_cam_set_buffer(cam, buf);
++	spin_unlock_irqrestore(&cam->buf_lock, flags);
++
++	/* CMOS first, then arm the output DMA. */
++	camsv_write(cam, CAMSV_TG_SEN_MODE,
++		    camsv_read(cam, CAMSV_TG_SEN_MODE) |
++		    CAMSV_TG_SEN_MODE_CMOS_EN);
++	camsv_write(cam, CAMSV_MODULE_EN,
++		    camsv_read(cam, CAMSV_MODULE_EN) | CAMSV_MODULE_EN_IMGO_EN);
++}
++
++static void gemini_cam_camsv_vf_enable(struct gemini_cam *cam)
++{
++	if (use_fbc)
++		camsv_write(cam, CAMSV_IMGO_FBC,
++			    camsv_read(cam, CAMSV_IMGO_FBC) |
++			    CAMSV_IMGO_FBC_EN);
++	camsv_write(cam, CAMSV_CLK_EN,
++		    CAMSV_CLK_EN_TG_DP | CAMSV_CLK_EN_PAK_DP |
++		    CAMSV_CLK_EN_DMA_DP);
++	camsv_write(cam, CAMSV_TG_SEN_MODE,
++		    camsv_read(cam, CAMSV_TG_SEN_MODE) |
++		    CAMSV_TG_SEN_MODE_CMOS_EN);
++	camsv_write(cam, CAMSV_TG_VF_CON,
++		    camsv_read(cam, CAMSV_TG_VF_CON) |
++		    CAMSV_TG_VF_CON_VFDATA_EN);
++}
++
++static void gemini_cam_camsv_vf_disable(struct gemini_cam *cam)
++{
++	/* Sample the TG's own view of the frame before stopping it. */
++	cam->stats.tg_frmsize = camsv_read(cam, CAMSV_TG_FRMSIZE_ST);
++	cam->stats.fbc = camsv_read(cam, CAMSV_IMGO_FBC);
++
++	camsv_write(cam, CAMSV_TG_SEN_MODE,
++		    camsv_read(cam, CAMSV_TG_SEN_MODE) &
++		    ~CAMSV_TG_SEN_MODE_CMOS_EN);
++	camsv_write(cam, CAMSV_TG_VF_CON,
++		    camsv_read(cam, CAMSV_TG_VF_CON) &
++		    ~CAMSV_TG_VF_CON_VFDATA_EN);
++	camsv_write(cam, CAMSV_INT_EN, 0);
++	camsv_write(cam, CAMSV_MODULE_EN, 0);
++	camsv_write(cam, CAMSV_IMGO_FBC,
++		    camsv_read(cam, CAMSV_IMGO_FBC) & ~CAMSV_IMGO_FBC_EN);
++}
++
++static irqreturn_t gemini_cam_irq(int irq, void *data)
++{
++	struct gemini_cam *cam = data;
++	struct gemini_cam_buffer *done, *next;
++	u32 status, mux_sta;
++
++	status = camsv_read(cam, CAMSV_INT_STATUS);
++	if (!status)
++		return IRQ_NONE;
++
++	spin_lock(&cam->buf_lock);
++
++	if (status & CAMSV_IRQ_TG_ERR)
++		cam->stats.tg_err++;
++	if (status & CAMSV_IRQ_TG_GBERR)
++		cam->stats.tg_gberr++;
++	if (status & CAMSV_IRQ_IMGO_ERR)
++		cam->stats.imgo_err++;
++	if (status & CAMSV_IRQ_IMGO_OVERRUN)
++		cam->stats.imgo_overrun++;
++	if (status & CAMSV_IRQ_SOF)
++		cam->stats.sof++;
++
++	/*
++	 * The SENINF FIFO's own error word. Its bit meanings are not
++	 * documented in anything available here, so it is latched raw rather
++	 * than decoded — a non-zero value is still the difference between "the
++	 * link is marginal" and "the link is fine", which is what #65 asks to
++	 * be diagnosable.
++	 */
++	mux_sta = readl(seninf_mux_base(cam) + SENINF_MUX_INTSTA);
++	if (mux_sta) {
++		cam->stats.mux_intsta = mux_sta;
++		writel(mux_sta, seninf_mux_base(cam) + SENINF_MUX_INTSTA);
++	}
++
++	if (status & CAMSV_IRQ_PASS1_DON) {
++		cam->stats.frames++;
++		cam->sequence++;
++
++		done = list_first_entry_or_null(&cam->buf_list,
++						struct gemini_cam_buffer, list);
++		if (done)
++			list_del(&done->list);
++		else
++			cam->stats.dropped++;
++
++		next = list_first_entry_or_null(&cam->buf_list,
++						struct gemini_cam_buffer, list);
++
++		if (done) {
++			done->vb.sequence = cam->sequence;
++			done->vb.vb2_buf.timestamp = ktime_get_ns();
++			vb2_buffer_done(&done->vb.vb2_buf, VB2_BUF_STATE_DONE);
++			if (use_fbc)
++				gemini_cam_fbc_inc(cam);
++		}
++
++		/*
++		 * With no buffer to point at, the hardware keeps its previous
++		 * target and the FBC drops frames until buf_queue supplies one.
++		 */
++		if (next)
++			gemini_cam_set_buffer(cam, next);
++	}
++
++	spin_unlock(&cam->buf_lock);
++
++	/* Write-1-to-clear is not used here: reading INT_STATUS clears it. */
++	if (status & CAMSV_INT_ST_MASK_ERR)
++		dev_warn_ratelimited(cam->dev, "CAMSV error status 0x%08x\n",
++				     (u32)(status & CAMSV_INT_ST_MASK_ERR));
++
++	return IRQ_HANDLED;
++}
++
++/* -------------------------------------------------------------------------
++ * SENINF subdev
++ */
++static int gemini_cam_sd_s_stream(struct v4l2_subdev *sd, int enable)
++{
++	struct gemini_cam *cam = sd_to_cam(sd);
++	int ret;
++
++	if (enable) {
++		gemini_cam_seninf_start(cam);
++		if (test_pattern)
++			return 0;
++		ret = v4l2_subdev_call(cam->sensor, video, s_stream, 1);
++		if (ret) {
++			dev_err(cam->dev, "sensor s_stream(1): %d\n", ret);
++			gemini_cam_seninf_stop(cam);
++			return ret;
++		}
++		return 0;
++	}
++
++	if (test_pattern) {
++		gemini_cam_seninf_stop(cam);
++		return 0;
++	}
++
++	ret = v4l2_subdev_call(cam->sensor, video, s_stream, 0);
++	if (ret)
++		dev_err(cam->dev, "sensor s_stream(0): %d\n", ret);
++	gemini_cam_seninf_stop(cam);
++	return ret;
++}
++
++static const struct v4l2_subdev_video_ops gemini_cam_sd_video_ops = {
++	.s_stream = gemini_cam_sd_s_stream,
++};
++
++static const struct v4l2_subdev_ops gemini_cam_sd_ops = {
++	.video = &gemini_cam_sd_video_ops,
++};
++
++static const struct media_entity_operations gemini_cam_media_ops = {
++	.link_validate = v4l2_subdev_link_validate,
++};
++
++/* -------------------------------------------------------------------------
++ * Format
++ *
++ * One format only: the SGRBG10 the Hi-556 emits, packed the way CAMSV's PAK
++ * block writes it. Anything else would be a claim this driver has not tested.
++ */
++static void gemini_cam_fill_format(struct v4l2_pix_format *f)
++{
++	f->pixelformat = V4L2_PIX_FMT_SGRBG10;
++	f->field = V4L2_FIELD_NONE;
++	f->colorspace = V4L2_COLORSPACE_RAW;
++	f->ycbcr_enc = V4L2_YCBCR_ENC_DEFAULT;
++	f->quantization = V4L2_QUANTIZATION_DEFAULT;
++	f->xfer_func = V4L2_XFER_FUNC_DEFAULT;
++
++	f->width = clamp_t(u32, ALIGN(f->width, 2), 64, 2592);
++	f->height = clamp_t(u32, ALIGN(f->height, 2), 64, 1944);
++	f->bytesperline = ALIGN(DIV_ROUND_UP(f->width * 10, 8), 2);
++	f->sizeimage = f->bytesperline * f->height;
++}
++
++/* -------------------------------------------------------------------------
++ * videobuf2
++ */
++static int gemini_cam_queue_setup(struct vb2_queue *vq, unsigned int *nbufs,
++				  unsigned int *nplanes, unsigned int sizes[],
++				  struct device *alloc_devs[])
++{
++	struct gemini_cam *cam = vb2_get_drv_priv(vq);
++	unsigned int size = cam->format.sizeimage;
++
++	/* The FBC slot count is a 4-bit field. */
++	*nbufs = clamp_t(unsigned int, *nbufs, 2, 15);
++
++	if (*nplanes) {
++		if (*nplanes != 1 || sizes[0] < size)
++			return -EINVAL;
++		return 0;
++	}
++
++	*nplanes = 1;
++	sizes[0] = size;
++	return 0;
++}
++
++static int gemini_cam_buf_prepare(struct vb2_buffer *vb)
++{
++	struct gemini_cam *cam = vb2_get_drv_priv(vb->vb2_queue);
++	struct gemini_cam_buffer *buf = to_cam_buffer(vb);
++
++	if (vb2_plane_size(vb, 0) < cam->format.sizeimage) {
++		dev_err(cam->dev, "buffer too small: %lu < %u\n",
++			vb2_plane_size(vb, 0), cam->format.sizeimage);
++		return -EINVAL;
++	}
++
++	vb2_set_plane_payload(vb, 0, cam->format.sizeimage);
++	buf->vb.field = V4L2_FIELD_NONE;
++	buf->daddr = vb2_dma_contig_plane_dma_addr(vb, 0);
++
++	/*
++	 * CAMSV_IMGO_BASE_ADDR is a 32-bit register and this SoC has memory
++	 * above 4 GB. A buffer the DMA cannot address must be refused, not
++	 * truncated into somebody else's pages.
++	 */
++	if (upper_32_bits(buf->daddr)) {
++		dev_err(cam->dev, "buffer at %pad is above the 32-bit DMA window\n",
++			&buf->daddr);
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++static void gemini_cam_buf_queue(struct vb2_buffer *vb)
++{
++	struct gemini_cam *cam = vb2_get_drv_priv(vb->vb2_queue);
++	struct gemini_cam_buffer *buf = to_cam_buffer(vb);
++	bool streaming = vb2_start_streaming_called(vb->vb2_queue);
++	unsigned long flags;
++
++	spin_lock_irqsave(&cam->buf_lock, flags);
++	if (streaming && list_empty(&cam->buf_list))
++		gemini_cam_set_buffer(cam, buf);
++	list_add_tail(&buf->list, &cam->buf_list);
++	if (streaming && use_fbc)
++		gemini_cam_fbc_inc(cam);
++	spin_unlock_irqrestore(&cam->buf_lock, flags);
++}
++
++static void gemini_cam_return_buffers(struct gemini_cam *cam,
++				      enum vb2_buffer_state state)
++{
++	struct gemini_cam_buffer *buf, *tmp;
++	unsigned long flags;
++
++	spin_lock_irqsave(&cam->buf_lock, flags);
++	list_for_each_entry_safe(buf, tmp, &cam->buf_list, list) {
++		list_del(&buf->list);
++		vb2_buffer_done(&buf->vb.vb2_buf, state);
++	}
++	spin_unlock_irqrestore(&cam->buf_lock, flags);
++}
++
++static int gemini_cam_start_streaming(struct vb2_queue *vq, unsigned int count)
++{
++	struct gemini_cam *cam = vb2_get_drv_priv(vq);
++	int ret;
++
++	ret = pm_runtime_resume_and_get(cam->dev);
++	if (ret < 0) {
++		dev_err(cam->dev, "runtime resume: %d\n", ret);
++		goto err_return;
++	}
++
++	memset(&cam->stats, 0, sizeof(cam->stats));
++	cam->sequence = (unsigned int)-1;
++
++	ret = video_device_pipeline_start(&cam->vdev, &cam->pipeline);
++	if (ret) {
++		dev_err(cam->dev, "pipeline start: %d\n", ret);
++		goto err_pm;
++	}
++
++	gemini_cam_camsv_setup(cam, count);
++	gemini_cam_camsv_vf_enable(cam);
++
++	ret = v4l2_subdev_call(&cam->sd, video, s_stream, 1);
++	if (ret)
++		goto err_pipeline;
++
++	return 0;
++
++err_pipeline:
++	gemini_cam_camsv_vf_disable(cam);
++	video_device_pipeline_stop(&cam->vdev);
++err_pm:
++	pm_runtime_put(cam->dev);
++err_return:
++	gemini_cam_return_buffers(cam, VB2_BUF_STATE_QUEUED);
++	return ret;
++}
++
++static void gemini_cam_stop_streaming(struct vb2_queue *vq)
++{
++	struct gemini_cam *cam = vb2_get_drv_priv(vq);
++
++	v4l2_subdev_call(&cam->sd, video, s_stream, 0);
++	gemini_cam_camsv_vf_disable(cam);
++	gemini_cam_return_buffers(cam, VB2_BUF_STATE_ERROR);
++	video_device_pipeline_stop(&cam->vdev);
++
++	dev_info(cam->dev,
++		 "stream stopped: %u frames, %u sof, %u dropped, errors tg %u gb %u imgo %u ovr %u, mux_intsta 0x%08x, csi2 packets %u, tg frmsize 0x%08x\n",
++		 cam->stats.frames, cam->stats.sof, cam->stats.dropped,
++		 cam->stats.tg_err, cam->stats.tg_gberr, cam->stats.imgo_err,
++		 cam->stats.imgo_overrun, cam->stats.mux_intsta,
++		 cam->stats.csi2_packets, cam->stats.tg_frmsize);
++
++	pm_runtime_put(cam->dev);
++}
++
++static const struct vb2_ops gemini_cam_vb2_ops = {
++	.queue_setup = gemini_cam_queue_setup,
++	.buf_prepare = gemini_cam_buf_prepare,
++	.buf_queue = gemini_cam_buf_queue,
++	.start_streaming = gemini_cam_start_streaming,
++	.stop_streaming = gemini_cam_stop_streaming,
++	.wait_prepare = vb2_ops_wait_prepare,
++	.wait_finish = vb2_ops_wait_finish,
+ };
+ 
+-static int gemini_bridge_bound(struct v4l2_async_notifier *notifier,
+-			       struct v4l2_subdev *sd,
+-			       struct v4l2_async_connection *asc)
++/* -------------------------------------------------------------------------
++ * V4L2 ioctls
++ */
++static int gemini_cam_querycap(struct file *file, void *priv,
++			       struct v4l2_capability *cap)
++{
++	strscpy(cap->driver, "gemini-cam", sizeof(cap->driver));
++	strscpy(cap->card, "Gemini PDA camera", sizeof(cap->card));
++	return 0;
++}
++
++static int gemini_cam_enum_fmt(struct file *file, void *priv,
++			       struct v4l2_fmtdesc *f)
++{
++	if (f->index)
++		return -EINVAL;
++	f->pixelformat = V4L2_PIX_FMT_SGRBG10;
++	return 0;
++}
++
++static int gemini_cam_g_fmt(struct file *file, void *priv,
++			    struct v4l2_format *f)
+ {
+-	struct gemini_cam_bridge *b =
+-		container_of(notifier, struct gemini_cam_bridge, notifier);
++	struct gemini_cam *cam = video_drvdata(file);
+ 
+-	dev_info(b->dev, "sensor subdev '%s' bound to the media graph\n",
++	f->fmt.pix = cam->format;
++	return 0;
++}
++
++static int gemini_cam_try_fmt(struct file *file, void *priv,
++			      struct v4l2_format *f)
++{
++	gemini_cam_fill_format(&f->fmt.pix);
++	return 0;
++}
++
++static int gemini_cam_s_fmt(struct file *file, void *priv,
++			    struct v4l2_format *f)
++{
++	struct gemini_cam *cam = video_drvdata(file);
++
++	if (vb2_is_busy(&cam->queue))
++		return -EBUSY;
++
++	gemini_cam_fill_format(&f->fmt.pix);
++	cam->format = f->fmt.pix;
++	return 0;
++}
++
++static int gemini_cam_enum_framesizes(struct file *file, void *priv,
++				      struct v4l2_frmsizeenum *fsize)
++{
++	/*
++	 * The sensor's own mode table is the authority on what sizes exist;
++	 * this only says what the DMA can carry. Userspace picks a mode by
++	 * setting the format on the sensor subdev.
++	 */
++	if (fsize->index || fsize->pixel_format != V4L2_PIX_FMT_SGRBG10)
++		return -EINVAL;
++
++	fsize->type = V4L2_FRMSIZE_TYPE_STEPWISE;
++	fsize->stepwise.min_width = 64;
++	fsize->stepwise.max_width = 2592;
++	fsize->stepwise.step_width = 2;
++	fsize->stepwise.min_height = 64;
++	fsize->stepwise.max_height = 1944;
++	fsize->stepwise.step_height = 2;
++	return 0;
++}
++
++static int gemini_cam_enum_input(struct file *file, void *priv,
++				 struct v4l2_input *inp)
++{
++	if (inp->index)
++		return -EINVAL;
++	inp->type = V4L2_INPUT_TYPE_CAMERA;
++	strscpy(inp->name, "Camera", sizeof(inp->name));
++	return 0;
++}
++
++static int gemini_cam_g_input(struct file *file, void *priv, unsigned int *i)
++{
++	*i = 0;
++	return 0;
++}
++
++static int gemini_cam_s_input(struct file *file, void *priv, unsigned int i)
++{
++	return i ? -EINVAL : 0;
++}
++
++static const struct v4l2_ioctl_ops gemini_cam_ioctl_ops = {
++	.vidioc_querycap		= gemini_cam_querycap,
++	.vidioc_enum_fmt_vid_cap	= gemini_cam_enum_fmt,
++	.vidioc_g_fmt_vid_cap		= gemini_cam_g_fmt,
++	.vidioc_s_fmt_vid_cap		= gemini_cam_s_fmt,
++	.vidioc_try_fmt_vid_cap		= gemini_cam_try_fmt,
++	.vidioc_enum_framesizes		= gemini_cam_enum_framesizes,
++	.vidioc_enum_input		= gemini_cam_enum_input,
++	.vidioc_g_input			= gemini_cam_g_input,
++	.vidioc_s_input			= gemini_cam_s_input,
++	.vidioc_reqbufs			= vb2_ioctl_reqbufs,
++	.vidioc_create_bufs		= vb2_ioctl_create_bufs,
++	.vidioc_prepare_buf		= vb2_ioctl_prepare_buf,
++	.vidioc_querybuf		= vb2_ioctl_querybuf,
++	.vidioc_qbuf			= vb2_ioctl_qbuf,
++	.vidioc_dqbuf			= vb2_ioctl_dqbuf,
++	.vidioc_expbuf			= vb2_ioctl_expbuf,
++	.vidioc_streamon		= vb2_ioctl_streamon,
++	.vidioc_streamoff		= vb2_ioctl_streamoff,
++};
++
++static const struct v4l2_file_operations gemini_cam_fops = {
++	.owner		= THIS_MODULE,
++	.open		= v4l2_fh_open,
++	.release	= vb2_fop_release,
++	.poll		= vb2_fop_poll,
++	.unlocked_ioctl	= video_ioctl2,
++	.mmap		= vb2_fop_mmap,
++};
++
++/* -------------------------------------------------------------------------
++ * debugfs: the bring-up instrument
++ */
++static int gemini_cam_stats_show(struct seq_file *s, void *unused)
++{
++	struct gemini_cam *cam = s->private;
++	struct gemini_cam_stats *st = &cam->stats;
++
++	seq_printf(s, "routing        inst %u csi %u mux %u cam_mux %u\n",
++		   seninf_inst, seninf_csi, seninf_mux, seninf_cam_mux);
++	seq_printf(s, "frames         %u\n", st->frames);
++	seq_printf(s, "sof            %u\n", st->sof);
++	seq_printf(s, "dropped        %u\n", st->dropped);
++	seq_printf(s, "tg_err         %u\n", st->tg_err);
++	seq_printf(s, "tg_gberr       %u\n", st->tg_gberr);
++	seq_printf(s, "imgo_err       %u\n", st->imgo_err);
++	seq_printf(s, "imgo_overrun   %u\n", st->imgo_overrun);
++	seq_printf(s, "mux_intsta     0x%08x\n", st->mux_intsta);
++	seq_printf(s, "csi2_packets   %u\n", st->csi2_packets);
++	seq_printf(s, "tg_frmsize     0x%08x\n", st->tg_frmsize);
++	seq_printf(s, "fbc            0x%08x\n", st->fbc);
++
++	if (pm_runtime_get_if_in_use(cam->dev) > 0) {
++		void __iomem *inst = seninf_inst_base(cam);
++
++		seq_printf(s, "live csi2_ctl  0x%08x\n",
++			   readl(inst + SENINF_CSI2_CTL));
++		seq_printf(s, "live csi2_dbg  0x%08x\n",
++			   readl(inst + SENINF_CSI2_DGB_PORT));
++		seq_printf(s, "live lnrc_fsm  0x%08x\n",
++			   readl(inst + SENINF_CSI2_LNRC_FSM));
++		seq_printf(s, "live mux_ctrl  0x%08x\n",
++			   readl(seninf_mux_base(cam) + SENINF_MUX_CTRL));
++		seq_printf(s, "live top_mux   0x%08x\n",
++			   readl(cam->seninf + SENINF_TOP_MUX_CTRL));
++		seq_printf(s, "live cam_mux   0x%08x\n",
++			   readl(cam->seninf + SENINF_TOP_CAM_MUX_CTRL));
++		seq_printf(s, "live phy_ctl   0x%08x\n",
++			   readl(cam->seninf + SENINF_TOP_PHY_CTL(seninf_csi)));
++		seq_printf(s, "live sv_frmsz  0x%08x\n",
++			   camsv_read(cam, CAMSV_TG_FRMSIZE_ST));
++		seq_printf(s, "live sv_inter  0x%08x\n",
++			   camsv_read(cam, CAMSV_TG_INTER_ST));
++		seq_printf(s, "live sv_fbc    0x%08x\n",
++			   camsv_read(cam, CAMSV_IMGO_FBC));
++		seq_printf(s, "live sv_errst  0x%08x\n",
++			   camsv_read(cam, CAMSV_IMGO_ERR_STAT));
++		pm_runtime_put(cam->dev);
++	} else {
++		seq_puts(s, "live           (camera powered down)\n");
++	}
++
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(gemini_cam_stats);
++
++/* -------------------------------------------------------------------------
++ * Async notifier / probe
++ */
++static int gemini_cam_notify_bound(struct v4l2_async_notifier *notifier,
++				   struct v4l2_subdev *sd,
++				   struct v4l2_async_connection *asc)
++{
++	struct gemini_cam *cam =
++		container_of(notifier, struct gemini_cam, notifier);
++	int ret;
++
++	cam->sensor = sd;
++
++	ret = v4l2_create_fwnode_links_to_pad(sd, &cam->pads[GEMINI_CAM_PAD_SINK],
++					      MEDIA_LNK_FL_ENABLED |
++					      MEDIA_LNK_FL_IMMUTABLE);
++	if (ret) {
++		dev_err(cam->dev, "link sensor -> seninf: %d\n", ret);
++		return ret;
++	}
++
++	cam->sensor_pad = media_pad_remote_pad_first(&cam->pads[GEMINI_CAM_PAD_SINK]);
++
++	dev_info(cam->dev, "sensor subdev '%s' bound to the media graph\n",
+ 		 sd->name);
+ 	return 0;
+ }
+ 
+-static int gemini_bridge_complete(struct v4l2_async_notifier *notifier)
++static int gemini_cam_notify_complete(struct v4l2_async_notifier *notifier)
+ {
+-	struct gemini_cam_bridge *b =
+-		container_of(notifier, struct gemini_cam_bridge, notifier);
++	struct gemini_cam *cam =
++		container_of(notifier, struct gemini_cam, notifier);
+ 	int ret;
+ 
+-	ret = v4l2_device_register_subdev_nodes(&b->v4l2_dev);
++	ret = v4l2_device_register_subdev_nodes(&cam->v4l2_dev);
+ 	if (ret) {
+-		dev_err(b->dev, "register subdev nodes: %d\n", ret);
++		dev_err(cam->dev, "register subdev nodes: %d\n", ret);
+ 		return ret;
+ 	}
+ 
+-	ret = media_device_register(&b->mdev);
++	ret = video_register_device(&cam->vdev, VFL_TYPE_VIDEO, -1);
+ 	if (ret) {
+-		dev_err(b->dev, "media_device_register: %d\n", ret);
++		dev_err(cam->dev, "video_register_device: %d\n", ret);
+ 		return ret;
+ 	}
+ 
+-	dev_info(b->dev, "media graph up: %s\n", b->mdev.model);
++	ret = media_create_pad_link(&cam->sd.entity, GEMINI_CAM_PAD_SOURCE,
++				    &cam->vdev.entity, 0,
++				    MEDIA_LNK_FL_ENABLED |
++				    MEDIA_LNK_FL_IMMUTABLE);
++	if (ret) {
++		dev_err(cam->dev, "link seninf -> video: %d\n", ret);
++		goto err_vdev;
++	}
++
++	ret = media_device_register(&cam->mdev);
++	if (ret) {
++		dev_err(cam->dev, "media_device_register: %d\n", ret);
++		goto err_vdev;
++	}
++
++	dev_info(cam->dev, "media graph up: %s, /dev/video%d\n",
++		 cam->mdev.model, cam->vdev.num);
+ 	return 0;
++
++err_vdev:
++	video_unregister_device(&cam->vdev);
++	return ret;
+ }
+ 
+-static const struct v4l2_async_notifier_operations gemini_bridge_ops = {
+-	.bound = gemini_bridge_bound,
+-	.complete = gemini_bridge_complete,
++static const struct v4l2_async_notifier_operations gemini_cam_notify_ops = {
++	.bound = gemini_cam_notify_bound,
++	.complete = gemini_cam_notify_complete,
+ };
+ 
+-static int gemini_bridge_probe(struct platform_device *pdev)
++static int gemini_cam_parse_endpoint(struct gemini_cam *cam,
++				     struct fwnode_handle *ep)
++{
++	struct v4l2_fwnode_endpoint vep = {
++		.bus_type = V4L2_MBUS_CSI2_DPHY,
++	};
++	int ret;
++
++	ret = v4l2_fwnode_endpoint_parse(ep, &vep);
++	if (ret) {
++		dev_err(cam->dev, "parse endpoint: %d\n", ret);
++		return ret;
++	}
++
++	cam->bus = vep.bus.mipi_csi2;
++	if (!cam->bus.num_data_lanes || cam->bus.num_data_lanes > 4) {
++		dev_err(cam->dev, "unsupported lane count %u\n",
++			cam->bus.num_data_lanes);
++		return -EINVAL;
++	}
++
++	dev_info(cam->dev, "CSI-2: %u data lanes, clock lane %u\n",
++		 cam->bus.num_data_lanes, cam->bus.clock_lane);
++	return 0;
++}
++
++static int gemini_cam_probe(struct platform_device *pdev)
+ {
+-	struct gemini_cam_bridge *b;
++	struct device *dev = &pdev->dev;
++	struct gemini_cam *cam;
++	struct media_pad *vdev_pad;
++	struct resource *res;
+ 	struct fwnode_handle *ep;
+ 	struct v4l2_async_connection *asc;
+ 	int ret;
+ 
+-	b = devm_kzalloc(&pdev->dev, sizeof(*b), GFP_KERNEL);
+-	if (!b)
++	cam = devm_kzalloc(dev, sizeof(*cam), GFP_KERNEL);
++	if (!cam)
+ 		return -ENOMEM;
+-	b->dev = &pdev->dev;
+-	platform_set_drvdata(pdev, b);
++	cam->dev = dev;
++	platform_set_drvdata(pdev, cam);
++	mutex_init(&cam->lock);
++	spin_lock_init(&cam->buf_lock);
++	INIT_LIST_HEAD(&cam->buf_list);
++
++	/*
++	 * The CAMSV output DMA is behind SMI larb2 and the M4U translates
++	 * that port unconditionally: a physical address in
++	 * CAMSV_IMGO_BASE_ADDR produces "fault type=0x5 iova=... write" on
++	 * every burst and never a frame (measured, build #78). So refuse to
++	 * run un-mapped rather than write to whatever that address aliases —
++	 * this needs "iommus = <&m4u M4U_PORT_CAM_SV0>" in DT and larb2 in
++	 * the m4u's larb list.
++	 */
++	if (!device_iommu_mapped(dev))
++		return dev_err_probe(dev, -EPROBE_DEFER,
++				     "no IOMMU mapping for the CAMSV DMA yet\n");
++
++	/*
++	 * CAMSV_IMGO_BASE_ADDR is 32 bits wide. Say so before vb2 allocates
++	 * anything, so the CMA allocator hands back addresses the DMA can
++	 * actually reach rather than ones that silently wrap.
++	 */
++	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
++	if (ret)
++		return dev_err_probe(dev, ret, "32-bit DMA mask\n");
++
++	/*
++	 * devm_ioremap(), not devm_platform_ioremap_resource(): the SENINF
++	 * window is shared with gemini-camera-power, which drives the master
++	 * clocks in it, and a request_mem_region() here would make the two
++	 * mutually exclusive.
++	 */
++	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "seninf");
++	if (!res)
++		return dev_err_probe(dev, -EINVAL, "no SENINF reg range\n");
++
++	cam->seninf = devm_ioremap(dev, res->start, resource_size(res));
++	if (!cam->seninf)
++		return dev_err_probe(dev, -ENOMEM, "cannot map SENINF\n");
++
++	cam->camsv = devm_platform_ioremap_resource_byname(pdev, "camsv");
++	if (IS_ERR(cam->camsv))
++		return dev_err_probe(dev, PTR_ERR(cam->camsv),
++				     "cannot map CAMSV\n");
++
++	cam->clks[0].id = "camsv0";
++	cam->clks[1].id = "camsv1";
++	cam->clks[2].id = "camsv2";
++	cam->num_clks = ARRAY_SIZE(cam->clks);
++	ret = devm_clk_bulk_get(dev, cam->num_clks, cam->clks);
++	if (ret)
++		return dev_err_probe(dev, ret, "CAMSV clocks\n");
++
++	cam->irq = platform_get_irq(pdev, 0);
++	if (cam->irq < 0)
++		return cam->irq;
++
++	ret = devm_request_irq(dev, cam->irq, gemini_cam_irq, 0,
++			       "gemini-camsv0", cam);
++	if (ret)
++		return dev_err_probe(dev, ret, "CAMSV IRQ\n");
++
++	ret = devm_pm_runtime_enable(dev);
++	if (ret)
++		return dev_err_probe(dev, ret, "runtime PM\n");
++
++	ep = fwnode_graph_get_next_endpoint(dev_fwnode(dev), NULL);
++	if (!ep)
++		return dev_err_probe(dev, -ENODEV, "no port endpoint in DT\n");
++
++	ret = gemini_cam_parse_endpoint(cam, ep);
++	if (ret) {
++		fwnode_handle_put(ep);
++		return ret;
++	}
+ 
+-	b->mdev.dev = b->dev;
+-	strscpy(b->mdev.model, "gemini-camera", sizeof(b->mdev.model));
+-	media_device_init(&b->mdev);
++	cam->mdev.dev = dev;
++	strscpy(cam->mdev.model, "gemini-camera", sizeof(cam->mdev.model));
++	media_device_init(&cam->mdev);
+ 
+-	b->v4l2_dev.mdev = &b->mdev;
+-	ret = v4l2_device_register(b->dev, &b->v4l2_dev);
++	cam->v4l2_dev.mdev = &cam->mdev;
++	ret = v4l2_device_register(dev, &cam->v4l2_dev);
+ 	if (ret) {
+-		dev_err(b->dev, "v4l2_device_register: %d\n", ret);
++		dev_err(dev, "v4l2_device_register: %d\n", ret);
+ 		goto err_mdev;
+ 	}
+ 
+-	v4l2_async_nf_init(&b->notifier, &b->v4l2_dev);
+-
+-	ep = fwnode_graph_get_next_endpoint(dev_fwnode(b->dev), NULL);
+-	if (!ep) {
+-		dev_err(b->dev, "no port endpoint in DT\n");
+-		ret = -ENODEV;
++	/* The SENINF subdev. */
++	v4l2_subdev_init(&cam->sd, &gemini_cam_sd_ops);
++	cam->sd.dev = dev;
++	cam->sd.owner = THIS_MODULE;
++	cam->sd.flags = V4L2_SUBDEV_FL_HAS_DEVNODE;
++	cam->sd.entity.function = MEDIA_ENT_F_VID_IF_BRIDGE;
++	cam->sd.entity.ops = &gemini_cam_media_ops;
++	strscpy(cam->sd.name, "gemini-seninf", sizeof(cam->sd.name));
++	v4l2_set_subdevdata(&cam->sd, cam);
++
++	cam->pads[GEMINI_CAM_PAD_SINK].flags = MEDIA_PAD_FL_SINK;
++	cam->pads[GEMINI_CAM_PAD_SOURCE].flags = MEDIA_PAD_FL_SOURCE;
++	ret = media_entity_pads_init(&cam->sd.entity, 2, cam->pads);
++	if (ret)
+ 		goto err_v4l2;
++
++	ret = v4l2_device_register_subdev(&cam->v4l2_dev, &cam->sd);
++	if (ret) {
++		dev_err(dev, "register seninf subdev: %d\n", ret);
++		goto err_sd_entity;
+ 	}
+ 
+-	asc = v4l2_async_nf_add_fwnode_remote(&b->notifier, ep,
++	/* The capture video node. */
++	vdev_pad = devm_kzalloc(dev, sizeof(*vdev_pad), GFP_KERNEL);
++	if (!vdev_pad) {
++		ret = -ENOMEM;
++		goto err_sd;
++	}
++	vdev_pad->flags = MEDIA_PAD_FL_SINK;
++
++	cam->format.width = 1296;
++	cam->format.height = 972;
++	gemini_cam_fill_format(&cam->format);
++
++	cam->queue.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++	cam->queue.io_modes = VB2_MMAP | VB2_DMABUF;
++	cam->queue.drv_priv = cam;
++	cam->queue.buf_struct_size = sizeof(struct gemini_cam_buffer);
++	cam->queue.ops = &gemini_cam_vb2_ops;
++	cam->queue.mem_ops = &vb2_dma_contig_memops;
++	cam->queue.timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
++	cam->queue.min_buffers_needed = 2;
++	cam->queue.lock = &cam->lock;
++	cam->queue.dev = dev;
++	ret = vb2_queue_init(&cam->queue);
++	if (ret)
++		goto err_sd;
++
++	cam->vdev.queue = &cam->queue;
++	cam->vdev.v4l2_dev = &cam->v4l2_dev;
++	cam->vdev.fops = &gemini_cam_fops;
++	cam->vdev.ioctl_ops = &gemini_cam_ioctl_ops;
++	cam->vdev.release = video_device_release_empty;
++	cam->vdev.device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_STREAMING;
++	cam->vdev.lock = &cam->lock;
++	cam->vdev.entity.function = MEDIA_ENT_F_IO_V4L;
++	strscpy(cam->vdev.name, "gemini-camsv0", sizeof(cam->vdev.name));
++	video_set_drvdata(&cam->vdev, cam);
++
++	ret = media_entity_pads_init(&cam->vdev.entity, 1, vdev_pad);
++	if (ret)
++		goto err_sd;
++
++	/* Async: wait for the sensor. */
++	v4l2_async_nf_init(&cam->notifier, &cam->v4l2_dev);
++	asc = v4l2_async_nf_add_fwnode_remote(&cam->notifier, ep,
+ 					      struct v4l2_async_connection);
+ 	fwnode_handle_put(ep);
++	ep = NULL;
+ 	if (IS_ERR(asc)) {
+ 		ret = PTR_ERR(asc);
+-		dev_err(b->dev, "add_fwnode_remote: %d\n", ret);
++		dev_err(dev, "add_fwnode_remote: %d\n", ret);
+ 		goto err_nf;
+ 	}
+ 
+-	b->notifier.ops = &gemini_bridge_ops;
+-	ret = v4l2_async_nf_register(&b->notifier);
++	cam->notifier.ops = &gemini_cam_notify_ops;
++	ret = v4l2_async_nf_register(&cam->notifier);
+ 	if (ret) {
+-		dev_err(b->dev, "nf_register: %d\n", ret);
++		dev_err(dev, "nf_register: %d\n", ret);
+ 		goto err_nf;
+ 	}
+ 
+-	dev_info(b->dev, "camera media bridge ready\n");
++	cam->debugfs = debugfs_create_dir("gemini-camera", NULL);
++	debugfs_create_file("stats", 0444, cam->debugfs, cam,
++			    &gemini_cam_stats_fops);
++
++	dev_info(dev, "camera pipeline ready (SENINF + CAMSV0)\n");
+ 	return 0;
+ 
+ err_nf:
+-	v4l2_async_nf_cleanup(&b->notifier);
++	v4l2_async_nf_cleanup(&cam->notifier);
++	media_entity_cleanup(&cam->vdev.entity);
++err_sd:
++	v4l2_device_unregister_subdev(&cam->sd);
++err_sd_entity:
++	media_entity_cleanup(&cam->sd.entity);
+ err_v4l2:
+-	v4l2_device_unregister(&b->v4l2_dev);
++	v4l2_device_unregister(&cam->v4l2_dev);
+ err_mdev:
+-	media_device_cleanup(&b->mdev);
++	media_device_cleanup(&cam->mdev);
++	if (ep)
++		fwnode_handle_put(ep);
+ 	return ret;
+ }
+ 
+-static void gemini_bridge_remove(struct platform_device *pdev)
++static void gemini_cam_remove(struct platform_device *pdev)
++{
++	struct gemini_cam *cam = platform_get_drvdata(pdev);
++
++	debugfs_remove_recursive(cam->debugfs);
++	v4l2_async_nf_unregister(&cam->notifier);
++	v4l2_async_nf_cleanup(&cam->notifier);
++	video_unregister_device(&cam->vdev);
++	media_device_unregister(&cam->mdev);
++	v4l2_device_unregister_subdev(&cam->sd);
++	media_entity_cleanup(&cam->sd.entity);
++	media_entity_cleanup(&cam->vdev.entity);
++	v4l2_device_unregister(&cam->v4l2_dev);
++	media_device_cleanup(&cam->mdev);
++}
++
++static int gemini_cam_runtime_resume(struct device *dev)
+ {
+-	struct gemini_cam_bridge *b = platform_get_drvdata(pdev);
++	struct gemini_cam *cam = dev_get_drvdata(dev);
+ 
+-	v4l2_async_nf_unregister(&b->notifier);
+-	v4l2_async_nf_cleanup(&b->notifier);
+-	media_device_unregister(&b->mdev);
+-	v4l2_device_unregister(&b->v4l2_dev);
+-	media_device_cleanup(&b->mdev);
++	/*
++	 * The genpd (gemini-camera) has already brought the rails, the ISP
++	 * domain and the camsys gates up by the time this runs; the CAMSV
++	 * gates live in that same domain and are ours to hold.
++	 */
++	return clk_bulk_prepare_enable(cam->num_clks, cam->clks);
+ }
+ 
+-static const struct of_device_id gemini_bridge_of_match[] = {
++static int gemini_cam_runtime_suspend(struct device *dev)
++{
++	struct gemini_cam *cam = dev_get_drvdata(dev);
++
++	clk_bulk_disable_unprepare(cam->num_clks, cam->clks);
++	return 0;
++}
++
++static const struct dev_pm_ops gemini_cam_pm_ops = {
++	RUNTIME_PM_OPS(gemini_cam_runtime_suspend, gemini_cam_runtime_resume,
++		       NULL)
++};
++
++static const struct of_device_id gemini_cam_of_match[] = {
+ 	{ .compatible = "planet,gemini-camera-bridge" },
+ 	{ }
+ };
+-MODULE_DEVICE_TABLE(of, gemini_bridge_of_match);
++MODULE_DEVICE_TABLE(of, gemini_cam_of_match);
+ 
+-static struct platform_driver gemini_bridge_driver = {
+-	.probe = gemini_bridge_probe,
+-	.remove_new = gemini_bridge_remove,
++static struct platform_driver gemini_cam_driver = {
++	.probe = gemini_cam_probe,
++	.remove_new = gemini_cam_remove,
+ 	.driver = {
+ 		.name = "gemini-cam-bridge",
+-		.of_match_table = gemini_bridge_of_match,
++		.of_match_table = gemini_cam_of_match,
++		.pm = pm_ptr(&gemini_cam_pm_ops),
+ 	},
+ };
+-module_platform_driver(gemini_bridge_driver);
++module_platform_driver(gemini_cam_driver);
+ 
+-MODULE_DESCRIPTION("Gemini PDA camera media-graph bridge (slice #64 seam)");
++MODULE_DESCRIPTION("Gemini PDA camera SENINF + CAMSV capture pipeline (#65)");
+ MODULE_LICENSE("GPL");
+diff --git a/drivers/misc/Kconfig b/drivers/misc/Kconfig
+--- a/drivers/misc/Kconfig
++++ b/drivers/misc/Kconfig
+@@ -598,16 +598,20 @@
+ 	  gemini-camera-power.
+ 
+ config GEMINI_CAMERA_BRIDGE
+-	tristate "Planet Gemini PDA camera media-graph bridge"
++	tristate "Planet Gemini PDA camera SENINF + CAMSV capture pipeline"
+ 	depends on OF
+ 	depends on VIDEO_DEV
+ 	depends on MEDIA_CONTROLLER
++	depends on VIDEO_V4L2_SUBDEV_API
++	select VIDEOBUF2_DMA_CONTIG
++	select V4L2_FWNODE
+ 	help
+-	  Minimal media device (issue #64) that binds the Gemini camera
+-	  sensor's async V4L2 subdev and exposes it as a media-controller
+-	  entity and a /dev/v4l-subdev node, so media-ctl and v4l2-ctl can
+-	  enumerate the sensor, its formats and its controls. It does no
+-	  CSI/SENINF data-path work — it is only the media-graph seam.
++	  The Gemini PDA camera data path (issues #64 and #65): a media
++	  device that binds the front sensor's async V4L2 subdev, a SENINF
++	  subdev that drives the MIPI CSI-2 receiver and the SENINF
++	  crossbars, and a /dev/video capture node fed by the CAMSV0 DMA
++	  engine, which writes raw Bayer frames straight to memory with no
++	  image processing.
+ 
+ 	  If unsure, say N. If built as a module it is called
+ 	  gemini-cam-bridge.

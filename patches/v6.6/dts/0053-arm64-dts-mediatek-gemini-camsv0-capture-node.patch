@@ -1,0 +1,75 @@
+Subject: [PATCH] arm64: dts: mediatek: gemini: CAMSV0 capture node and its IOMMU port
+
+diff --git a/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts b/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
+--- a/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
++++ b/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
+@@ -2752,14 +2752,65 @@
+ };
+ 
+ /*
+- * The media-graph seam for slice #64: a bare, root-level media device that
+- * binds the sensor's async subdev so media-ctl / v4l2-ctl can enumerate it. No
+- * CSI or SENINF data-path work here — that is #65.
++ * The camera data path (slices #64 and #65): the media device the sensor's
++ * async subdev attaches to, the SENINF CSI-2 receiver, and the CAMSV0 DMA
++ * engine that writes raw Bayer frames to memory.
++ *
++ * Root-level with a reg, exactly like camera-power above: this SoC's /soc node
++ * carries no ranges these two would inherit, and camera-power already sets the
++ * precedent for the block.
+  */
+ &{/} {
+-	camera_bridge: camera-bridge {
++	camera_bridge: camera-bridge@1a050000 {
+ 		compatible = "planet,gemini-camera-bridge";
+ 
++		/*
++		 * Two windows. The SENINF one is deliberately the same range
++		 * gemini-camera-power maps: that driver owns the master
++		 * clocks inside it and this one owns the receiver, so both
++		 * ioremap it without claiming the region.
++		 *
++		 * 0x8000 covers seninf_top through seninf8_mux (MT6797
++		 * Functional Spec §6.10). CAMSV0 is 0x1a050000; the six CAMSV
++		 * instances are 0x1000 apart and only the first is used.
++		 */
++		reg = <0 0x1a040000 0 0x8000>,
++		      <0 0x1a050000 0 0x1000>;
++		reg-names = "seninf", "camsv";
++
++		/*
++		 * CAMSV_0 pass-1 done, GIC SPI 252 (vendor DT node
++		 * camsv00@1a050000). The vendor marks the polarity of this
++		 * whole block "fix me"; level-low is what it ships with and
++		 * what larb2 above already uses.
++		 */
++		interrupts = <GIC_SPI 252 IRQ_TYPE_LEVEL_LOW>;
++
++		/*
++		 * The three CAMSV gates. The vendor gate table has one gate
++		 * per CAMSV pair, and the vendor enables all three together
++		 * whenever any CAMSV runs.
++		 */
++		clocks = <&camsys CLK_CAM_CAMSV0>,
++			 <&camsys CLK_CAM_CAMSV1>,
++			 <&camsys CLK_CAM_CAMSV2>;
++		clock-names = "camsv0", "camsv1", "camsv2";
++
++		/*
++		 * The camera domain: rails, camsys gates, the ISP MTCMOS
++		 * domain and the SENINF master clocks all come up with it and
++		 * go back down when nothing is streaming.
++		 */
++		power-domains = <&camera_power>;
++
++		/*
++		 * CAMSV0's output DMA sits behind SMI larb2 and the M4U
++		 * translates that port. Without this the engine writes to
++		 * whatever the physical address happens to alias and the M4U
++		 * faults on every burst.
++		 */
++		iommus = <&m4u M4U_PORT_CAM_SV0>;
++
+ 		port {
+ 			cam_bridge_in: endpoint {
+ 				remote-endpoint = <&hi556_out>;

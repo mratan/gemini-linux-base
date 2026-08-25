@@ -1,0 +1,74 @@
+Subject: [PATCH] arm64: dts: mediatek: mt6797: put SMI larb2 behind the M4U
+
+diff --git a/arch/arm64/boot/dts/mediatek/mt6797.dtsi b/arch/arm64/boot/dts/mediatek/mt6797.dtsi
+--- a/arch/arm64/boot/dts/mediatek/mt6797.dtsi
++++ b/arch/arm64/boot/dts/mediatek/mt6797.dtsi
+@@ -600,6 +600,14 @@
+ 	larb0: larb@14020000 {
+ 		compatible = "mediatek,mt6797-smi-larb";
+ 		reg = <0 0x14020000 0 0x1000>;
++		/*
++		 * Stated rather than inferred. mtk_iommu_probe() falls back to
++		 * the larb's index in "mediatek,larbs" when this property is
++		 * absent, which was harmless while larb0 was the only entry and
++		 * silently wrong the moment a second, non-consecutive larb was
++		 * added next to it.
++		 */
++		mediatek,larb-id = <0>;
+ 		mediatek,smi = <&smi_common>;
+ 		power-domains = <&scpsys MT6797_POWER_DOMAIN_MM>;
+ 		clocks = <&mmsys CLK_MM_SMI_LARB0>,
+@@ -620,9 +628,18 @@
+ 	 * a panfrost-rendered buffer can never be handed to the display and
+ 	 * every GPU-composited pixel goes through a CPU copy. See B-39.
+ 	 *
+-	 * Only larb0 is listed: it is the only larb this tree instantiates
+-	 * and the whole display pipeline is behind it. Adding larb1..6 needs
+-	 * their nodes first.
++	 * larb0 (display) and larb2 (camera) are listed. Both must probe
++	 * before this node does — mtk_iommu_probe() defers until every larb
++	 * in the list has bound — so a board that leaves either disabled gets
++	 * no IOMMU at all, and with it no display. Both are enabled by
++	 * mt6797-gemini-pda.dts. larb1 and larb3..6 still have no nodes.
++	 *
++	 * larb2 is here because the camera's CAMSV DMA is behind it and the
++	 * M4U translates that port whether or not Linux knows about it:
++	 * programming a physical address into CAMSV_IMGO_BASE_ADDR produced
++	 * a stream of "fault type=0x5 iova=0x46c00002 ... write" and not one
++	 * captured frame (measured, build #78). The port has to be mapped,
++	 * not bypassed.
+ 	 *
+ 	 * Deliberately NO clocks/clock-names: mt6797 has no infracfg M4U
+ 	 * gate (mt6797_data omits HAS_BCLK for the same reason).
+@@ -632,7 +649,7 @@
+ 		reg = <0 0x10205000 0 0x1000>;
+ 		interrupts = <GIC_SPI 156 IRQ_TYPE_LEVEL_LOW>;
+ 		mediatek,infracfg = <&infrasys>;
+-		mediatek,larbs = <&larb0>;
++		mediatek,larbs = <&larb0>, <&larb2>;
+ 		#iommu-cells = <1>;
+ 	};
+ 
+@@ -910,10 +927,10 @@
+ 	 * SMI LARB2 — the camera pipeline's local arbiter onto the memory
+ 	 * bus. IRQ 258 level-low from the vendor DT node smi_larb2@1a001000.
+ 	 *
+-	 * No "iommus"/M4U wiring here: the m4u node lists only larb0 today
+-	 * (see its comment), and adding larb2 to that list is a change to
+-	 * the display path's IOMMU that belongs with the slice that actually
+-	 * DMAs camera frames (#65), not with bring-up of the clocks.
++	 * #65 added this larb to the m4u's list (see that node): the camera
++	 * DMA masters behind it need real IOVAs. The consumers carry their own
++	 * "iommus" property naming a port; this node only has to exist and
++	 * bind, because the IOMMU will not probe until it does.
+ 	 *
+ 	 * Both clock cells are CLK_CAM_LARB2: the vendor gate table has a
+ 	 * single LARB2 gate, and mtk-smi requires two ("apb" and "smi") —
+@@ -924,6 +941,7 @@
+ 	larb2: larb@1a001000 {
+ 		compatible = "mediatek,mt6797-smi-larb";
+ 		reg = <0 0x1a001000 0 0x1000>;
++		mediatek,larb-id = <2>;
+ 		interrupts = <GIC_SPI 258 IRQ_TYPE_LEVEL_LOW>;
+ 		mediatek,smi = <&smi_common>;
+ 		power-domains = <&scpsys MT6797_POWER_DOMAIN_ISP>;
