@@ -32,7 +32,28 @@ sleep 1
 # is a journal-replay reboot, not a clean one.
 mount -o remount,ro / 2>/dev/null || echo "gemini-reboot: rootfs stayed rw (journal will replay)"
 sync
-echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+
+# NO drop_caches HERE. It used to be the next line, "best effort" after the
+# syncs above, and on 2026-08-25 netconsole caught what it actually does:
+#
+#   gemini-reboot (1960): drop_caches: 3
+#   Unable to handle kernel paging request at virtual address 000182027e959109
+#   FSC = 0x04: level 0 translation fault
+#
+# An oops, on a wild pointer, every time. The two devmem writes below are the
+# ones that perform the reset, and they are AFTER that line -- so the reboot
+# never happened. The machine sat wedged until the watchdog reclaimed it, and
+# the unclean reset left the loop-mounted rootfs replaying, which is what the
+# 20-minute boot loops on 2026-08-25 were.
+#
+# Removing it costs nothing: `sync; sync` above has already written everything
+# back, and dropping clean page cache before a reset buys no durability at all.
+#
+# It is a MESSENGER, not the disease. Walking every cached object is simply
+# where pre-existing memory corruption gets noticed. The corruption itself is
+# an open bug -- the camera DMA path is the first place to look, since it
+# writes to vb2 buffers through the IOMMU and this only started appearing once
+# capture was running. Do not "fix" that by putting this line back.
 
 # The reset needs the block ENABLED and EXRST_EN CLEAR: enabled because
 # WDT_SWRST does nothing on a disabled watchdog, and EXRST clear because that
