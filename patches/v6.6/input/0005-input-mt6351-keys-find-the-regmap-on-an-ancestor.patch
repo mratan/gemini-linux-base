@@ -1,0 +1,37 @@
+Subject: [PATCH] Input: mt6351-keys - find the regmap on an ancestor, not the parent
+
+diff --git a/drivers/input/keyboard/mt6351-keys.c b/drivers/input/keyboard/mt6351-keys.c
+--- a/drivers/input/keyboard/mt6351-keys.c
++++ b/drivers/input/keyboard/mt6351-keys.c
+@@ -154,6 +154,7 @@
+ static int mt6351_keys_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
++	struct device *parent;
+ 	struct mt6351_keys *keys;
+ 	u32 codes[2] = { KEY_ESC, KEY_SLEEP };
+ 	int i, ret;
+@@ -169,9 +170,21 @@
+ 	 * mt6351 regulator and the mt6351 codec on this node already take,
+ 	 * because mainline has no MT6351 MFD to hang children off.
+ 	 */
+-	keys->regmap = dev_get_regmap(dev->parent, NULL);
++	/*
++	 * Walk up rather than looking only at the immediate parent. The regmap
++	 * covering the PMIC's address space lives on the PWRAP device, and
++	 * this node is the PWRAP's GRANDchild: pwrap -> "mediatek,mt6351" ->
++	 * "keys". Asking only dev->parent finds the mt6351 node's device,
++	 * which has no regmap of its own, and the driver refuses to probe on a
++	 * board that is described perfectly correctly.
++	 */
++	for (parent = dev->parent; parent; parent = parent->parent) {
++		keys->regmap = dev_get_regmap(parent, NULL);
++		if (keys->regmap)
++			break;
++	}
+ 	if (!keys->regmap) {
+-		dev_err(dev, "no regmap on the parent device\n");
++		dev_err(dev, "no regmap on any ancestor device\n");
+ 		return -ENODEV;
+ 	}
+ 

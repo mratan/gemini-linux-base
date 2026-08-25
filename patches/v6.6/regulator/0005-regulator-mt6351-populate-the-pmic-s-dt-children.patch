@@ -1,0 +1,44 @@
+Subject: [PATCH] regulator: mt6351: populate the PMIC node's device-tree children
+
+diff --git a/drivers/regulator/mt6351-regulator.c b/drivers/regulator/mt6351-regulator.c
+--- a/drivers/regulator/mt6351-regulator.c
++++ b/drivers/regulator/mt6351-regulator.c
+@@ -20,6 +20,7 @@
+ 
+ #include <linux/module.h>
+ #include <linux/of.h>
++#include <linux/of_platform.h>
+ #include <linux/platform_device.h>
+ #include <linux/regmap.h>
+ #include <linux/regulator/driver.h>
+@@ -276,7 +277,7 @@
+ 	struct regmap *regmap = dev_get_regmap(pdev->dev.parent, NULL);
+ 	struct regulator_config config = {};
+ 	struct regulator_dev *rdev;
+-	int i;
++	int i, ret;
+ 
+ 	if (!regmap) {
+ 		dev_err(&pdev->dev, "no pwrap regmap on parent device\n");
+@@ -304,6 +305,21 @@
+ 
+ 	dev_info(&pdev->dev, "MT6351: %d regulators registered (VCN, SD, camera)\n",
+ 		 MT6351_ID_max);
++	/*
++	 * Instantiate this node's device-tree children.
++	 *
++	 * "mediatek,mt6351" is really an MFD node -- it has regulators, a
++	 * codec and two keys under it -- but mainline has no MT6351 MFD, so
++	 * this driver binds the node directly. The pwrap's own
++	 * of_platform_populate() only reaches this node's siblings, one level
++	 * up, so without this the "keys" subnode has a compatible, a driver
++	 * registered for it, and no device: exactly the state issue #61 was
++	 * stuck in. The "regulators" subnode has no compatible and is skipped.
++	 */
++	ret = devm_of_platform_populate(&pdev->dev);
++	if (ret)
++		dev_warn(&pdev->dev, "cannot populate PMIC children: %d\n", ret);
++
+ 	return 0;
+ }
+ 
