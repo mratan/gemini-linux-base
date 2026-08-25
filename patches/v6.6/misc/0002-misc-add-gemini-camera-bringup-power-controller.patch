@@ -174,7 +174,7 @@ diff --git a/drivers/misc/gemini-camera-power.c b/drivers/misc/gemini-camera-pow
 new file mode 100644
 --- /dev/null
 +++ b/drivers/misc/gemini-camera-power.c
-@@ -0,0 +1,679 @@
+@@ -0,0 +1,741 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Gemini PDA camera bring-up power controller.
@@ -273,12 +273,46 @@ new file mode 100644
 + * 04-docs/CAMERA-SENSORS-2026-08-24.md. Whatever feeds the TG its clock is
 + * still missing, and that is the open end of #63.
 + */
++/*
++ * SENINF master-clock setup, reverse-engineered from the vendor camera HAL
++ * (libcam.halsensor.so in the stock system.img, SeninfDrvImp::setMclk1),
++ * NOT from the vendor kernel. The kernel's ISP_MCLKn_EN only ever writes
++ * bit 29 of +0x600, but the running system's HAL maps the SENINF page through
++ * /dev/devmap and drives it directly, and its enable is a different bit. The
++ * kernel path is a red herring. The HAL sequence, per socket (base = SENINF0
++ * for the main sensor, SENINF1 for the sub):
++ *
++ *   SENINF_TOP_CTRL (+0x000) |= BIT(10) | BIT(11)
++ *   SENINF_TG_SEN_CK (+0x604): [5:0] = MCLK divider, [21:16] = divider2
++ *   SENINF_MCLK (+0x600): BIT(31) enable, plus BIT(28), bits [1:0] = 1
++ *
++ * The divider takes 48 MHz (camtg_sel, measured on the SoC frequency meter)
++ * down to the 24 MHz the sensor wants. The exact field encoding is the one
++ * unknown left; seninf_div overrides it so it can be swept on-device against
++ * the CMMCLK pad, which now moves because the enable is finally the right bit.
++ */
 +#define SENINF_STRIDE			0x1000
++#define SENINF_TOP_CTRL_REG		0x0000
 +#define SENINF_MCLK_REG			0x0600
 +#define SENINF_SEN_CK_REG		0x0604
-+#define SENINF_MCLK_REST		0x00000001
-+#define SENINF_MCLK_OUT_EN		BIT(28)
-+#define SENINF_MCLK_EN			BIT(29)
++
++#define SENINF_TOP_CTRL_EN		(BIT(10) | BIT(11))
++
++#define SENINF_MCLK_ENABLE		BIT(31)		/* HAL enable, NOT bit 29 */
++#define SENINF_MCLK_BIT28		BIT(28)
++#define SENINF_MCLK_LOW			(BIT(0) | BIT(1))
++
++#define SENINF_SEN_CK_DIV_MASK		0x3f		/* [5:0] */
++#define SENINF_SEN_CK_DIV2_MASK		(0x3f << 16)	/* [21:16] */
++
++/*
++ * MCLK divider field for 48 MHz -> 24 MHz. Overridable so the exact encoding
++ * can be found on-device; 1 is the first guess (the [5:0] field halving).
++ */
++static unsigned int seninf_div = 1;
++module_param(seninf_div, uint, 0644);
++MODULE_PARM_DESC(seninf_div,
++		 "SENINF_TG_SEN_CK divider field for 48->24 MHz (sweep knob)");
 +
 +/*
 + * Vendor power-sequence voltages (kd_camera_hw.h VOL* / PowerOnList).
@@ -370,17 +404,45 @@ new file mode 100644
 +static void gemini_cam_mclk_set(struct gemini_cam *cam, unsigned int seninf,
 +				bool on)
 +{
-+	void __iomem *reg = cam->seninf_base + seninf * SENINF_STRIDE +
-+			    SENINF_MCLK_REG;
-+	u32 val = SENINF_MCLK_REST |
-+		  (on ? (SENINF_MCLK_EN | SENINF_MCLK_OUT_EN) : 0);
++	void __iomem *base = cam->seninf_base + seninf * SENINF_STRIDE;
++	u32 v;
 +
-+	if (on && seninf_mclk)
-+		val = seninf_mclk;
++	if (!on) {
++		/* Enable bit clear is enough to stop the output. */
++		v = readl(base + SENINF_MCLK_REG) & ~SENINF_MCLK_ENABLE;
++		writel(v, base + SENINF_MCLK_REG);
++		return;
++	}
 +
-+	writel(val, reg);
-+	dev_dbg(cam->dev, "seninf%u MCLK %s, reg now 0x%08x\n",
-+		seninf, on ? "on" : "off", readl(reg));
++	/* Raw override wins, for sweeping the whole register from userspace. */
++	if (seninf_mclk) {
++		writel(seninf_mclk, base + SENINF_MCLK_REG);
++		dev_info(cam->dev, "seninf%u MCLK override 0x%08x (readback 0x%08x)\n",
++			 seninf, seninf_mclk, readl(base + SENINF_MCLK_REG));
++		return;
++	}
++
++	/* 1. SENINF_TOP_CTRL bits 10, 11. */
++	v = readl(base + SENINF_TOP_CTRL_REG) | SENINF_TOP_CTRL_EN;
++	writel(v, base + SENINF_TOP_CTRL_REG);
++
++	/* 2. TG_SEN_CK divider, both fields, from the sweepable seninf_div. */
++	v = readl(base + SENINF_SEN_CK_REG);
++	v &= ~(SENINF_SEN_CK_DIV_MASK | SENINF_SEN_CK_DIV2_MASK);
++	v |= seninf_div & SENINF_SEN_CK_DIV_MASK;
++	v |= (seninf_div << 16) & SENINF_SEN_CK_DIV2_MASK;
++	writel(v, base + SENINF_SEN_CK_REG);
++
++	/* 3. MCLK enable — bit 31, plus the low bits the HAL always sets. */
++	v = readl(base + SENINF_MCLK_REG);
++	v |= SENINF_MCLK_ENABLE | SENINF_MCLK_BIT28 | SENINF_MCLK_LOW;
++	writel(v, base + SENINF_MCLK_REG);
++
++	dev_info(cam->dev,
++		 "seninf%u MCLK on: TOP_CTRL 0x%08x, TG_SEN_CK 0x%08x, MCLK 0x%08x\n",
++		 seninf, readl(base + SENINF_TOP_CTRL_REG),
++		 readl(base + SENINF_SEN_CK_REG),
++		 readl(base + SENINF_MCLK_REG));
 +}
 +
 +static void gemini_cam_assert_resets(struct gemini_cam *cam)
