@@ -3,7 +3,7 @@ Subject: [PATCH] misc: gemini-cam-bridge: SENINF CSI-2 receiver and CAMSV captur
 diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 --- a/drivers/misc/gemini-cam-bridge.c
 +++ b/drivers/misc/gemini-cam-bridge.c
-@@ -1,155 +1,2301 @@
+@@ -1,155 +1,2377 @@
  // SPDX-License-Identifier: GPL-2.0-only
  /*
 - * Gemini PDA camera media-graph bridge.
@@ -103,7 +103,8 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 + * SENINF registers (offsets from seninf_top, 0x1a040000)
 + */
 +#define SENINF_INST_STRIDE			0x1000
-+
+ 
+-struct gemini_cam_bridge {
 +#define SENINF_TOP_CTRL				0x0000
 +#define SENINF_TOP_CTRL_PCLK_EN			BIT(10)
 +#define SENINF_TOP_CTRL_PCLK2_EN		BIT(11)
@@ -283,8 +284,7 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 +#define SENINF_TIMESTAMP_STEP			0x67
 +#define SENINF_SETTLE_DELAY			0x15
 +#define SENINF_HS_TRAIL_PARAMETER		0x8
- 
--struct gemini_cam_bridge {
++
 +/*
 + * The MUX interrupt status bits are not documented in anything available
 + * here. The vendor's CAMSV path reports the same conditions (TG error, TG
@@ -450,6 +450,25 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 + */
 +static unsigned int phy_clock_lane = 1;
 +module_param(phy_clock_lane, uint, 0644);
++
++/*
++ * Configure the bank PAIR -- this bank and the one 0x200 above it -- rather
++ * than a single bank.
++ *
++ * The vendor selects between two shapes with the first field of Seninf_para,
++ * and that field also picks which of three analog base pointers it uses. Those
++ * three bases are 0x400 apart, and each shape configures the base and the base
++ * plus 0x200: an A half and a B half. Which is to say the six banks in this
++ * page are three PAIRS -- CSI0 A/B at 0x000/0x200, CSI1 A/B at 0x400/0x600,
++ * CSI2 A/B at 0x800/0xa00 -- and the front sensor's bank at +0x400 is the A
++ * half of the middle pair, not a bank on its own.
++ *
++ * Only the A half was ever written before this. The halves differ in exactly
++ * one bit: the A half puts lane 2 in clock mode, the B half does not.
++ */
++static bool phy_pair = true;
++module_param(phy_pair, bool, 0644);
++MODULE_PARM_DESC(phy_pair, "configure this bank and its B half at +0x200 as a pair");
 +MODULE_PARM_DESC(phy_clock_lane, "analog lane carrying the CSI-2 clock (0, 1 or 2)");
 +
 +/*
@@ -729,9 +748,65 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 + * last -- the vendor powers it up after every other field is settled, with a
 + * pause between the core and the filter.
 + */
++/* One analog half: A when b_half is false, B when it is true. */
++static void gemini_cam_phy_half(struct gemini_cam *cam, void __iomem *ana,
++				bool b_half)
++{
++	u32 val;
++	int i;
++
++	/*
++	 * The vendor's four-lane shape, which is what the branch selected by a
++	 * Seninf_para[0] of 1 or 2 writes: CPHY off, lanes 0 and 1 as data with
++	 * CKSEL set, and lane 2 as the clock -- but ONLY on the A half. The B
++	 * half leaves lane 2 out of clock mode, which is the single bit the two
++	 * halves differ by.
++	 */
++	val = readl(ana + MIPI_RX_ANA00);
++	val &= ~(MIPI_RX_ANA00_CPHY_EN | MIPI_RX_ANA00_RESET_BITS |
++		 MIPI_RX_ANA00_L0_CKMODE_EN | MIPI_RX_ANA00_L1_CKMODE_EN |
++		 MIPI_RX_ANA00_L2_CKMODE_EN);
++	val |= MIPI_RX_ANA00_L0_CKSEL | MIPI_RX_ANA00_L1_CKSEL |
++	       MIPI_RX_ANA00_L2_CKSEL;
++	if (!b_half)
++		val |= MIPI_RX_ANA00_L2_CKMODE_EN;
++	writel(val, ana + MIPI_RX_ANA00);
++
++	reg_update(ana + MIPI_RX_ANA04, MIPI_RX_ANA04_F1,
++		   FIELD_PREP(MIPI_RX_ANA04_F1, 6));
++	reg_update(ana + MIPI_RX_ANA04, MIPI_RX_ANA04_F2,
++		   FIELD_PREP(MIPI_RX_ANA04_F2, 1));
++
++	for (i = 0; i < 3; i++) {
++		void __iomem *eq = ana + MIPI_RX_ANA18 + i * 4;
++
++		reg_update(eq, MIPI_RX_ANA_EQ_IS, FIELD_PREP(MIPI_RX_ANA_EQ_IS, 1));
++		reg_update(eq, MIPI_RX_ANA_EQ_BW, FIELD_PREP(MIPI_RX_ANA_EQ_BW, 1));
++	}
++
++	writel(readl(ana + MIPI_RX_ANA00) | MIPI_RX_ANA00_BG_CORE_EN,
++	       ana + MIPI_RX_ANA00);
++	udelay(30);
++	writel(readl(ana + MIPI_RX_ANA00) | MIPI_RX_ANA00_BG_LPF_EN,
++	       ana + MIPI_RX_ANA00);
++	udelay(1);
++}
++
 +static void gemini_cam_phy_setup(struct gemini_cam *cam)
 +{
 +	void __iomem *ana = cam->mipi_ana + phy_bank;
++
++	if (phy_pair) {
++		gemini_cam_phy_half(cam, ana, false);
++		gemini_cam_phy_half(cam, ana + MIPI_RX_ANA_BANK_STRIDE, true);
++		dev_dbg(cam->dev,
++			"D-PHY pair 0x%x/0x%x: ANA00 0x%08x / 0x%08x\n",
++			phy_bank, phy_bank + MIPI_RX_ANA_BANK_STRIDE,
++			readl(ana + MIPI_RX_ANA00),
++			readl(ana + MIPI_RX_ANA_BANK_STRIDE + MIPI_RX_ANA00));
++		return;
++	}
++	{
 +	static const u32 ckmode[3] = {
 +		MIPI_RX_ANA00_L0_CKMODE_EN,
 +		MIPI_RX_ANA00_L1_CKMODE_EN,
@@ -771,6 +846,7 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 +
 +	dev_dbg(cam->dev, "D-PHY bank 0x%x: ANA00 0x%08x (clock lane %u)\n",
 +		phy_bank, readl(ana + MIPI_RX_ANA00), phy_clock_lane);
++	}
 +}
 +
 +/*
@@ -1803,11 +1879,8 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 +	.vidioc_expbuf			= vb2_ioctl_expbuf,
 +	.vidioc_streamon		= vb2_ioctl_streamon,
 +	.vidioc_streamoff		= vb2_ioctl_streamoff,
- };
- 
--static int gemini_bridge_bound(struct v4l2_async_notifier *notifier,
--			       struct v4l2_subdev *sd,
--			       struct v4l2_async_connection *asc)
++};
++
 +static const struct v4l2_file_operations gemini_cam_fops = {
 +	.owner		= THIS_MODULE,
 +	.open		= v4l2_fh_open,
@@ -1833,9 +1906,7 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 + */
 +static ssize_t streaming_show(struct device *dev,
 +			      struct device_attribute *attr, char *buf)
- {
--	struct gemini_cam_bridge *b =
--		container_of(notifier, struct gemini_cam_bridge, notifier);
++{
 +	struct gemini_cam *cam = dev_get_drvdata(dev);
 +
 +	return sysfs_emit(buf, "%d\n", cam->streaming ? 1 : 0);
@@ -1845,17 +1916,23 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 +static struct attribute *gemini_cam_attrs[] = {
 +	&dev_attr_streaming.attr,
 +	NULL,
-+};
+ };
 +ATTRIBUTE_GROUPS(gemini_cam);
-+
+ 
+-static int gemini_bridge_bound(struct v4l2_async_notifier *notifier,
+-			       struct v4l2_subdev *sd,
+-			       struct v4l2_async_connection *asc)
 +/* -------------------------------------------------------------------------
 + * debugfs: the bring-up instrument
 + */
 +static int gemini_cam_stats_show(struct seq_file *s, void *unused)
-+{
+ {
+-	struct gemini_cam_bridge *b =
+-		container_of(notifier, struct gemini_cam_bridge, notifier);
 +	struct gemini_cam *cam = s->private;
 +	struct gemini_cam_stats *st = &cam->stats;
-+
+ 
+-	dev_info(b->dev, "sensor subdev '%s' bound to the media graph\n",
 +	seq_printf(s, "routing        inst %u csi %u mux %u cam_mux %u\n",
 +		   seninf_inst, seninf_csi, seninf_mux, seninf_cam_mux);
 +	seq_printf(s, "frames         %u\n", st->frames);
@@ -1927,8 +2004,7 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 +	struct gemini_cam *cam =
 +		container_of(notifier, struct gemini_cam, notifier);
 +	int ret;
- 
--	dev_info(b->dev, "sensor subdev '%s' bound to the media graph\n",
++
 +	cam->sensor = sd;
 +
 +	ret = v4l2_create_fwnode_links_to_pad(sd, &cam->pads[GEMINI_CAM_PAD_SINK],
@@ -2134,13 +2210,13 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 +		fwnode_handle_put(ep);
 +		return ret;
 +	}
- 
--	b->v4l2_dev.mdev = &b->mdev;
--	ret = v4l2_device_register(b->dev, &b->v4l2_dev);
++
 +	cam->mdev.dev = dev;
 +	strscpy(cam->mdev.model, "gemini-camera", sizeof(cam->mdev.model));
 +	media_device_init(&cam->mdev);
-+
+ 
+-	b->v4l2_dev.mdev = &b->mdev;
+-	ret = v4l2_device_register(b->dev, &b->v4l2_dev);
 +	cam->v4l2_dev.mdev = &cam->mdev;
 +	ret = v4l2_device_register(dev, &cam->v4l2_dev);
  	if (ret) {
@@ -2290,9 +2366,15 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
  
 -static void gemini_bridge_remove(struct platform_device *pdev)
 +static void gemini_cam_remove(struct platform_device *pdev)
-+{
+ {
+-	struct gemini_cam_bridge *b = platform_get_drvdata(pdev);
 +	struct gemini_cam *cam = platform_get_drvdata(pdev);
-+
+ 
+-	v4l2_async_nf_unregister(&b->notifier);
+-	v4l2_async_nf_cleanup(&b->notifier);
+-	media_device_unregister(&b->mdev);
+-	v4l2_device_unregister(&b->v4l2_dev);
+-	media_device_cleanup(&b->mdev);
 +	debugfs_remove_recursive(cam->debugfs);
 +	v4l2_async_nf_unregister(&cam->notifier);
 +	v4l2_async_nf_cleanup(&cam->notifier);
@@ -2304,8 +2386,9 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 +	media_entity_cleanup(&cam->vdev.entity);
 +	v4l2_device_unregister(&cam->v4l2_dev);
 +	media_device_cleanup(&cam->mdev);
-+}
-+
+ }
+ 
+-static const struct of_device_id gemini_bridge_of_match[] = {
 +static int gemini_cam_runtime_resume(struct device *dev)
 +{
 +	struct gemini_cam *cam = dev_get_drvdata(dev);
@@ -2319,20 +2402,13 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 +}
 +
 +static int gemini_cam_runtime_suspend(struct device *dev)
- {
--	struct gemini_cam_bridge *b = platform_get_drvdata(pdev);
++{
 +	struct gemini_cam *cam = dev_get_drvdata(dev);
- 
--	v4l2_async_nf_unregister(&b->notifier);
--	v4l2_async_nf_cleanup(&b->notifier);
--	media_device_unregister(&b->mdev);
--	v4l2_device_unregister(&b->v4l2_dev);
--	media_device_cleanup(&b->mdev);
++
 +	clk_bulk_disable_unprepare(cam->num_clks, cam->clks);
 +	return 0;
- }
- 
--static const struct of_device_id gemini_bridge_of_match[] = {
++}
++
 +static const struct dev_pm_ops gemini_cam_pm_ops = {
 +	RUNTIME_PM_OPS(gemini_cam_runtime_suspend, gemini_cam_runtime_resume,
 +		       NULL)
