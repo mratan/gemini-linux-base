@@ -3,7 +3,7 @@ Subject: [PATCH] misc: gemini-cam-bridge: SENINF CSI-2 receiver and CAMSV captur
 diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 --- a/drivers/misc/gemini-cam-bridge.c
 +++ b/drivers/misc/gemini-cam-bridge.c
-@@ -1,155 +1,2160 @@
+@@ -1,155 +1,2259 @@
  // SPDX-License-Identifier: GPL-2.0-only
  /*
 - * Gemini PDA camera media-graph bridge.
@@ -292,7 +292,8 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 + * stats so a marginal link shows up as a non-zero word even before anybody
 + * knows which bit is which.
 + */
-+
+ 
+-struct gemini_cam_bridge {
 +/* -------------------------------------------------------------------------
 + * CAMSV registers (offsets from CAMSV0, 0x1a050000). Vendor camera_isp.c.
 + */
@@ -476,8 +477,7 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 +module_param(lane_mux, int, 0644);
 +MODULE_PARM_DESC(lane_mux,
 +		 "override for MIPI_RX_CON24 lane muxing, as the raw [31:24] byte; -1 derives it from the DT data-lanes/clock-lane");
- 
--struct gemini_cam_bridge {
++
 +/* -------------------------------------------------------------------------
 + * Driver state
 + */
@@ -1369,12 +1369,90 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 +	return ret;
 +}
 +
++/*
++ * Pad operations.
++ *
++ * The SENINF does not scale, crop or convert: whatever the sensor emits comes
++ * out the other side. So the format on both pads is the same format, the sink
++ * takes whatever the sensor offers, and the source is read-only.
++ *
++ * These are not decoration. Anything that drives a media pipeline properly --
++ * media-ctl -V, and libcamera's simple pipeline handler, which calls
++ * setFormat() on every entity in the chain -- fails on a subdev with no pad
++ * ops, and fails in a way that reads as "this camera is not supported" rather
++ * than "this driver is incomplete".
++ */
++static int gemini_cam_sd_init_cfg(struct v4l2_subdev *sd,
++				  struct v4l2_subdev_state *state)
++{
++	struct v4l2_mbus_framefmt *fmt;
++
++	fmt = v4l2_subdev_get_pad_format(sd, state, GEMINI_CAM_PAD_SINK);
++	fmt->code = MEDIA_BUS_FMT_SGRBG10_1X10;
++	fmt->width = 1296;
++	fmt->height = 972;
++	fmt->field = V4L2_FIELD_NONE;
++	fmt->colorspace = V4L2_COLORSPACE_RAW;
++
++	*v4l2_subdev_get_pad_format(sd, state, GEMINI_CAM_PAD_SOURCE) = *fmt;
++	return 0;
++}
++
++static int gemini_cam_sd_enum_mbus_code(struct v4l2_subdev *sd,
++					struct v4l2_subdev_state *state,
++					struct v4l2_subdev_mbus_code_enum *code)
++{
++	if (code->index)
++		return -EINVAL;
++
++	/*
++	 * One code. The CAMSV path is configured for RAW10 and nothing in this
++	 * driver converts, so offering anything else would be a promise the
++	 * hardware does not keep.
++	 */
++	code->code = MEDIA_BUS_FMT_SGRBG10_1X10;
++	return 0;
++}
++
++static int gemini_cam_sd_set_fmt(struct v4l2_subdev *sd,
++				 struct v4l2_subdev_state *state,
++				 struct v4l2_subdev_format *format)
++{
++	struct v4l2_mbus_framefmt *sink, *source;
++
++	/* The source pad mirrors the sink; it cannot be set independently. */
++	if (format->pad == GEMINI_CAM_PAD_SOURCE)
++		return v4l2_subdev_get_fmt(sd, state, format);
++
++	format->format.code = MEDIA_BUS_FMT_SGRBG10_1X10;
++	format->format.width = clamp_t(u32, format->format.width, 64, 2592);
++	format->format.height = clamp_t(u32, format->format.height, 64, 1944);
++	format->format.field = V4L2_FIELD_NONE;
++	format->format.colorspace = V4L2_COLORSPACE_RAW;
++
++	sink = v4l2_subdev_get_pad_format(sd, state, GEMINI_CAM_PAD_SINK);
++	*sink = format->format;
++
++	source = v4l2_subdev_get_pad_format(sd, state, GEMINI_CAM_PAD_SOURCE);
++	*source = *sink;
++
++	return 0;
++}
++
++static const struct v4l2_subdev_pad_ops gemini_cam_sd_pad_ops = {
++	.init_cfg = gemini_cam_sd_init_cfg,
++	.enum_mbus_code = gemini_cam_sd_enum_mbus_code,
++	.get_fmt = v4l2_subdev_get_fmt,
++	.set_fmt = gemini_cam_sd_set_fmt,
++};
++
 +static const struct v4l2_subdev_video_ops gemini_cam_sd_video_ops = {
 +	.s_stream = gemini_cam_sd_s_stream,
 +};
 +
 +static const struct v4l2_subdev_ops gemini_cam_sd_ops = {
 +	.video = &gemini_cam_sd_video_ops,
++	.pad = &gemini_cam_sd_pad_ops,
 +};
 +
 +static const struct media_entity_operations gemini_cam_media_ops = {
@@ -1690,8 +1768,11 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 +	.vidioc_expbuf			= vb2_ioctl_expbuf,
 +	.vidioc_streamon		= vb2_ioctl_streamon,
 +	.vidioc_streamoff		= vb2_ioctl_streamoff,
-+};
-+
+ };
+ 
+-static int gemini_bridge_bound(struct v4l2_async_notifier *notifier,
+-			       struct v4l2_subdev *sd,
+-			       struct v4l2_async_connection *asc)
 +static const struct v4l2_file_operations gemini_cam_fops = {
 +	.owner		= THIS_MODULE,
 +	.open		= v4l2_fh_open,
@@ -1699,11 +1780,8 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 +	.poll		= vb2_fop_poll,
 +	.unlocked_ioctl	= video_ioctl2,
 +	.mmap		= vb2_fop_mmap,
- };
- 
--static int gemini_bridge_bound(struct v4l2_async_notifier *notifier,
--			       struct v4l2_subdev *sd,
--			       struct v4l2_async_connection *asc)
++};
++
 +/* -------------------------------------------------------------------------
 + * "the camera shows when it is in use" (#67)
 + *
@@ -2012,22 +2090,22 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 +	ep = fwnode_graph_get_next_endpoint(dev_fwnode(dev), NULL);
 +	if (!ep)
 +		return dev_err_probe(dev, -ENODEV, "no port endpoint in DT\n");
-+
+ 
+-	b->mdev.dev = b->dev;
+-	strscpy(b->mdev.model, "gemini-camera", sizeof(b->mdev.model));
+-	media_device_init(&b->mdev);
 +	ret = gemini_cam_parse_endpoint(cam, ep);
 +	if (ret) {
 +		fwnode_handle_put(ep);
 +		return ret;
 +	}
  
--	b->mdev.dev = b->dev;
--	strscpy(b->mdev.model, "gemini-camera", sizeof(b->mdev.model));
--	media_device_init(&b->mdev);
+-	b->v4l2_dev.mdev = &b->mdev;
+-	ret = v4l2_device_register(b->dev, &b->v4l2_dev);
 +	cam->mdev.dev = dev;
 +	strscpy(cam->mdev.model, "gemini-camera", sizeof(cam->mdev.model));
 +	media_device_init(&cam->mdev);
- 
--	b->v4l2_dev.mdev = &b->mdev;
--	ret = v4l2_device_register(b->dev, &b->v4l2_dev);
++
 +	cam->v4l2_dev.mdev = &cam->mdev;
 +	ret = v4l2_device_register(dev, &cam->v4l2_dev);
  	if (ret) {
@@ -2058,21 +2136,31 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 +	if (ret)
  		goto err_v4l2;
 +
++	/*
++	 * Allocate the subdev's format state. Without this the pad ops above
++	 * have nowhere to keep a format and every get_fmt returns -EINVAL.
++	 */
++	ret = v4l2_subdev_init_finalize(&cam->sd);
++	if (ret) {
++		dev_err(dev, "subdev state: %d\n", ret);
++		goto err_sd_entity;
++	}
++
 +	ret = v4l2_device_register_subdev(&cam->v4l2_dev, &cam->sd);
 +	if (ret) {
 +		dev_err(dev, "register seninf subdev: %d\n", ret);
-+		goto err_sd_entity;
- 	}
- 
--	asc = v4l2_async_nf_add_fwnode_remote(&b->notifier, ep,
++		goto err_sd_state;
++	}
++
 +	/* The capture video node. */
 +	vdev_pad = devm_kzalloc(dev, sizeof(*vdev_pad), GFP_KERNEL);
 +	if (!vdev_pad) {
 +		ret = -ENOMEM;
 +		goto err_sd;
-+	}
+ 	}
 +	vdev_pad->flags = MEDIA_PAD_FL_SINK;
-+
+ 
+-	asc = v4l2_async_nf_add_fwnode_remote(&b->notifier, ep,
 +	cam->format.width = 1296;
 +	cam->format.height = 972;
 +	gemini_cam_fill_format(&cam->format);
@@ -2143,6 +2231,8 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 +	media_entity_cleanup(&cam->vdev.entity);
 +err_sd:
 +	v4l2_device_unregister_subdev(&cam->sd);
++err_sd_state:
++	v4l2_subdev_cleanup(&cam->sd);
 +err_sd_entity:
 +	media_entity_cleanup(&cam->sd.entity);
  err_v4l2:
@@ -2158,28 +2248,22 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
  
 -static void gemini_bridge_remove(struct platform_device *pdev)
 +static void gemini_cam_remove(struct platform_device *pdev)
- {
--	struct gemini_cam_bridge *b = platform_get_drvdata(pdev);
++{
 +	struct gemini_cam *cam = platform_get_drvdata(pdev);
- 
--	v4l2_async_nf_unregister(&b->notifier);
--	v4l2_async_nf_cleanup(&b->notifier);
--	media_device_unregister(&b->mdev);
--	v4l2_device_unregister(&b->v4l2_dev);
--	media_device_cleanup(&b->mdev);
++
 +	debugfs_remove_recursive(cam->debugfs);
 +	v4l2_async_nf_unregister(&cam->notifier);
 +	v4l2_async_nf_cleanup(&cam->notifier);
 +	video_unregister_device(&cam->vdev);
 +	media_device_unregister(&cam->mdev);
 +	v4l2_device_unregister_subdev(&cam->sd);
++	v4l2_subdev_cleanup(&cam->sd);
 +	media_entity_cleanup(&cam->sd.entity);
 +	media_entity_cleanup(&cam->vdev.entity);
 +	v4l2_device_unregister(&cam->v4l2_dev);
 +	media_device_cleanup(&cam->mdev);
- }
- 
--static const struct of_device_id gemini_bridge_of_match[] = {
++}
++
 +static int gemini_cam_runtime_resume(struct device *dev)
 +{
 +	struct gemini_cam *cam = dev_get_drvdata(dev);
@@ -2193,13 +2277,20 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 +}
 +
 +static int gemini_cam_runtime_suspend(struct device *dev)
-+{
+ {
+-	struct gemini_cam_bridge *b = platform_get_drvdata(pdev);
 +	struct gemini_cam *cam = dev_get_drvdata(dev);
-+
+ 
+-	v4l2_async_nf_unregister(&b->notifier);
+-	v4l2_async_nf_cleanup(&b->notifier);
+-	media_device_unregister(&b->mdev);
+-	v4l2_device_unregister(&b->v4l2_dev);
+-	media_device_cleanup(&b->mdev);
 +	clk_bulk_disable_unprepare(cam->num_clks, cam->clks);
 +	return 0;
-+}
-+
+ }
+ 
+-static const struct of_device_id gemini_bridge_of_match[] = {
 +static const struct dev_pm_ops gemini_cam_pm_ops = {
 +	RUNTIME_PM_OPS(gemini_cam_runtime_suspend, gemini_cam_runtime_resume,
 +		       NULL)
@@ -2219,8 +2310,17 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 +	.probe = gemini_cam_probe,
 +	.remove_new = gemini_cam_remove,
  	.driver = {
- 		.name = "gemini-cam-bridge",
+-		.name = "gemini-cam-bridge",
 -		.of_match_table = gemini_bridge_of_match,
++		/*
++		 * Fifteen characters, not seventeen. media_device_info.driver
++		 * is a 16-byte field, so "gemini-cam-bridge" reaches userspace
++		 * as "gemini-cam-brid" -- and that truncated string is the
++		 * identity every media-aware program matches on, including
++		 * libcamera's pipeline-handler table. Better to choose the
++		 * name than to inherit a chopped one.
++		 */
++		.name = "gemini-camsv",
 +		.of_match_table = gemini_cam_of_match,
 +		.dev_groups = gemini_cam_groups,
 +		.pm = pm_ptr(&gemini_cam_pm_ops),
