@@ -3,7 +3,7 @@ Subject: [PATCH] misc: gemini-cam-bridge: SENINF CSI-2 receiver and CAMSV captur
 diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 --- a/drivers/misc/gemini-cam-bridge.c
 +++ b/drivers/misc/gemini-cam-bridge.c
-@@ -1,155 +1,2279 @@
+@@ -1,155 +1,2301 @@
  // SPDX-License-Identifier: GPL-2.0-only
  /*
 - * Gemini PDA camera media-graph bridge.
@@ -283,7 +283,8 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 +#define SENINF_TIMESTAMP_STEP			0x67
 +#define SENINF_SETTLE_DELAY			0x15
 +#define SENINF_HS_TRAIL_PARAMETER		0x8
-+
+ 
+-struct gemini_cam_bridge {
 +/*
 + * The MUX interrupt status bits are not documented in anything available
 + * here. The vendor's CAMSV path reports the same conditions (TG error, TG
@@ -467,6 +468,28 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 +module_param(csi2_ctl_or, uint, 0644);
 +MODULE_PARM_DESC(csi2_ctl_or, "extra bits to set in SENINF_CSI2_CTL");
 +
++/*
++ * D-PHY receive timing, in the SENINF's own units.
++ *
++ * settle_delay is how long the receiver ignores the line after the sensor
++ * leaves low-power state before it starts sampling; hs_trail is the tail it
++ * expects after the last bit. Both are counted in byte-clock periods, so BOTH
++ * SCALE WITH THE LINK RATE -- and this board runs the sensor at 24 MHz where
++ * the mainline hi556 mode tables assume 19.2 MHz, which puts the link about 25%
++ * above nominal. The vendor's constants were measured on a board at nominal.
++ *
++ * They are parameters because a receiver whose settle window is wrong does not
++ * report anything interesting: it simply never decodes a packet, which is
++ * indistinguishable from a mis-wired lane or a silent sensor.
++ */
++static unsigned int settle_delay = SENINF_SETTLE_DELAY;
++module_param(settle_delay, uint, 0644);
++MODULE_PARM_DESC(settle_delay, "CSI-2 data settle delay, byte-clock periods");
++
++static unsigned int hs_trail = SENINF_HS_TRAIL_PARAMETER;
++module_param(hs_trail, uint, 0644);
++MODULE_PARM_DESC(hs_trail, "CSI-2 HS trail parameter, byte-clock periods");
++
 +static int lane_en_mask = -1;
 +module_param(lane_en_mask, int, 0644);
 +MODULE_PARM_DESC(lane_en_mask,
@@ -489,8 +512,7 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 +	struct list_head list;
 +	dma_addr_t daddr;
 +};
- 
--struct gemini_cam_bridge {
++
 +struct gemini_cam_stats {
 +	u32 frames;		/* PASS1_DON seen */
 +	u32 sof;		/* SOF seen */
@@ -779,11 +801,8 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 +	u32 enable;		/* trim-applied bit */
 +	u16 ana;		/* analog status register, from the bank base */
 +	u8 ana_bit;		/* comparator bit within it */
- };
- 
--static int gemini_bridge_bound(struct v4l2_async_notifier *notifier,
--			       struct v4l2_subdev *sd,
--			       struct v4l2_async_connection *asc)
++};
++
 +static const struct gemini_cam_cal_lane gemini_cam_cal_lanes[] = {
 +	{ SENINF_MIPI_RX_CON00, GENMASK(6, 2),   BIT(1),  BIT(0),  0x0050, 8  },
 +	{ SENINF_MIPI_RX_CON00, GENMASK(30, 26), BIT(25), BIT(24), 0x0054, 24 },
@@ -876,7 +895,7 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 +
 +	gemini_cam_phy_offset_cal(cam);
 +
-+	writel(SENINF_SETTLE_DELAY << 8, inst + SENINF_CSI2_LNRD_TIMING);
++	writel(settle_delay << 8, inst + SENINF_CSI2_LNRD_TIMING);
 +
 +	/* One enable per physical lane. */
 +	mask = lane_en_mask >= 0 ? lane_en_mask
@@ -983,7 +1002,7 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 +	writel(SENINF_CSI2_DPCM_DI_30_EN, inst + SENINF_CSI2_DPCM);
 +
 +	inst_update(cam, SENINF_CSI2_LNRD_TIMING,
-+		    SENINF_CSI2_LNRD_TIMING_DATA_SETTLE, SENINF_SETTLE_DELAY);
++		    SENINF_CSI2_LNRD_TIMING_DATA_SETTLE, settle_delay);
 +
 +	val = readl(inst + SENINF_CSI2_CTL)
 +	    | FIELD_PREP(SENINF_CSI2_CTL_ED_SEL, 1)
@@ -1011,7 +1030,7 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 +		       inst + SENINF_CSI2_CTL);
 +	inst_update(cam, SENINF_CSI2_CTL, SENINF_CSI2_CTL_HS_TRAIL_EN, 1);
 +	inst_update(cam, SENINF_CSI2_HS_TRAIL, SENINF_CSI2_HS_TRAIL_PARAM,
-+		    SENINF_HS_TRAIL_PARAMETER);
++		    hs_trail);
 +
 +	/*
 +	 * Debug port 0x1a is the received-packet counter. It is the only
@@ -1035,7 +1054,7 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 +		 */
 +		writel(readl(inst + SENINF_NCSI2_CTL) | SENINF_NCSI2_CTL_B7,
 +		       inst + SENINF_NCSI2_CTL);
-+		writel(SENINF_SETTLE_DELAY << 8, inst + SENINF_NCSI2_SETTLE);
++		writel(settle_delay << 8, inst + SENINF_NCSI2_SETTLE);
 +		writel(readl(inst + SENINF_NCSI2_CTL) |
 +		       (BIT(num_lanes) - 1) | SENINF_NCSI2_CTL_FIXED,
 +		       inst + SENINF_NCSI2_CTL);
@@ -1343,13 +1362,10 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 + * SENINF subdev
 + */
 +static int gemini_cam_sd_s_stream(struct v4l2_subdev *sd, int enable)
- {
--	struct gemini_cam_bridge *b =
--		container_of(notifier, struct gemini_cam_bridge, notifier);
++{
 +	struct gemini_cam *cam = sd_to_cam(sd);
 +	int ret;
- 
--	dev_info(b->dev, "sensor subdev '%s' bound to the media graph\n",
++
 +	if (enable) {
 +		gemini_cam_seninf_start(cam);
 +		if (test_pattern)
@@ -1787,8 +1803,11 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 +	.vidioc_expbuf			= vb2_ioctl_expbuf,
 +	.vidioc_streamon		= vb2_ioctl_streamon,
 +	.vidioc_streamoff		= vb2_ioctl_streamoff,
-+};
-+
+ };
+ 
+-static int gemini_bridge_bound(struct v4l2_async_notifier *notifier,
+-			       struct v4l2_subdev *sd,
+-			       struct v4l2_async_connection *asc)
 +static const struct v4l2_file_operations gemini_cam_fops = {
 +	.owner		= THIS_MODULE,
 +	.open		= v4l2_fh_open,
@@ -1814,7 +1833,9 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 + */
 +static ssize_t streaming_show(struct device *dev,
 +			      struct device_attribute *attr, char *buf)
-+{
+ {
+-	struct gemini_cam_bridge *b =
+-		container_of(notifier, struct gemini_cam_bridge, notifier);
 +	struct gemini_cam *cam = dev_get_drvdata(dev);
 +
 +	return sysfs_emit(buf, "%d\n", cam->streaming ? 1 : 0);
@@ -1906,7 +1927,8 @@ diff --git a/drivers/misc/gemini-cam-bridge.c b/drivers/misc/gemini-cam-bridge.c
 +	struct gemini_cam *cam =
 +		container_of(notifier, struct gemini_cam, notifier);
 +	int ret;
-+
+ 
+-	dev_info(b->dev, "sensor subdev '%s' bound to the media graph\n",
 +	cam->sensor = sd;
 +
 +	ret = v4l2_create_fwnode_links_to_pad(sd, &cam->pads[GEMINI_CAM_PAD_SINK],
