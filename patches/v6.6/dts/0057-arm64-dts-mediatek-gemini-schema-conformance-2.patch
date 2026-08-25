@@ -1,0 +1,296 @@
+From: Gemini PDA Linux port <mratan/gemini-linux>
+Subject: [PATCH] arm64: dts: mediatek: gemini: make the board dts validate
+
+arm64: dts: mediatek: gemini: make the board dts validate
+
+Companion to the dtsi change.  Two of these are behavioural and are
+called out where they happen:
+
+  * hdmi_1v2 used "enable-gpios", which reg-fixed-voltage.c does not
+    read -- it asks gpiolib for the nameless "gpio"/"gpios" property.
+    GPIO247 has therefore never been driven by software and the rail has
+    only ever been whatever the bootloader left it at.  Renamed, so the
+    regulator now actually gates it.  First suspect if HDMI regresses.
+  * The PMIC node is renamed mt6351 -> pmic, which is the child name
+    mediatek,pwrap.yaml blesses.  The label is unchanged, so every &pmic
+    reference still resolves.
+
+The rest is inert: richtek,dvs-* demoted to a comment (fan53555.c reads
+neither), a two-item compatible on the bq25896, SoC-specific compatibles
+ahead of the generic tphy/mtu3 ones, and pinctrl groups renamed into the
+schema's two-level shape.
+
+---
+--- a/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
++++ b/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
+@@ -488,7 +488,7 @@
+ 	 * these defaults anyway; tuning is Phase 7.
+ 	 */
+ 	charger: charger@6b {
+-		compatible = "ti,bq25896";
++		compatible = "ti,bq25896", "ti,bq25890";
+ 		reg = <0x6b>;
+ 		ti,charge-current = <2048000>;
+ 		ti,battery-regulation-voltage = <4208000>;
+@@ -748,8 +748,11 @@
+ 		regulator-name = "vproc";
+ 		regulator-min-microvolt = <600000>;
+ 		regulator-max-microvolt = <1393750>;
+-		richtek,dvs-up-microvolt-per-usec = <32000>;
+-		richtek,dvs-down-microvolt-per-usec = <4000>;
++		/*
++		 * Datasheet DVS ramp: 32 mV/us up, 4 mV/us down. Not expressed
++		 * as properties -- fan53555.c, which serves this compatible,
++		 * reads no such thing, so they were decoration.
++		 */
+ 		status = "disabled";
+ 	};
+ };
+@@ -933,8 +936,8 @@
+ 	 * Vendor DTS: UART0 RX=GPIO97, TX=GPIO98.
+ 	 * These differ from the mainline uart0_pins_a (GPIO234/235).
+ 	 */
+-	uart0_gemini_pins: uart0-gemini {
+-		pins-rx-tx {
++	uart0_gemini_pins: uart0-gemini-0 {
++		rx-tx-pins {
+ 			pinmux = <MT6797_GPIO98__FUNC_UTXD0>,
+ 				 <MT6797_GPIO97__FUNC_URXD0>;
+ 		};
+@@ -963,12 +966,12 @@
+ 	 * SHDN: GPIO58 as plain GPIO output (active-low reset).
+ 	 * INT:  GPIO87 as EINT10 input.
+ 	 */
+-	aw9523b_pins: aw9523b {
+-		pins-shdn {
++	aw9523b_pins: aw9523b-0 {
++		shdn-pins {
+ 			pinmux = <MT6797_GPIO58__FUNC_GPIO58>;
+ 			output-high;
+ 		};
+-		pins-int {
++		int-pins {
+ 			pinmux = <MT6797_GPIO87__FUNC_EINT10>;
+ 			input-enable;
+ 			bias-pull-up;
+@@ -981,12 +984,12 @@
+ 	 * ENP:     GPIO60  (AVDD enable, active-high).
+ 	 * ENN:     GPIO251 (AVEE enable, active-high).
+ 	 */
+-	panel_pins: panel {
+-		pins-rst {
++	panel_pins: panel-0 {
++		rst-pins {
+ 			pinmux = <MT6797_GPIO180__FUNC_GPIO180>;
+ 			output-low;
+ 		};
+-		pins-enp {
++		enp-pins {
+ 			pinmux = <MT6797_GPIO60__FUNC_GPIO60>;
+ 			output-low;
+ 		};
+@@ -1167,8 +1170,8 @@
+ };
+ 
+ &pio {
+-	disp_pwm_pins: disp-pwm-pins {
+-		pins-pwm {
++	disp_pwm_pins: disp-pwm-0 {
++		pwm-pins {
+ 			pinmux = <MT6797_GPIO178__FUNC_DISP_PWM>;
+ 		};
+ 	};
+@@ -1230,8 +1233,8 @@
+ 	 * the bootloader configured it -- known-good, since LK boots from this
+ 	 * eMMC with these pads.
+ 	 */
+-	msdc0_pins_default: msdc0-default {
+-		pins-cmd-dat {
++	msdc0_pins_default: msdc0-0 {
++		cmd-dat-pins {
+ 			pinmux = <MT6797_GPIO122__FUNC_MSDC0_CMD>,
+ 				 <MT6797_GPIO114__FUNC_MSDC0_DAT0>,
+ 				 <MT6797_GPIO115__FUNC_MSDC0_DAT1>,
+@@ -1242,10 +1245,10 @@
+ 				 <MT6797_GPIO120__FUNC_MSDC0_DAT6>,
+ 				 <MT6797_GPIO121__FUNC_MSDC0_DAT7>;
+ 		};
+-		pins-clk {
++		clk-pins {
+ 			pinmux = <MT6797_GPIO123__FUNC_MSDC0_CLK>;
+ 		};
+-		pins-rst {
++		rst-pins {
+ 			pinmux = <MT6797_GPIO125__FUNC_MSDC0_RSTB>;
+ 		};
+ 	};
+@@ -1261,8 +1264,8 @@
+ 	 * (as done via MTK_DRIVE_* in other mt65xx/mt81xx board DTS uhs
+ 	 * states) is deferred until basic block I/O is confirmed working.
+ 	 */
+-	msdc0_pins_uhs: msdc0-uhs {
+-		pins-cmd-dat {
++	msdc0_pins_uhs: msdc0-1 {
++		cmd-dat-pins {
+ 			pinmux = <MT6797_GPIO122__FUNC_MSDC0_CMD>,
+ 				 <MT6797_GPIO114__FUNC_MSDC0_DAT0>,
+ 				 <MT6797_GPIO115__FUNC_MSDC0_DAT1>,
+@@ -1273,10 +1276,10 @@
+ 				 <MT6797_GPIO120__FUNC_MSDC0_DAT6>,
+ 				 <MT6797_GPIO121__FUNC_MSDC0_DAT7>;
+ 		};
+-		pins-clk {
++		clk-pins {
+ 			pinmux = <MT6797_GPIO123__FUNC_MSDC0_CLK>;
+ 		};
+-		pins-rst {
++		rst-pins {
+ 			pinmux = <MT6797_GPIO125__FUNC_MSDC0_RSTB>;
+ 		};
+ 	};
+@@ -1377,29 +1380,29 @@
+  */
+ &pio {
+ 	/* pinmux only, no pinconf -- see the msdc0 pinctrl comment */
+-	msdc1_pins_default: msdc1-default {
+-		pins-cmd-dat {
++	msdc1_pins_default: msdc1-0 {
++		cmd-dat-pins {
+ 			pinmux = <MT6797_GPIO129__FUNC_MSDC1_CMD>,
+ 				 <MT6797_GPIO130__FUNC_MSDC1_DAT0>,
+ 				 <MT6797_GPIO131__FUNC_MSDC1_DAT1>,
+ 				 <MT6797_GPIO132__FUNC_MSDC1_DAT2>,
+ 				 <MT6797_GPIO133__FUNC_MSDC1_DAT3>;
+ 		};
+-		pins-clk {
++		clk-pins {
+ 			pinmux = <MT6797_GPIO134__FUNC_MSDC1_CLK>;
+ 		};
+ 	};
+ 
+ 	/* state_uhs required by mtk-sd probe; same mux as default */
+-	msdc1_pins_uhs: msdc1-uhs {
+-		pins-cmd-dat {
++	msdc1_pins_uhs: msdc1-1 {
++		cmd-dat-pins {
+ 			pinmux = <MT6797_GPIO129__FUNC_MSDC1_CMD>,
+ 				 <MT6797_GPIO130__FUNC_MSDC1_DAT0>,
+ 				 <MT6797_GPIO131__FUNC_MSDC1_DAT1>,
+ 				 <MT6797_GPIO132__FUNC_MSDC1_DAT2>,
+ 				 <MT6797_GPIO133__FUNC_MSDC1_DAT3>;
+ 		};
+-		pins-clk {
++		clk-pins {
+ 			pinmux = <MT6797_GPIO134__FUNC_MSDC1_CLK>;
+ 		};
+ 	};
+@@ -1451,7 +1454,7 @@
+  */
+ / {
+ 	u3phy: t-phy@11290000 {
+-		compatible = "mediatek,generic-tphy-v1";
++		compatible = "mediatek,mt6797-tphy", "mediatek,generic-tphy-v1";
+ 		reg = <0 0x11290000 0 0x800>;
+ 		#address-cells = <2>;
+ 		#size-cells = <2>;
+@@ -1485,7 +1488,7 @@
+ 	};
+ 
+ 	ssusb: usb@11271000 {
+-		compatible = "mediatek,mtu3";
++		compatible = "mediatek,mt6797-mtu3", "mediatek,mtu3";
+ 		reg = <0 0x11271000 0 0x3000>,
+ 		      <0 0x11280700 0 0x0100>;
+ 		reg-names = "mac", "ippc";
+@@ -1575,7 +1578,7 @@
+ 			 <&infrasys CLK_INFRA_PMIC_AP>;
+ 		clock-names = "spi", "wrap";
+ 
+-		pmic: mt6351 {
++		pmic: pmic {
+ 			compatible = "mediatek,mt6351";
+ 
+ 			/*
+@@ -1870,7 +1873,7 @@
+  */
+ / {
+ 	usb1phy: t-phy@11210000 {
+-		compatible = "mediatek,generic-tphy-v1";
++		compatible = "mediatek,mt6797-tphy", "mediatek,generic-tphy-v1";
+ 		reg = <0 0x11210000 0 0x800>;
+ 		#address-cells = <2>;
+ 		#size-cells = <2>;
+@@ -2004,9 +2007,16 @@
+ 		regulator-name = "hdmi_1v2";
+ 		regulator-min-microvolt = <1200000>;
+ 		regulator-max-microvolt = <1200000>;
+-		enable-gpios = <&pio 247 GPIO_ACTIVE_HIGH>;
++		gpios = <&pio 247 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
+ 		/* TODO: verify enable polarity on hardware (vendor drives
+-		 * GPIO247 high to enable the rail). */
++		 * GPIO247 high to enable the rail).
++		 *
++		 * This was "enable-gpios" until 2026-08-25, which
++		 * reg-fixed-voltage.c does not read -- it asks gpiolib for the
++		 * nameless "gpio"/"gpios" property. So the rail was never
++		 * actually gated by software. If HDMI regresses, that is the
++		 * change to look at first. */
+ 	};
+ 
+ 	/* HDMI type-A receptacle presented to the user via the Planet cable. */
+@@ -2095,8 +2105,8 @@
+ 	 * sil9024a.dtsi gpio_sil9022_dpi_func1). 12 data lines (D0..D11) plus
+ 	 * DE/CK/HSYNC/VSYNC — RGB888 is carried dual-edge (DDR).
+ 	 */
+-	dpi_pins: dpi-pins {
+-		pins-dpi {
++	dpi_pins: dpi-0 {
++		dpi-pins {
+ 			pinmux = <MT6797_GPIO39__FUNC_DPI_D0>,
+ 				 <MT6797_GPIO40__FUNC_DPI_D1>,
+ 				 <MT6797_GPIO41__FUNC_DPI_D2>,
+@@ -2129,8 +2139,8 @@
+ 	 * sil9024a.dtsi gpio_sil9022_dpi_gpio), selected on the "sleep" pinctrl
+ 	 * state so the parallel bus is quiet when HDMI is off.
+ 	 */
+-	dpi_pins_idle: dpi-pins-idle {
+-		pins-dpi {
++	dpi_pins_idle: dpi-1 {
++		dpi-pins {
+ 			pinmux = <MT6797_GPIO39__FUNC_GPIO39>,
+ 				 <MT6797_GPIO40__FUNC_GPIO40>,
+ 				 <MT6797_GPIO41__FUNC_GPIO41>,
+@@ -2150,8 +2160,8 @@
+ 		};
+ 	};
+ 
+-	hdmi_pins: hdmi-pins {
+-		pins-ctrl {
++	hdmi_pins: hdmi-0 {
++		ctrl-pins {
+ 			pinmux = <MT6797_GPIO57__FUNC_GPIO57>,
+ 				 <MT6797_GPIO62__FUNC_GPIO62>,
+ 				 <MT6797_GPIO247__FUNC_GPIO247>;
+@@ -2393,8 +2403,8 @@
+ 	 * same convention as the dpi/hdmi pin groups added in VS1. pinmux only:
+ 	 * bias/drive from the vendor DTS is left as the bootloader set it.
+ 	 */
+-	rightport_mux_pins: rightport-mux-pins {
+-		pins-mux {
++	rightport_mux_pins: rightport-mux-0 {
++		mux-pins {
+ 			pinmux = <MT6797_GPIO70__FUNC_GPIO70>,
+ 				 <MT6797_GPIO71__FUNC_GPIO71>,
+ 				 <MT6797_GPIO72__FUNC_GPIO72>;
+@@ -2855,8 +2865,8 @@
+ 	 * pinconf), so the vendor's ISP_DRIVING_8MA drive strength cannot be
+ 	 * expressed here and the pads keep whatever the preloader left.
+ 	 */
+-	camera_mclk_pins: camera-mclk-pins {
+-		pins-mclk {
++	camera_mclk_pins: camera-mclk-0 {
++		mclk-pins {
+ 			pinmux = <MT6797_GPIO30__FUNC_CMMCLK0>,
+ 				 <MT6797_GPIO31__FUNC_CMMCLK1>;
+ 		};

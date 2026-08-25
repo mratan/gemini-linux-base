@@ -1,0 +1,223 @@
+From: Gemini PDA Linux port <mratan/gemini-linux>
+Subject: [PATCH] dt-bindings: mediatek: document what the drivers already read
+
+dt-bindings: mediatek: document what the drivers already read
+
+Seven schema fixes, each backed by a driver in this tree that reads the
+property or matches the compatible.  None of them invent anything: every
+one closes a gap where mainline code and mainline documentation already
+disagreed.
+
+  * phy/mediatek,tphy: mediatek,mt6797-tphy, plus the three force-*
+    flags phy-mtk-tphy.c has always read and nobody ever wrote down.
+  * usb/mediatek,mtu3: mediatek,mt6797-mtu3.
+  * i2c/i2c-mt65xx: mediatek,appm_used, read by i2c-mt65xx.c.  The
+    underscore is the spelling the driver looks for.
+  * gpu/arm,mali-midgard: the MT6797's Mali-T880 has four core power
+    domains, not one.  Constrained to mt6797 so no other SoC loosens.
+  * power/supply/bq25890: the usb-otg-vbus and vsys regulator subnodes
+    that bq25890_charger.c matches by name; irq-gpios, its documented-
+    nowhere interrupt fallback; and interrupts dropped from required,
+    because a board whose INT pin lands on an unusable interrupt
+    controller still works.
+  * pinctrl/mediatek,mt6779-pinctrl: this controller is also the SoC's
+    gpio-controller, so GPIO hogs are legal children of it.
+  * soc/mediatek/mediatek,pwrap: allow a PMIC function block presented
+    as a sibling of the pmic node, which is how the MT6351's audio
+    codec is wired.
+
+---
+--- a/Documentation/devicetree/bindings/phy/mediatek,tphy.yaml
++++ b/Documentation/devicetree/bindings/phy/mediatek,tphy.yaml
+@@ -73,6 +73,7 @@
+               - mediatek,mt2701-tphy
+               - mediatek,mt7623-tphy
+               - mediatek,mt7622-tphy
++              - mediatek,mt6797-tphy
+               - mediatek,mt8516-tphy
+           - const: mediatek,generic-tphy-v1
+       - items:
+@@ -230,6 +231,25 @@
+         minimum: 1
+         maximum: 3
+ 
++      mediatek,force-b-session-valid:
++        description:
++          Force the USB2 PHY to report a valid B-session regardless of what the
++          VBUS comparator sees. Needed where VBUS is not routed to the PHY, so
++          the gadget would otherwise never see a connection.
++        type: boolean
++
++      mediatek,force-usb-host:
++        description:
++          Force the USB2 PHY into host mode, for a port wired host-only whose ID
++          pin is not connected.
++        type: boolean
++
++      mediatek,force-suspendm-release:
++        description:
++          Release the PHY's suspendm signal at probe rather than leaving it
++          asserted, for ports where nothing else will do it.
++        type: boolean
++
+       mediatek,bc12:
+         description:
+           Specify the flag to enable BC1.2 if support it
+--- a/Documentation/devicetree/bindings/usb/mediatek,mtu3.yaml
++++ b/Documentation/devicetree/bindings/usb/mediatek,mtu3.yaml
+@@ -22,6 +22,7 @@
+     items:
+       - enum:
+           - mediatek,mt2712-mtu3
++          - mediatek,mt6797-mtu3
+           - mediatek,mt8173-mtu3
+           - mediatek,mt8183-mtu3
+           - mediatek,mt8186-mtu3
+--- a/Documentation/devicetree/bindings/i2c/i2c-mt65xx.yaml
++++ b/Documentation/devicetree/bindings/i2c/i2c-mt65xx.yaml
+@@ -88,6 +88,15 @@
+     description:
+       SCL frequency to use (in Hz). If omitted, 100kHz is used.
+ 
++  mediatek,appm_used:
++    description:
++      Enable APPM (Auto Power-saving Pin Mode). The controller then parks SCL and
++      SDA between transfers instead of driving them, which the MT6797's i2c6 pad
++      chain requires to talk to a DA9214 -- without it the first byte of every
++      transfer is lost. The underscore is not a typo; it is the spelling
++      i2c-mt65xx.c has always looked for.
++    type: boolean
++
+   mediatek,have-pmic:
+     description: Platform controls I2C from PMIC side
+     type: boolean
+--- a/Documentation/devicetree/bindings/gpu/arm,mali-midgard.yaml
++++ b/Documentation/devicetree/bindings/gpu/arm,mali-midgard.yaml
+@@ -81,7 +81,12 @@
+     type: object
+ 
+   power-domains:
+-    maxItems: 1
++    minItems: 1
++    maxItems: 4
++
++  power-domain-names:
++    minItems: 1
++    maxItems: 4
+ 
+   resets:
+     minItems: 1
+@@ -124,6 +129,29 @@
+   - if:
+       properties:
+         compatible:
++          contains:
++            const: mediatek,mt6797-mali
++    then:
++      properties:
++        power-domains:
++          minItems: 4
++        power-domain-names:
++          items:
++            - const: core0
++            - const: core1
++            - const: core2
++            - const: core3
++      required:
++        - power-domains
++        - power-domain-names
++    else:
++      properties:
++        power-domains:
++          maxItems: 1
++        power-domain-names: false
++  - if:
++      properties:
++        compatible:
+           contains:
+             const: allwinner,sun50i-h6-mali
+     then:
+--- a/Documentation/devicetree/bindings/power/supply/bq25890.yaml
++++ b/Documentation/devicetree/bindings/power/supply/bq25890.yaml
+@@ -82,13 +82,35 @@
+   ti,ibatcomp-micro-ohms:
+     description: value of a resistor in series with the battery (in Micro Ohms)
+ 
++  usb-otg-vbus:
++    $ref: /schemas/regulator/regulator.yaml#
++    description:
++      The VBUS boost converter, exposed as a regulator so a USB host port can
++      consume it. bq25890_charger.c matches this subnode by name
++      (regulator_desc.of_match), so the name is part of the ABI.
++    unevaluatedProperties: false
++
++  vsys:
++    $ref: /schemas/regulator/regulator.yaml#
++    description:
++      The system rail, exposed read-only for monitoring. Matched by node name
++      the same way.
++    unevaluatedProperties: false
++
+   ti,ibatcomp-clamp-microvolt:
+     description: max. charging voltage adjustment due to expected voltage drop on in-series resistor
+ 
++  irq-gpios:
++    maxItems: 1
++    description:
++      The charger's INT pin as a plain GPIO, for boards whose interrupt
++      controller cannot take it. bq25890_charger.c already falls back to this
++      (bq25890_irq_probe) when no "interrupts" is given; it was simply never
++      documented.
++
+ required:
+   - compatible
+   - reg
+-  - interrupts
+   - ti,battery-regulation-voltage
+   - ti,charge-current
+   - ti,termination-current
+@@ -97,6 +119,11 @@
+   - ti,boost-voltage
+   - ti,boost-max-current
+ 
++# An interrupt is strongly preferred -- without one, charger state changes are
++# only noticed on a power_supply poll. It is not required, because the INT pin
++# may land on an interrupt controller the kernel cannot use (MT6797 has no EINT
++# support in mainline pinctrl), and the driver runs without it.
++
+ unevaluatedProperties: false
+ 
+ examples:
+--- a/Documentation/devicetree/bindings/pinctrl/mediatek,mt6779-pinctrl.yaml
++++ b/Documentation/devicetree/bindings/pinctrl/mediatek,mt6779-pinctrl.yaml
+@@ -111,6 +111,14 @@
+         - "#interrupt-cells"
+ 
+ patternProperties:
++  # This controller is also the SoC's gpio-controller, so GPIO hogs are legal
++  # children of it. Without this they are rejected outright by
++  # "additionalProperties: false" below.
++  '-hog(-[0-9]+)?$':
++    type: object
++    required:
++      - gpio-hog
++
+   '-[0-9]*$':
+     type: object
+     additionalProperties: false
+--- a/Documentation/devicetree/bindings/soc/mediatek/mediatek,pwrap.yaml
++++ b/Documentation/devicetree/bindings/soc/mediatek/mediatek,pwrap.yaml
+@@ -97,6 +97,13 @@
+   pmic:
+     type: object
+ 
++patternProperties:
++  # Some MediaTek PMICs expose a function block as a sibling of the PMIC node
++  # rather than a child of it -- the MT6351's audio codec, for one, which takes
++  # its regmap from the pwrap device itself.
++  "^[a-z0-9-]+-sound$":
++    type: object
++
+ required:
+   - compatible
+   - reg

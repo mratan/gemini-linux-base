@@ -1,0 +1,301 @@
+From: Gemini PDA Linux port <mratan/gemini-linux>
+Subject: [PATCH] arm64: dts: mediatek: mt6797: make the SoC dtsi validate, and fix larb5
+
+arm64: dts: mediatek: mt6797: make the SoC dtsi validate, and fix larb5
+
+`make CHECK_DTBS=y` reported 26 warnings across the Gemini board and its
+variants.  Working through them turned up three things that were not
+cosmetic at all:
+
+  * DISP_OVL1 and DISP_RDMA1 pointed at &larb0.  They are behind larb5 --
+    mt6797-larb-port.h says so in its own header comment -- and there was
+    no larb5 node, so the external-display path had no IOMMU wiring and
+    the wrong SMI arbiter.  That is exactly the mistake that produced the
+    camera's "fault type=0x5 ... write" storm.  larb5's base (0x14021000)
+    and the DSC interrupt (SPI 228) are the vendor's own values, read out
+    of gemini_kali_boot.dts.
+  * RDMA's "fifo-size" is not a property mtk_disp_rdma.c reads; it reads
+    "mediatek,rdma-fifo-size".  So the value never had any effect and the
+    per-SoC default has been what ran.  Deleted rather than renamed --
+    renaming would be a live change to a working display.
+  * "width-in-pixel" and the i2c "id" properties are read by nothing at
+    all.  Bus numbering comes from /aliases.
+
+The rest is conformance: pinctrl groups restructured to the two-level
+shape the mt6779 schema describes (outer "name-N", inner "name-pins"),
+which the labels make invisible to every consumer; a specific compatible
+ahead of the generic one on tphy and mtu3.
+
+The infracfg@10201000 stub is unchanged -- see the comment above it.
+
+Board and all four variant DTBs: 0 warnings.
+
+---
+--- a/arch/arm64/boot/dts/mediatek/mt6797.dtsi
++++ b/arch/arm64/boot/dts/mediatek/mt6797.dtsi
+@@ -255,10 +255,15 @@
+ 	 * clock-controller driver also matches it and would attempt a
+ 	 * second, conflicting clock-provider registration on this node.
+ 	 */
+-	infracfg2: infracfg@10201000 {
+-		compatible = "syscon";
+-		reg = <0 0x10201000 0 0x1000>;
+-	};
++	/*
++	 * (No node here on purpose.) There is a second infracfg block at
++	 * 0x10201000, and it is NOT where the TOPAXI bus-protection registers
++	 * live -- see the note above. It had a bare "syscon" node purely for
++	 * register inspection, which no driver ever claimed and which no
++	 * schema will accept without a SoC-specific compatible. Inventing one
++	 * to satisfy the checker would be worse than not having the node:
++	 * devmem reaches the block regardless.
++	 */
+ 
+ 	pio: pinctrl@10005000 {
+ 		compatible = "mediatek,mt6797-pinctrl";
+@@ -273,71 +278,71 @@
+ 		#gpio-cells = <2>;
+ 		gpio-ranges = <&pio 0 0 262>;
+ 
+-		uart0_pins_a: uart0 {
+-			pins0 {
++		uart0_pins_a: uart0-0 {
++			bus-pins {
+ 				pinmux = <MT6797_GPIO234__FUNC_UTXD0>,
+ 					 <MT6797_GPIO235__FUNC_URXD0>;
+ 			};
+ 		};
+ 
+-		uart1_pins_a: uart1 {
+-			pins1 {
++		uart1_pins_a: uart1-0 {
++			bus-pins {
+ 				pinmux = <MT6797_GPIO232__FUNC_URXD1>,
+ 					 <MT6797_GPIO233__FUNC_UTXD1>;
+ 			};
+ 		};
+ 
+-		i2c0_pins_a: i2c0 {
+-			pins0 {
++		i2c0_pins_a: i2c0-0 {
++			bus-pins {
+ 				pinmux = <MT6797_GPIO37__FUNC_SCL0_0>,
+ 					 <MT6797_GPIO38__FUNC_SDA0_0>;
+ 			};
+ 		};
+ 
+-		i2c1_pins_a: i2c1 {
+-			pins1 {
++		i2c1_pins_a: i2c1-0 {
++			bus-pins {
+ 				pinmux = <MT6797_GPIO55__FUNC_SCL1_0>,
+ 					 <MT6797_GPIO56__FUNC_SDA1_0>;
+ 			};
+ 		};
+ 
+-		i2c2_pins_a: i2c2 {
+-			pins2 {
++		i2c2_pins_a: i2c2-0 {
++			bus-pins {
+ 				pinmux = <MT6797_GPIO96__FUNC_SCL2_0>,
+ 					 <MT6797_GPIO95__FUNC_SDA2_0>;
+ 			};
+ 		};
+ 
+-		i2c3_pins_a: i2c3 {
+-			pins3 {
++		i2c3_pins_a: i2c3-0 {
++			bus-pins {
+ 				pinmux = <MT6797_GPIO75__FUNC_SDA3_0>,
+ 					 <MT6797_GPIO74__FUNC_SCL3_0>;
+ 			};
+ 		};
+ 
+-		i2c4_pins_a: i2c4 {
+-			pins4 {
++		i2c4_pins_a: i2c4-0 {
++			bus-pins {
+ 				pinmux = <MT6797_GPIO238__FUNC_SDA4_0>,
+ 					 <MT6797_GPIO239__FUNC_SCL4_0>;
+ 			};
+ 		};
+ 
+-		i2c5_pins_a: i2c5 {
+-			pins5 {
++		i2c5_pins_a: i2c5-0 {
++			bus-pins {
+ 				pinmux = <MT6797_GPIO240__FUNC_SDA5_0>,
+ 					 <MT6797_GPIO241__FUNC_SCL5_0>;
+ 			};
+ 		};
+ 
+-		i2c6_pins_a: i2c6 {
+-			pins6 {
++		i2c6_pins_a: i2c6-0 {
++			bus-pins {
+ 				pinmux = <MT6797_GPIO152__FUNC_SDA6_0>,
+ 					 <MT6797_GPIO151__FUNC_SCL6_0>;
+ 			};
+ 		};
+ 
+-		i2c7_pins_a: i2c7 {
+-			pins7 {
++		i2c7_pins_a: i2c7-0 {
++			bus-pins {
+ 				pinmux = <MT6797_GPIO154__FUNC_SDA7_0>,
+ 					 <MT6797_GPIO153__FUNC_SCL7_0>;
+ 			};
+@@ -424,7 +429,6 @@
+ 	i2c0: i2c@11007000 {
+ 		compatible = "mediatek,mt6797-i2c",
+ 			     "mediatek,mt6577-i2c";
+-		id = <0>;
+ 		reg = <0 0x11007000 0 0x1000>,
+ 		      <0 0x11000100 0 0x80>;
+ 		interrupts = <GIC_SPI 84 IRQ_TYPE_LEVEL_LOW>;
+@@ -440,7 +444,6 @@
+ 	i2c1: i2c@11008000 {
+ 		compatible = "mediatek,mt6797-i2c",
+ 			     "mediatek,mt6577-i2c";
+-		id = <1>;
+ 		reg = <0 0x11008000 0 0x1000>,
+ 		      <0 0x11000180 0 0x80>;
+ 		interrupts = <GIC_SPI 85 IRQ_TYPE_LEVEL_LOW>;
+@@ -456,7 +459,6 @@
+ 	i2c8: i2c@11009000 {
+ 		compatible = "mediatek,mt6797-i2c",
+ 			     "mediatek,mt6577-i2c";
+-		id = <8>;
+ 		reg = <0 0x11009000 0 0x1000>,
+ 		      <0 0x11000200 0 0x80>;
+ 		interrupts = <GIC_SPI 86 IRQ_TYPE_LEVEL_LOW>;
+@@ -473,7 +475,6 @@
+ 	i2c9: i2c@1100d000 {
+ 		compatible = "mediatek,mt6797-i2c",
+ 			     "mediatek,mt6577-i2c";
+-		id = <9>;
+ 		reg = <0 0x1100d000 0 0x1000>,
+ 		      <0 0x11000280 0 0x80>;
+ 		interrupts = <GIC_SPI 87 IRQ_TYPE_LEVEL_LOW>;
+@@ -490,7 +491,6 @@
+ 	i2c6: i2c@1100e000 {
+ 		compatible = "mediatek,mt6797-i2c",
+ 			     "mediatek,mt6577-i2c";
+-		id = <6>;
+ 		reg = <0 0x1100e000 0 0x1000>,
+ 		      <0 0x11000500 0 0x80>;
+ 		interrupts = <GIC_SPI 88 IRQ_TYPE_LEVEL_LOW>;
+@@ -506,7 +506,6 @@
+ 	i2c7: i2c@11010000 {
+ 		compatible = "mediatek,mt6797-i2c",
+ 			     "mediatek,mt6577-i2c";
+-		id = <7>;
+ 		reg = <0 0x11010000 0 0x1000>,
+ 		      <0 0x11000580 0 0x80>;
+ 		interrupts = <GIC_SPI 89 IRQ_TYPE_LEVEL_LOW>;
+@@ -522,7 +521,6 @@
+ 	i2c4: i2c@11011000 {
+ 		compatible = "mediatek,mt6797-i2c",
+ 			     "mediatek,mt6577-i2c";
+-		id = <4>;
+ 		reg = <0 0x11011000 0 0x1000>,
+ 		      <0 0x11000300 0 0x80>;
+ 		interrupts = <GIC_SPI 90 IRQ_TYPE_LEVEL_LOW>;
+@@ -538,7 +536,6 @@
+ 	i2c2: i2c@11013000 {
+ 		compatible = "mediatek,mt6797-i2c",
+ 			     "mediatek,mt6577-i2c";
+-		id = <2>;
+ 		reg = <0 0x11013000 0 0x1000>,
+ 		      <0 0x11000400 0 0x80>;
+ 		interrupts = <GIC_SPI 95 IRQ_TYPE_LEVEL_LOW>;
+@@ -555,7 +552,6 @@
+ 	i2c3: i2c@11014000 {
+ 		compatible = "mediatek,mt6797-i2c",
+ 			     "mediatek,mt6577-i2c";
+-		id = <3>;
+ 		reg = <0 0x11014000 0 0x1000>,
+ 		      <0 0x11000480 0 0x80>;
+ 		interrupts = <GIC_SPI 96 IRQ_TYPE_LEVEL_LOW>;
+@@ -572,7 +568,6 @@
+ 	i2c5: i2c@1101c000 {
+ 		compatible = "mediatek,mt6797-i2c",
+ 			     "mediatek,mt6577-i2c";
+-		id = <5>;
+ 		reg = <0 0x1101c000 0 0x1000>,
+ 		      <0 0x11000380 0 0x80>;
+ 		interrupts = <GIC_SPI 83 IRQ_TYPE_LEVEL_LOW>;
+@@ -597,6 +592,25 @@
+ 	 * planet/kali_boot.img (node smi_larb0@14020000).
+ 	 * 0x14010000 is disp_rdma1 — do not use that address here.
+ 	 */
++	/*
++	 * larb5 serves DISP_OVL1/RDMA1/WDMA1 -- the external-display path.
++	 * mt6797-larb-port.h says so in its own header comment, but the OVL1
++	 * and RDMA1 nodes pointed at &larb0 until 2026-08-25, which would have
++	 * produced exactly the IOMMU translation faults the camera hit on the
++	 * same mistake. No `interrupts`: mtk-smi never requests one (the vendor
++	 * value is SPI 234, kept here for reference).
++	 */
++	larb5: larb@14021000 {
++		compatible = "mediatek,mt6797-smi-larb";
++		reg = <0 0x14021000 0 0x1000>;
++		mediatek,larb-id = <5>;
++		mediatek,smi = <&smi_common>;
++		power-domains = <&scpsys MT6797_POWER_DOMAIN_MM>;
++		clocks = <&mmsys CLK_MM_SMI_LARB5>,
++			 <&mmsys CLK_MM_SMI_LARB5>;
++		clock-names = "apb", "smi";
++	};
++
+ 	larb0: larb@14020000 {
+ 		compatible = "mediatek,mt6797-smi-larb";
+ 		reg = <0 0x14020000 0 0x1000>;
+@@ -649,7 +663,7 @@
+ 		reg = <0 0x10205000 0 0x1000>;
+ 		interrupts = <GIC_SPI 156 IRQ_TYPE_LEVEL_LOW>;
+ 		mediatek,infracfg = <&infrasys>;
+-		mediatek,larbs = <&larb0>, <&larb2>;
++		mediatek,larbs = <&larb0>, <&larb2>, <&larb5>;
+ 		#iommu-cells = <1>;
+ 	};
+ 
+@@ -707,8 +721,6 @@
+ 		clocks = <&mmsys CLK_MM_DISP_RDMA0>;
+ 		mediatek,larb = <&larb0>;
+ 		iommus = <&m4u M4U_PORT_DISP_RDMA0>;
+-		width-in-pixel = <1440>;
+-		fifo-size = <1536>;
+ 		status = "disabled";
+ 	};
+ 	disp_color0: disp-color0@14013000 {
+@@ -780,7 +792,8 @@
+ 			interrupts = <GIC_SPI 214 IRQ_TYPE_LEVEL_LOW>;
+ 			power-domains = <&scpsys MT6797_POWER_DOMAIN_MM>;
+ 			clocks = <&mmsys CLK_MM_DISP_OVL1>;
+-			mediatek,larb = <&larb0>;
++			mediatek,larb = <&larb5>;
++			iommus = <&m4u M4U_PORT_DISP_OVL1>;
+ 			status = "disabled";
+ 		};
+ 		disp_rdma1: disp-rdma1@14010000 {
+@@ -790,9 +803,8 @@
+ 			interrupts = <GIC_SPI 218 IRQ_TYPE_LEVEL_LOW>;
+ 			power-domains = <&scpsys MT6797_POWER_DOMAIN_MM>;
+ 			clocks = <&mmsys CLK_MM_DISP_RDMA1>;
+-			mediatek,larb = <&larb0>;
+-			width-in-pixel = <1440>;
+-			fifo-size = <1536>;
++			mediatek,larb = <&larb5>;
++			iommus = <&m4u M4U_PORT_DISP_RDMA1>;
+ 			status = "disabled";
+ 		};
+ 		/*
+@@ -810,6 +822,7 @@
+ 			compatible = "mediatek,mt6797-disp-dsc",
+ 			             "mediatek,mt8195-disp-dsc";
+ 			reg = <0 0x1401a000 0 0x1000>;
++			interrupts = <GIC_SPI 228 IRQ_TYPE_LEVEL_LOW>;
+ 			power-domains = <&scpsys MT6797_POWER_DOMAIN_MM>;
+ 			clocks = <&mmsys CLK_MM_DISP_DSC>;
+ 			status = "disabled";

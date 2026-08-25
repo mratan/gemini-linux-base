@@ -1,0 +1,486 @@
+From: Gemini PDA Linux port <mratan/gemini-linux>
+Subject: [PATCH] dt-bindings: write the five that were missing
+
+The #40 audit listed seven compatibles that have a driver in this tree but
+no binding.  These are five of them, plus the two schema changes the
+remaining two need.
+
+  * regulator/mediatek,mt6797-cpu-sram-ldo -- VSRAM for the A53 clusters
+    is eight LDOs inside INFRACFG_AO, not a PMIC rail, and cpufreq cannot
+    reach the top of either OPP table until it is raised.
+  * input/touchscreen/novatek,nt36xxx-ts -- a TDDI part, so the panel
+    phandle is what makes it a drm_panel_follower.
+  * usb/onsemi,fusb301a -- CC logic, no PD.  Two per board here.
+  * display/panel/planet,gemini-panel -- deliberately names the machine
+    and not the panel: two different panels shipped and only the
+    bootloader knows which one is fitted.
+  * net/wireless/mediatek,mt6797-consys -- documented so the tree checks,
+    and marked NOT FOR UPSTREAM in its own description.  It covers the
+    consys/wifi/btif nodes together because the vendor stack finds three
+    of them with of_find_compatible_node() instead of binding to them.
+  * usb/mediatek,musb gains mediatek,mt6797-musb: the musbfsh variant,
+    which stands alone rather than falling back to mediatek,mtk-musb
+    (that config enumerates but never passes bulk on this SoC) and has
+    one clock rather than three.
+  * vendor-prefixes gains "onsemi".
+
+A correction to that audit while here: it called the three btif* nodes
+the only genuine deletion candidates.  They are not.  mtk_btif is bound
+to 1100c000.btif on the running device and mtk_stp_wmt_soc depends on it;
+btif_tx and btif_rx never get a driver but btif_dma_plat.c reads their
+reg and interrupts via of_find_compatible_node().  Deleting any of the
+three breaks the Wi-Fi that ADR-0001 closed.
+
+Not covered, and left for a submission that carries the drivers:
+mediatek,mt6797-musb's driver change itself, and gemini,mt6797-consys-wmt
+/ mediatek,wifi, which should not be in an upstream dtsi at all.
+
+---
+--- /dev/null
++++ b/Documentation/devicetree/bindings/regulator/mediatek,mt6797-cpu-sram-ldo.yaml
+@@ -0,0 +1,50 @@
++# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/regulator/mediatek,mt6797-cpu-sram-ldo.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: MediaTek MT6797 CPU SRAM LDO
++
++maintainers:
++  - Gemini PDA Linux port <https://github.com/mratan/gemini-linux>
++
++description: |
++  VSRAM for the MT6797's Cortex-A53 clusters is not a PMIC rail. It is an array
++  of eight LDOs inside INFRACFG_AO, programmed through CPULDO_CTRL_0/1/2 at
++  offsets 0xf98, 0xf9c and 0xfa0.
++
++  It matters because the SRAM supply has to sit at or above Vproc: cpufreq
++  cannot take either cluster to the top of its OPP table until this has been
++  raised first. Expressing it as a regulator is what lets the OPP core sequence
++  the two together.
++
++allOf:
++  - $ref: regulator.yaml#
++
++properties:
++  compatible:
++    const: mediatek,mt6797-cpu-sram-ldo
++
++  mediatek,infracfg:
++    $ref: /schemas/types.yaml#/definitions/phandle
++    description:
++      A phandle to the INFRACFG_AO syscon holding the CPULDO_CTRL registers.
++      This must be the always-on block at 0x10001000; the second infracfg block
++      reads back as zero for these registers.
++
++required:
++  - compatible
++  - mediatek,infracfg
++
++unevaluatedProperties: false
++
++examples:
++  - |
++    regulator-cpu-sram {
++        compatible = "mediatek,mt6797-cpu-sram-ldo";
++        mediatek,infracfg = <&infracfg_ao>;
++        regulator-name = "vsram_cpu";
++        regulator-min-microvolt = <900000>;
++        regulator-max-microvolt = <1150000>;
++    };
+--- /dev/null
++++ b/Documentation/devicetree/bindings/input/touchscreen/novatek,nt36xxx-ts.yaml
+@@ -0,0 +1,80 @@
++# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/input/touchscreen/novatek,nt36xxx-ts.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: Novatek NT36xxx touchscreen controller
++
++maintainers:
++  - Gemini PDA Linux port <https://github.com/mratan/gemini-linux>
++
++description: |
++  A capacitive touch controller found in the NT36672 family. On the parts this
++  binding was written against it is a TDDI device: touch and display share one
++  die and one power domain, so the panel's prepare/unprepare IS the touch
++  controller's power sequence. Naming the panel makes the driver a
++  drm_panel_follower, which is how it learns not to poll an unpowered chip and
++  how to re-initialise one that has just come back from cold.
++
++  The chip answers at two addresses. "reg" is the control address; point reports
++  are read from address 0x01, which the driver derives itself.
++
++allOf:
++  - $ref: touchscreen.yaml#
++
++properties:
++  compatible:
++    const: novatek,nt36xxx-ts
++
++  reg:
++    maxItems: 1
++
++  interrupts:
++    maxItems: 1
++
++  irq-gpios:
++    maxItems: 1
++    description:
++      The controller's data-ready line as a plain GPIO, for a host whose
++      interrupt controller cannot take it. The driver polls and uses this line
++      to gate the read -- without that gate the point buffer reads as junk.
++      Supply this or "interrupts".
++
++  reset-gpios:
++    maxItems: 1
++
++  panel:
++    $ref: /schemas/types.yaml#/definitions/phandle
++    description:
++      The panel this controller shares its die and power domain with. Required
++      on a TDDI part; meaningless on a discrete one.
++
++required:
++  - compatible
++  - reg
++
++anyOf:
++  - required: [interrupts]
++  - required: [irq-gpios]
++
++unevaluatedProperties: false
++
++examples:
++  - |
++    #include <dt-bindings/gpio/gpio.h>
++
++    i2c {
++        #address-cells = <1>;
++        #size-cells = <0>;
++
++        touchscreen@62 {
++            compatible = "novatek,nt36xxx-ts";
++            reg = <0x62>;
++            reset-gpios = <&pio 68 GPIO_ACTIVE_LOW>;
++            irq-gpios = <&pio 85 GPIO_ACTIVE_LOW>;
++            panel = <&panel>;
++            touchscreen-swapped-x-y;
++            touchscreen-inverted-y;
++        };
++    };
+--- /dev/null
++++ b/Documentation/devicetree/bindings/usb/onsemi,fusb301a.yaml
+@@ -0,0 +1,52 @@
++# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/usb/onsemi,fusb301a.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: ON Semiconductor FUSB301A USB Type-C controller
++
++maintainers:
++  - Gemini PDA Linux port <https://github.com/mratan/gemini-linux>
++
++description: |
++  A Type-C CC-logic controller: it detects attach, resolves cable orientation
++  and reports the advertised current, but does no power delivery.
++
++  A board may fit more than one, on different buses, one per port.
++
++properties:
++  compatible:
++    const: onsemi,fusb301a
++
++  reg:
++    maxItems: 1
++
++  interrupts:
++    maxItems: 1
++    description:
++      The INT_N pin. Optional -- the driver polls when it is absent, which is
++      what a host with no usable interrupt controller for this line must do.
++
++  vbus-supply:
++    description:
++      The VBUS source this controller switches when acting as a source.
++
++required:
++  - compatible
++  - reg
++
++additionalProperties: false
++
++examples:
++  - |
++    i2c {
++        #address-cells = <1>;
++        #size-cells = <0>;
++
++        typec@25 {
++            compatible = "onsemi,fusb301a";
++            reg = <0x25>;
++            vbus-supply = <&otg_vbus>;
++        };
++    };
+--- /dev/null
++++ b/Documentation/devicetree/bindings/display/panel/planet,gemini-panel.yaml
+@@ -0,0 +1,74 @@
++# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/display/panel/planet,gemini-panel.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: Planet Computers Gemini PDA DSI panel
++
++maintainers:
++  - Gemini PDA Linux port <https://github.com/mratan/gemini-linux>
++
++description: |
++  The 5.99" 1080x2160 DSI panel of the Planet Computers Gemini PDA.
++
++  There is deliberately no panel-specific compatible here. Two different panels
++  were fitted across production -- a Novatek NT36672 and a Solomon SSD2092 --
++  and the board cannot tell you which one it has. The bootloader can: it probes
++  the panel at every boot and publishes the name in /chosen/atag,videolfb, which
++  is where the driver reads it from. So the compatible names the machine, and
++  the driver resolves the part at runtime.
++
++allOf:
++  - $ref: panel-common.yaml#
++
++properties:
++  compatible:
++    const: planet,gemini-panel
++
++  reg:
++    maxItems: 1
++
++  avdd-supply:
++    description: Positive analog supply, typically +5.5 V.
++
++  avee-supply:
++    description: Negative analog supply, typically -5.5 V.
++
++  reset-gpios: true
++  backlight: true
++  port: true
++
++required:
++  - compatible
++  - reg
++  - avdd-supply
++  - avee-supply
++  - reset-gpios
++  - port
++
++unevaluatedProperties: false
++
++examples:
++  - |
++    #include <dt-bindings/gpio/gpio.h>
++
++    dsi {
++        #address-cells = <1>;
++        #size-cells = <0>;
++
++        panel@0 {
++            compatible = "planet,gemini-panel";
++            reg = <0>;
++            avdd-supply = <&lcd_avdd>;
++            avee-supply = <&lcd_avee>;
++            reset-gpios = <&pio 180 GPIO_ACTIVE_LOW>;
++            backlight = <&backlight_lcd>;
++
++            port {
++                panel_in: endpoint {
++                    remote-endpoint = <&dsi_out>;
++                };
++            };
++        };
++    };
+--- /dev/null
++++ b/Documentation/devicetree/bindings/net/wireless/mediatek,mt6797-consys.yaml
+@@ -0,0 +1,90 @@
++# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/net/wireless/mediatek,mt6797-consys.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: MediaTek MT6797 CONSYS connectivity subsystem
++
++maintainers:
++  - Gemini PDA Linux port <https://github.com/mratan/gemini-linux>
++
++description: |
++  NOT PROPOSED FOR UPSTREAM. This documents the device tree an out-of-tree
++  vendor connectivity stack requires, so that a tree carrying that stack can
++  still pass dt_binding_check. Anything submitting the MT6797 upstream should
++  leave these nodes out of the SoC dtsi entirely and carry them in a downstream
++  overlay, because there is no mainline driver for any of them and the
++  compatible strings are not SoC-qualified in the way a reviewer would ask for.
++
++  CONSYS is the MT6797's combo connectivity block: a separate MCU with its own
++  power domain, running firmware loaded by the AP, that terminates Wi-Fi,
++  Bluetooth, GPS and FM. The AP talks to it over BTIF, a dedicated FIFO with
++  its own APDMA channels.
++
++  The nodes are separate because the vendor stack finds three of them with
++  of_find_compatible_node() rather than by binding a driver to them.
++
++properties:
++  compatible:
++    enum:
++      - gemini,mt6797-consys-wmt
++      - mediatek,wifi
++      - mediatek,btif
++      - mediatek,btif_tx
++      - mediatek,btif_rx
++
++  reg:
++    minItems: 1
++    maxItems: 4
++
++  interrupts:
++    minItems: 1
++    maxItems: 2
++
++  clocks:
++    minItems: 1
++    maxItems: 2
++
++  clock-names:
++    minItems: 1
++    maxItems: 2
++
++  power-domains:
++    maxItems: 1
++
++  memory-region:
++    maxItems: 1
++
++  hardware-values:
++    $ref: /schemas/types.yaml#/definitions/uint32-array
++    description:
++      Opaque tuning words handed to the Wi-Fi firmware verbatim.
++
++  vcn18-supply:
++    description: 1.8 V CONSYS supply.
++  vcn28-supply:
++    description: 2.8 V CONSYS supply.
++  vcn33_bt-supply:
++    description: 3.3 V Bluetooth supply.
++  vcn33_wifi-supply:
++    description: 3.3 V Wi-Fi supply.
++
++required:
++  - compatible
++  - reg
++
++additionalProperties: false
++
++examples:
++  - |
++    #include <dt-bindings/interrupt-controller/arm-gic.h>
++    #include <dt-bindings/interrupt-controller/irq.h>
++
++    btif@1100c000 {
++        compatible = "mediatek,btif";
++        reg = <0x1100c000 0x1000>;
++        interrupts = <GIC_SPI 130 IRQ_TYPE_LEVEL_LOW>;
++        clocks = <&infracfg 1>, <&infracfg 2>;
++        clock-names = "btifc", "apdmac";
++    };
+--- a/Documentation/devicetree/bindings/usb/mediatek,musb.yaml
++++ b/Documentation/devicetree/bindings/usb/mediatek,musb.yaml
+@@ -15,12 +15,14 @@
+     pattern: '^usb@[0-9a-f]+$'
+ 
+   compatible:
+-    items:
+-      - enum:
+-          - mediatek,mt8516-musb
+-          - mediatek,mt2701-musb
+-          - mediatek,mt7623-musb
+-      - const: mediatek,mtk-musb
++    oneOf:
++      - items:
++          - enum:
++              - mediatek,mt8516-musb
++              - mediatek,mt2701-musb
++              - mediatek,mt7623-musb
++          - const: mediatek,mtk-musb
++      - const: mediatek,mt6797-musb
+ 
+   reg:
+     maxItems: 1
+@@ -33,17 +35,24 @@
+       - const: mc
+ 
+   clocks:
++    minItems: 1
+     items:
+       - description: The main/core clock
+       - description: The system bus clock
+       - description: The 48Mhz clock
+ 
+   clock-names:
++    minItems: 1
+     items:
+       - const: main
+       - const: mcu
+       - const: univpll
+ 
++  maximum-speed:
++    enum:
++      - high-speed
++      - full-speed
++
+   phys:
+     maxItems: 1
+ 
+@@ -80,6 +89,27 @@
+   - clocks
+   - clock-names
+ 
++allOf:
++  - if:
++      properties:
++        compatible:
++          contains:
++            const: mediatek,mt6797-musb
++    then:
++      # This instance is the musbfsh variant and has only the infra "icusb"
++      # bus gate; there are no separate mcu/univpll gates on this SoC.
++      properties:
++        clocks:
++          maxItems: 1
++        clock-names:
++          maxItems: 1
++    else:
++      properties:
++        clocks:
++          minItems: 3
++        clock-names:
++          minItems: 3
++
+ additionalProperties: false
+ 
+ examples:
+--- a/Documentation/devicetree/bindings/vendor-prefixes.yaml
++++ b/Documentation/devicetree/bindings/vendor-prefixes.yaml
+@@ -989,6 +989,8 @@
+     description: Open Network Install Environment group
+   "^onion,.*":
+     description: Onion Corporation
++  "^onsemi,.*":
++    description: onsemi (formerly ON Semiconductor)
+   "^onnn,.*":
+     description: ON Semiconductor Corp.
+   "^ontat,.*":
