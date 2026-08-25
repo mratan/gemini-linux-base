@@ -174,7 +174,7 @@ diff --git a/drivers/misc/gemini-camera-power.c b/drivers/misc/gemini-camera-pow
 new file mode 100644
 --- /dev/null
 +++ b/drivers/misc/gemini-camera-power.c
-@@ -0,0 +1,741 @@
+@@ -0,0 +1,736 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Gemini PDA camera bring-up power controller.
@@ -405,46 +405,41 @@ new file mode 100644
 +				bool on)
 +{
 +	void __iomem *base = cam->seninf_base + seninf * SENINF_STRIDE;
-+	u32 v;
 +
 +	if (!on) {
-+		/* Enable bit clear is enough to stop the output. */
-+		v = readl(base + SENINF_MCLK_REG) & ~SENINF_MCLK_ENABLE;
-+		writel(v, base + SENINF_MCLK_REG);
++		writel(readl(base + SENINF_MCLK_REG) & ~SENINF_MCLK_ENABLE,
++		       base + SENINF_MCLK_REG);
 +		return;
 +	}
 +
-+	/* Raw override wins, for sweeping the whole register from userspace. */
 +	if (seninf_mclk) {
 +		writel(seninf_mclk, base + SENINF_MCLK_REG);
-+		dev_info(cam->dev, "seninf%u MCLK override 0x%08x (readback 0x%08x)\n",
++		dev_info(cam->dev, "seninf%u MCLK override 0x%08x (rb 0x%08x)\n",
 +			 seninf, seninf_mclk, readl(base + SENINF_MCLK_REG));
 +		return;
 +	}
 +
-+	/* 1. SENINF_TOP_CTRL bits 10, 11. */
-+	v = readl(base + SENINF_TOP_CTRL_REG) | SENINF_TOP_CTRL_EN;
-+	writel(v, base + SENINF_TOP_CTRL_REG);
-+
-+	/* 2. TG_SEN_CK divider, both fields, from the sweepable seninf_div. */
-+	v = readl(base + SENINF_SEN_CK_REG);
-+	v &= ~(SENINF_SEN_CK_DIV_MASK | SENINF_SEN_CK_DIV2_MASK);
-+	v |= seninf_div & SENINF_SEN_CK_DIV_MASK;
-+	v |= (seninf_div << 16) & SENINF_SEN_CK_DIV2_MASK;
-+	writel(v, base + SENINF_SEN_CK_REG);
-+
-+	/* 3. MCLK enable — bit 31, plus the low bits the HAL always sets. */
-+	v = readl(base + SENINF_MCLK_REG);
-+	v |= SENINF_MCLK_ENABLE | SENINF_MCLK_BIT28 | SENINF_MCLK_LOW;
-+	writel(v, base + SENINF_MCLK_REG);
-+
-+	dev_info(cam->dev,
-+		 "seninf%u MCLK on: TOP_CTRL 0x%08x, TG_SEN_CK 0x%08x, MCLK 0x%08x\n",
-+		 seninf, readl(base + SENINF_TOP_CTRL_REG),
-+		 readl(base + SENINF_SEN_CK_REG),
-+		 readl(base + SENINF_MCLK_REG));
++	/*
++	 * The vendor's active MCLK register value, captured from the running
++	 * vendor 3.18 kernel via /dev/mem on the Reference slot (2026-08-24):
++	 * SENINF + 0x600 reads exactly 0x80000000 — bit 31 alone — with
++	 * SENINF_TG_SEN_CK (+0x604) and +0x608 left at their reset values and
++	 * SENINF_TOP_CTRL untouched. So bit 31 is the enable, and the bit 28 an
++	 * earlier revision of this driver set (which drives the pad to a static
++	 * level) is wrong.
++	 *
++	 * IMPORTANT: this is necessary but not sufficient. Setting this value
++	 * does NOT by itself clock the sensor — verified on both kernels, the
++	 * sensor does not answer on I2C and the vendor's own camera_info stays
++	 * empty when only the registers are set. The working clock additionally
++	 * needs the vendor userspace HAL's CAMTG-PLL setup (the SET_MCLK_PLL
++	 * ioctl's sendCommand path in libcam.halsensor.so), which this driver
++	 * does not yet replicate. See 04-docs/CAMERA-SENSORS-2026-08-24.md.
++	 */
++	writel(SENINF_MCLK_ENABLE, base + SENINF_MCLK_REG);
++	dev_info(cam->dev, "seninf%u MCLK = 0x%08x (vendor value; see driver note)\n",
++		 seninf, readl(base + SENINF_MCLK_REG));
 +}
-+
 +static void gemini_cam_assert_resets(struct gemini_cam *cam)
 +{
 +	int i;
