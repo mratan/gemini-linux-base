@@ -1,0 +1,1 @@
+savedcmd_/mercury/data/projects/gemini_linux/07-kernel/wt-main/tools/a72freq/gemini-a72freq.mod := printf '%s\n'   a72freq.o | awk '!x[$$0]++ { print("/mercury/data/projects/gemini_linux/07-kernel/wt-main/tools/a72freq/"$$0) }' > /mercury/data/projects/gemini_linux/07-kernel/wt-main/tools/a72freq/gemini-a72freq.mod

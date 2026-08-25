@@ -120,7 +120,7 @@ diff --git a/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts b/arch/arm64/boo
  			};
  		};
  
-@@ -2553,3 +2658,161 @@
+@@ -2553,3 +2658,203 @@
  		};
  	};
  };
@@ -168,6 +168,44 @@ diff --git a/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts b/arch/arm64/boo
 +	pinctrl-0 = <&i2c2_pins_a>;
 +	clock-frequency = <100000>;
 +	status = "okay";
++};
++
++/*
++ * The front camera. Identified in #63 from the vendor stack, which reports
++ * CAM[2]:sp5509mipirawsls -- and "sp5509" is MediaTek's project name for what
++ * is really an SK Hynix Hi-556: the vendor driver checks register 0x0f16 for
++ * 0x0556, which is exactly what mainline's drivers/media/i2c/hi556.c does.
++ * So this is a mainline sensor with a mainline driver, not a port.
++ *
++ * 7-bit 0x20: the vendor's i2c_addr_table is {0x40, 0x50}, which are write
++ * ids, i.e. 7-bit 0x20 and 0x28. 0x20 is the one it tries first.
++ *
++ * The endpoint has no remote-endpoint yet -- nothing receives CSI-2 until
++ * SENINF exists (#65). The sensor still probes, powers itself and reads its
++ * chip ID; it simply has nobody to stream to.
++ */
++&i2c3 {
++	hi556: camera@20 {
++		compatible = "hynix,hi556";
++		reg = <0x20>;
++
++		clocks = <&camsys CLK_CAM_CAMTG>;
++		clock-frequency = <24000000>;
++
++		dovdd-supply = <&mt6351_vcamio_reg>;
++		avdd-supply = <&mt6351_vcama_reg>;
++		dvdd-supply = <&mt6351_vcamd_reg>;
++
++		reset-gpios = <&pio 33 GPIO_ACTIVE_LOW>;
++		powerdown-gpios = <&pio 29 GPIO_ACTIVE_LOW>;
++
++		port {
++			hi556_out: endpoint {
++				data-lanes = <1 2>;
++				link-frequencies = /bits/ 64 <437000000>;
++			};
++		};
++	};
 +};
 +
 +/*
@@ -273,8 +311,12 @@ diff --git a/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts b/arch/arm64/boo
 +		 */
 +		main-reset-gpios = <&pio 32 GPIO_ACTIVE_LOW>;
 +		main-powerdown-gpios = <&pio 28 GPIO_ACTIVE_LOW>;
-+		sub-reset-gpios = <&pio 33 GPIO_ACTIVE_LOW>;
-+		sub-powerdown-gpios = <&pio 29 GPIO_ACTIVE_LOW>;
++		/*
++		 * The sub socket's reset and power-down lines are NOT here:
++		 * they moved onto the sensor's own node below with #64, which
++		 * is where V4L2 expects to find them. Only the unpopulated
++		 * main socket is still driven from this bring-up node.
++		 */
 +
 +		pinctrl-names = "default";
 +		pinctrl-0 = <&camera_mclk_pins>;

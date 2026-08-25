@@ -1,0 +1,37 @@
+--- a/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
++++ b/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
+@@ -1540,6 +1540,34 @@
+ 		pmic: mt6351 {
+ 			compatible = "mediatek,mt6351";
+ 
++			/*
++			 * The two PMIC keys: the key silkscreened "Esc" at the
++			 * top left (PWRKEY) and the silver button on the right
++			 * side (HOMEKEY). Neither is in the keyboard matrix —
++			 * that matrix holds exactly 52 keys, which is the whole
++			 * keyboard — so without this node they emit nothing.
++			 *
++			 * POLLED, because the MT6351's interrupt is EINT 262
++			 * (vendor mt6797.dts) and pinctrl-mt6797 has no EINT
++			 * support (blockers.md B-11), the same reason the
++			 * keyboard matrix polls. Both key states are in one
++			 * register, so a poll is a single PMIC read (~0.39 ms
++			 * measured, worst case).
++			 *
++			 * KEY_ESC for the power key matches Gemian, and is safe:
++			 * long-press power-off is a PMIC hardware function
++			 * (RG_PWRKEY_RST_EN) that this driver never touches.
++			 *
++			 * KEY_SLEEP on the silver button is UNVERIFIED — that it
++			 * is HOMEKEY at all is an assumption until someone runs
++			 * gemini-button-probe at the machine (issue #61).
++			 */
++			mt6351_keys: keys {
++				compatible = "mediatek,mt6351-keys";
++				linux,keycodes = <1>, <142>;   /* KEY_ESC, KEY_SLEEP */
++				poll-interval = <20>;
++			};
++
+ 			regulators {
+ 				mt6351_vcn18_reg: vcn18 {
+ 					regulator-name = "vcn18";

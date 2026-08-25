@@ -1,0 +1,295 @@
+--- a/drivers/input/keyboard/Kconfig
++++ b/drivers/input/keyboard/Kconfig
+@@ -790,6 +790,21 @@
+ 	  To compile this driver as a module, choose M here: the
+ 	  module will be called mt6779-keypad.
+ 
++config KEYBOARD_MT6351
++	tristate "MediaTek MT6351 PMIC keys (polled)"
++	depends on REGMAP
++	help
++	  Say Y here if you want to use the power and home keys of the
++	  MediaTek MT6351 PMIC.
++
++	  This is a POLLED driver. The MT6351's interrupt is an EINT, and
++	  mainline pinctrl-mt6797 has no EINT support, so the interrupt-driven
++	  mtk-pmic-keys cannot be used on that SoC. Both key states live in one
++	  register, so a poll costs a single PMIC read.
++
++	  To compile this driver as a module, choose M here: the module will
++	  be called mt6351-keys.
++
+ config KEYBOARD_MTK_PMIC
+ 	tristate "MediaTek PMIC keys support"
+ 	depends on MFD_MT6397 || COMPILE_TEST
+--- a/drivers/input/keyboard/Makefile
++++ b/drivers/input/keyboard/Makefile
+@@ -44,6 +44,7 @@
+ obj-$(CONFIG_KEYBOARD_MCS)		+= mcs_touchkey.o
+ obj-$(CONFIG_KEYBOARD_MPR121)		+= mpr121_touchkey.o
+ obj-$(CONFIG_KEYBOARD_MT6779)		+= mt6779-keypad.o
++obj-$(CONFIG_KEYBOARD_MT6351)		+= mt6351-keys.o
+ obj-$(CONFIG_KEYBOARD_MTK_PMIC) 	+= mtk-pmic-keys.o
+ obj-$(CONFIG_KEYBOARD_NEWTON)		+= newtonkbd.o
+ obj-$(CONFIG_KEYBOARD_NOMADIK)		+= nomadik-ske-keypad.o
+--- /dev/null
++++ b/drivers/input/keyboard/mt6351-keys.c
+@@ -0,0 +1,258 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * MT6351 PMIC keys — polled.
++ *
++ * The MT6351 has exactly two keys, PWRKEY and HOMEKEY. On the Gemini PDA they
++ * are the key silkscreened "Esc" at the top left and the silver button on the
++ * right side. Neither is part of the keyboard matrix: that matrix is 8x7 = 56
++ * positions holding exactly 52 keys, which is the whole keyboard, and the
++ * vendor's own aw9523_key.c agrees. Without this driver the two buttons produce
++ * no input events at all.
++ *
++ * WHY POLLED, WHEN mtk-pmic-keys EXISTS
++ *
++ * mtk-pmic-keys is interrupt-driven and wants a parent IRQ. The MT6351's
++ * interrupt is an EINT — the vendor device tree says so plainly:
++ *
++ *      pmic: mt6351 {
++ *              interrupt-parent = <&eintc>;
++ *              interrupts = <262 4>;
++ *      };
++ *
++ * and mainline pinctrl-mt6797 has no EINT support (blockers.md B-11). That is
++ * the same blocker that puts the keyboard matrix into polling mode
++ * (patches/v6.6/input/0001) and the lid hall sensor into a userspace poll. So
++ * there is no interrupt to hang an irqchip off, and building one would be
++ * blocked before it could be used.
++ *
++ * Polling is cheap here and is the established pattern on this machine. Both
++ * key states live in a single register, so one read per poll covers both.
++ * Measured on the device: a pwrap register read costs about 0.39 ms (upper
++ * bound — that figure came through debugfs, which formats every register it
++ * walks). At the default 20 ms interval that is roughly 2% of one core, against
++ * a matrix keypad on the same machine that scans seven columns over an i2c
++ * expander at the same rate.
++ *
++ * If B-11 is ever closed, the upstream shape is an MT6351 entry in
++ * mfd/mt6397-core.c plus mt6351_regs in mtk-pmic-keys.c, and this driver
++ * retires. It is deliberately small so that is easy.
++ *
++ * WHAT THIS DRIVER DELIBERATELY DOES NOT DO
++ *
++ * It never writes TOP_RST_MISC. The PMIC implements long-press power-off in
++ * hardware (RG_PWRKEY_RST_EN, and a duration in RG_PWRKEY_RST_TD), configured
++ * by the bootloader, and that behaviour is independent of whatever keycode this
++ * driver reports for a short press. Reporting KEY_ESC therefore costs nothing:
++ * hold the key and the hardware still powers the machine off. That is exactly
++ * how Gemian behaves, which is why its keyboard layout defines <ESC> with
++ * XF86PowerDown on an Fn level. Leaving those bits alone is the whole reason a
++ * short-press keycode is safe, so do not "improve" this by managing them.
++ *
++ * Copyright (C) 2026 Gemini PDA Linux project
++ */
++
++#include <linux/input.h>
++#include <linux/kernel.h>
++#include <linux/mod_devicetable.h>
++#include <linux/module.h>
++#include <linux/platform_device.h>
++#include <linux/property.h>
++#include <linux/regmap.h>
++
++/*
++ * Register and bit positions from the vendor header, mt6797's upmu_hw.h:
++ *
++ *   MT6351_TOPSTATUS              MT6351_PMIC_REG_BASE + 0x0220
++ *   MT6351_PMIC_PWRKEY_DEB        TOPSTATUS, mask 0x1, shift 1
++ *   MT6351_PMIC_HOMEKEY_DEB       TOPSTATUS, mask 0x1, shift 2
++ *
++ * MT6351_PMIC_REG_BASE is 0, so the offset is the raw regmap address. These are
++ * DEBOUNCED LEVELS, not edge latches: the bit reflects the current state of the
++ * key for as long as it is held, which is what makes polling viable.
++ */
++#define MT6351_TOPSTATUS		0x0220
++#define MT6351_PWRKEY_DEB		BIT(1)
++#define MT6351_HOMEKEY_DEB		BIT(2)
++
++/*
++ * ACTIVE LOW. From the vendor HAL (mt6755/hal_kpd.c), which is unambiguous:
++ *
++ *      if (pmic_get_register_value(MT6351_PMIC_HOMEKEY_DEB) == 1) {
++ *              // home key release
++ *      } else {
++ *              // home key press
++ *      }
++ *
++ * and it matches the hardware at rest: TOPSTATUS reads 0x0046 with nothing
++ * pressed, i.e. both bits set.
++ */
++#define MT6351_KEY_PRESSED		0
++
++#define MT6351_KEYS_DEFAULT_POLL_MS	20
++
++struct mt6351_key {
++	unsigned int mask;
++	unsigned int keycode;
++	bool pressed;
++	const char *name;
++};
++
++struct mt6351_keys {
++	struct device *dev;
++	struct regmap *regmap;
++	struct input_dev *input;
++	struct delayed_work work;
++	unsigned int poll_ms;
++	struct mt6351_key keys[2];
++};
++
++static void mt6351_keys_poll(struct work_struct *work)
++{
++	struct mt6351_keys *keys = container_of(work, struct mt6351_keys,
++						work.work);
++	unsigned int val;
++	bool changed = false;
++	int i, ret;
++
++	ret = regmap_read(keys->regmap, MT6351_TOPSTATUS, &val);
++	if (ret) {
++		/*
++		 * A pwrap read can fail transiently. Do not give up the poll
++		 * loop over it — a dead key is worse than a missed sample —
++		 * but do not spam the log either.
++		 */
++		dev_warn_ratelimited(keys->dev,
++				     "TOPSTATUS read failed (%d)\n", ret);
++		goto again;
++	}
++
++	for (i = 0; i < ARRAY_SIZE(keys->keys); i++) {
++		struct mt6351_key *key = &keys->keys[i];
++		bool pressed;
++
++		if (!key->keycode)
++			continue;
++
++		pressed = (val & key->mask) == MT6351_KEY_PRESSED;
++		if (pressed == key->pressed)
++			continue;
++
++		key->pressed = pressed;
++		input_report_key(keys->input, key->keycode, pressed);
++		changed = true;
++		dev_dbg(keys->dev, "%s %s\n", key->name,
++			pressed ? "pressed" : "released");
++	}
++
++	if (changed)
++		input_sync(keys->input);
++
++again:
++	schedule_delayed_work(&keys->work, msecs_to_jiffies(keys->poll_ms));
++}
++
++static int mt6351_keys_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct mt6351_keys *keys;
++	u32 codes[2] = { KEY_ESC, KEY_SLEEP };
++	int i, ret;
++
++	keys = devm_kzalloc(dev, sizeof(*keys), GFP_KERNEL);
++	if (!keys)
++		return -ENOMEM;
++
++	/*
++	 * The regmap belongs to the parent. This node sits under the pwrap's
++	 * "mediatek,mt6351" child, and the pwrap registers a regmap on its own
++	 * device covering the PMIC's 16-bit address space — the same route the
++	 * mt6351 regulator and the mt6351 codec on this node already take,
++	 * because mainline has no MT6351 MFD to hang children off.
++	 */
++	keys->regmap = dev_get_regmap(dev->parent, NULL);
++	if (!keys->regmap) {
++		dev_err(dev, "no regmap on the parent device\n");
++		return -ENODEV;
++	}
++
++	keys->dev = dev;
++	keys->poll_ms = MT6351_KEYS_DEFAULT_POLL_MS;
++	device_property_read_u32(dev, "poll-interval", &keys->poll_ms);
++	if (!keys->poll_ms)
++		keys->poll_ms = MT6351_KEYS_DEFAULT_POLL_MS;
++
++	/*
++	 * Keycodes are DT policy, not hardware. The defaults match Gemian,
++	 * whose layout expects the power key to report KEY_ESC (its <ESC>
++	 * definition carries XF86PowerDown on an Fn level, i.e. power-off is
++	 * userspace's business and the bare key is Escape).
++	 */
++	device_property_read_u32_array(dev, "linux,keycodes", codes,
++				       ARRAY_SIZE(codes));
++
++	keys->keys[0].mask = MT6351_PWRKEY_DEB;
++	keys->keys[0].keycode = codes[0];
++	keys->keys[0].name = "pwrkey";
++	keys->keys[1].mask = MT6351_HOMEKEY_DEB;
++	keys->keys[1].keycode = codes[1];
++	keys->keys[1].name = "homekey";
++
++	keys->input = devm_input_allocate_device(dev);
++	if (!keys->input)
++		return -ENOMEM;
++
++	keys->input->name = "mt6351-keys";
++	keys->input->phys = "mt6351-keys/input0";
++	keys->input->id.bustype = BUS_HOST;
++
++	for (i = 0; i < ARRAY_SIZE(keys->keys); i++) {
++		if (keys->keys[i].keycode)
++			input_set_capability(keys->input, EV_KEY,
++					     keys->keys[i].keycode);
++		/*
++		 * Start from "released" rather than from a first read. If the
++		 * machine somehow boots with a key held, the first poll reports
++		 * the press, which is the honest thing; assuming the current
++		 * state is the resting state would swallow it.
++		 */
++		keys->keys[i].pressed = false;
++	}
++
++	ret = input_register_device(keys->input);
++	if (ret)
++		return ret;
++
++	platform_set_drvdata(pdev, keys);
++	INIT_DELAYED_WORK(&keys->work, mt6351_keys_poll);
++	schedule_delayed_work(&keys->work, msecs_to_jiffies(keys->poll_ms));
++
++	dev_info(dev, "polled every %u ms (no EINT on this SoC, see B-11)\n",
++		 keys->poll_ms);
++	return 0;
++}
++
++static void mt6351_keys_remove(struct platform_device *pdev)
++{
++	struct mt6351_keys *keys = platform_get_drvdata(pdev);
++
++	cancel_delayed_work_sync(&keys->work);
++}
++
++static const struct of_device_id mt6351_keys_of_match[] = {
++	{ .compatible = "mediatek,mt6351-keys" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, mt6351_keys_of_match);
++
++static struct platform_driver mt6351_keys_driver = {
++	.driver = {
++		.name = "mt6351-keys",
++		.of_match_table = mt6351_keys_of_match,
++	},
++	.probe = mt6351_keys_probe,
++	.remove_new = mt6351_keys_remove,
++};
++module_platform_driver(mt6351_keys_driver);
++
++MODULE_DESCRIPTION("MT6351 PMIC power/home keys (polled)");
++MODULE_LICENSE("GPL");

@@ -1,0 +1,1 @@
+savedcmd_/mercury/data/projects/gemini_linux/07-kernel/wt-main/tools/a72freq/gemini-a72freq.o := aarch64-linux-ld -EL  -maarch64elf -z noexecstack --no-warn-rwx-segments   -r -o /mercury/data/projects/gemini_linux/07-kernel/wt-main/tools/a72freq/gemini-a72freq.o @/mercury/data/projects/gemini_linux/07-kernel/wt-main/tools/a72freq/gemini-a72freq.mod 

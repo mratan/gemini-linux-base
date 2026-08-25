@@ -1,0 +1,451 @@
+diff --git a/Documentation/devicetree/bindings/media/hynix,hi556.yaml b/Documentation/devicetree/bindings/media/hynix,hi556.yaml
+new file mode 100644
+--- /dev/null
++++ b/Documentation/devicetree/bindings/media/hynix,hi556.yaml
+@@ -0,0 +1,119 @@
++# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/media/hynix,hi556.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: SK Hynix Hi-556 5MP CMOS image sensor
++
++maintainers:
++  - Shawn Tu <shawnx.tu@intel.com>
++
++description: |
++  The Hi-556 is a 5 megapixel (2592x1944) raw Bayer CMOS image sensor with a
++  2-lane MIPI CSI-2 output. The same driver serves ACPI platforms, where the
++  firmware owns the sensor's clock, supplies and reset, and device-tree
++  platforms, where they are described here.
++
++  Note the part appears under vendor project names as well as its own: the
++  MediaTek imgsensor tree calls it "sp5509", which is what it is called on the
++  Planet Gemini PDA.
++
++allOf:
++  - $ref: /schemas/media/video-interface-devices.yaml#
++
++properties:
++  compatible:
++    const: hynix,hi556
++
++  reg:
++    maxItems: 1
++
++  clocks:
++    maxItems: 1
++    description: XVCLK, the sensor master clock. 24 MHz.
++
++  clock-frequency:
++    const: 24000000
++    description:
++      The master clock frequency the sensor is driven at. The driver rejects
++      anything else.
++
++  dovdd-supply:
++    description: Digital I/O supply, 1.8 V.
++
++  avdd-supply:
++    description: Analog supply, 2.8 V.
++
++  dvdd-supply:
++    description: Digital core supply, 1.2 V (1.21 V on MediaTek platforms).
++
++  reset-gpios:
++    maxItems: 1
++    description: Sensor reset, active low.
++
++  powerdown-gpios:
++    maxItems: 1
++    description: Sensor power-down (PWDNB), active low.
++
++  port:
++    $ref: /schemas/graph.yaml#/$defs/port-base
++    additionalProperties: false
++
++    properties:
++      endpoint:
++        $ref: /schemas/media/video-interfaces.yaml#
++        unevaluatedProperties: false
++
++        properties:
++          data-lanes:
++            items:
++              - const: 1
++              - const: 2
++
++          link-frequencies: true
++
++        required:
++          - data-lanes
++          - link-frequencies
++
++required:
++  - compatible
++  - reg
++  - clock-frequency
++  - port
++
++unevaluatedProperties: false
++
++examples:
++  - |
++    #include <dt-bindings/clock/mt6797-clk.h>
++    #include <dt-bindings/gpio/gpio.h>
++
++    i2c {
++        #address-cells = <1>;
++        #size-cells = <0>;
++
++        camera@20 {
++            compatible = "hynix,hi556";
++            reg = <0x20>;
++
++            clocks = <&camsys CLK_CAM_CAMTG>;
++            clock-frequency = <24000000>;
++
++            dovdd-supply = <&mt6351_vcamio_reg>;
++            avdd-supply = <&mt6351_vcama_reg>;
++            dvdd-supply = <&mt6351_vcamd_reg>;
++
++            reset-gpios = <&pio 33 GPIO_ACTIVE_LOW>;
++            powerdown-gpios = <&pio 29 GPIO_ACTIVE_LOW>;
++
++            port {
++                hi556_out: endpoint {
++                    remote-endpoint = <&seninf_in>;
++                    data-lanes = <1 2>;
++                    link-frequencies = /bits/ 64 <437000000>;
++                };
++            };
++        };
++    };
+diff --git a/drivers/media/i2c/Kconfig b/drivers/media/i2c/Kconfig
+--- a/drivers/media/i2c/Kconfig
++++ b/drivers/media/i2c/Kconfig
+@@ -54,7 +54,9 @@
+ 	tristate "Hynix Hi-556 sensor support"
+ 	help
+ 	  This is a Video4Linux2 sensor driver for the Hynix
+-	  Hi-556 camera.
++	  Hi-556 camera. Supports both ACPI platforms, where the firmware
++	  owns the sensor's clock and supplies, and device-tree platforms,
++	  where this driver drives them itself.
+ 
+ 	  To compile this driver as a module, choose M here: the
+ 	  module will be called hi556.
+diff --git a/drivers/media/i2c/hi556.c b/drivers/media/i2c/hi556.c
+--- a/drivers/media/i2c/hi556.c
++++ b/drivers/media/i2c/hi556.c
+@@ -3,10 +3,14 @@
+ 
+ #include <asm/unaligned.h>
+ #include <linux/acpi.h>
++#include <linux/clk.h>
+ #include <linux/delay.h>
++#include <linux/gpio/consumer.h>
+ #include <linux/i2c.h>
++#include <linux/mod_devicetable.h>
+ #include <linux/module.h>
+ #include <linux/pm_runtime.h>
++#include <linux/regulator/consumer.h>
+ #include <media/v4l2-ctrls.h>
+ #include <media/v4l2-device.h>
+ #include <media/v4l2-fwnode.h>
+@@ -23,6 +27,15 @@
+ #define HI556_REG_CHIP_ID		0x0f16
+ #define HI556_CHIP_ID			0x0556
+ 
++/* Supplies, in the order the vendor power sequence brings them up. */
++#define HI556_NUM_SUPPLIES		3
++
++static const char * const hi556_supply_names[HI556_NUM_SUPPLIES] = {
++	"dovdd",	/* Digital I/O, 1.8 V */
++	"avdd",		/* Analog, 2.8 V */
++	"dvdd",		/* Digital core, 1.21 V */
++};
++
+ #define HI556_REG_MODE_SELECT		0x0a00
+ #define HI556_MODE_STANDBY		0x0000
+ #define HI556_MODE_STREAMING		0x0100
+@@ -582,7 +595,38 @@
+ 
+ 	/* True if the device has been identified */
+ 	bool identified;
+-};
++
++	/*
++	 * Device-tree platforms only. On ACPI the firmware owns all of this
++	 * and every one of these is NULL/absent, so the power helpers below
++	 * degenerate to no-ops and the ACPI path is unchanged.
++	 */
++	struct clk *xvclk;
++	struct gpio_desc *reset_gpio;
++	struct gpio_desc *powerdown_gpio;
++	struct regulator_bulk_data supplies[HI556_NUM_SUPPLIES];
++};
++
++/*
++ * Power-up ordering and delays from the vendor MediaTek imgsensor driver this
++ * part ships behind on the Planet Gemini PDA
++ * (imgsensor/src/mt6797/camera_hw/kd_camera_hw.c, PowerOnList[] entry
++ * SENSOR_DRVNAME_SP5509_RAW_SLS -- "sp5509" is MediaTek's project name for
++ * this sensor):
++ *
++ *	master clock on
++ *	reset asserted, power-down asserted
++ *	DOVDD 1.8 V, 10 ms
++ *	AVDD  2.8 V, 10 ms
++ *	DVDD  1.21 V, 10 ms
++ *	reset released, 10 ms
++ *	power-down released, 10 ms
++ *
++ * DVDD is 1.21 V rather than the 1.2 V that table asks for: hwpoweron()
++ * rewrites Vol_1200 to Vol_1210 before every _hwPowerOn(DVDD, ...), and the
++ * running vendor stack reads the rail back at 1210000 uV.
++ */
++#define HI556_PWR_STEP_MS		10
+ 
+ static u64 to_pixel_rate(u32 f_index)
+ {
+@@ -1200,8 +1244,31 @@
+ 	}
+ 
+ 	if (mclk != HI556_MCLK) {
+-		dev_err(dev, "external clock %d is not supported", mclk);
+-		return -EINVAL;
++		/*
++		 * The register tables in this driver were written for a
++		 * 19.2 MHz XVCLK, which is what the ACPI platforms it was
++		 * developed on provide. Other boards run this sensor at other
++		 * rates -- MediaTek's own table for it uses 24 MHz -- and the
++		 * PLL dividers in the mode tables are not valid there, so the
++		 * frame timings and the link frequency will be wrong by the
++		 * ratio of the two clocks.
++		 *
++		 * Refuse outright on ACPI, where 19.2 MHz is the only thing
++		 * the firmware ever supplies and a mismatch means the
++		 * description is wrong. On device tree, warn and continue:
++		 * probe, identification and the control interface are all
++		 * valid at any in-spec XVCLK, and refusing here would make an
++		 * otherwise working sensor invisible. Streaming from such a
++		 * board needs mode tables for its own clock.
++		 */
++		if (!dev_of_node(dev)) {
++			dev_err(dev, "external clock %d is not supported", mclk);
++			return -EINVAL;
++		}
++
++		dev_warn(dev,
++			 "external clock is %u Hz, not the %u Hz these mode tables assume: timings and link frequency will be wrong until they are recomputed\n",
++			 mclk, HI556_MCLK);
+ 	}
+ 
+ 	ep = fwnode_graph_get_next_endpoint(fwnode, NULL);
+@@ -1247,6 +1314,10 @@
+ 	return ret;
+ }
+ 
++/* Defined below, next to the device-tree resource handling they belong to. */
++static int hi556_power_on(struct device *dev);
++static int hi556_power_off(struct device *dev);
++
+ static void hi556_remove(struct i2c_client *client)
+ {
+ 	struct v4l2_subdev *sd = i2c_get_clientdata(client);
+@@ -1256,9 +1327,132 @@
+ 	media_entity_cleanup(&sd->entity);
+ 	v4l2_ctrl_handler_free(sd->ctrl_handler);
+ 	pm_runtime_disable(&client->dev);
++	if (!pm_runtime_status_suspended(&client->dev))
++		hi556_power_off(&client->dev);
++	pm_runtime_set_suspended(&client->dev);
+ 	mutex_destroy(&hi556->mutex);
+ }
+ 
++/*
++ * On ACPI the firmware has already done all of this and none of the resources
++ * below are present, so both helpers are no-ops there and the ACPI path keeps
++ * its existing behaviour exactly.
++ */
++static int hi556_power_on(struct device *dev)
++{
++	struct v4l2_subdev *sd = dev_get_drvdata(dev);
++	struct hi556 *hi556 = to_hi556(sd);
++	int ret, i;
++
++	if (hi556->xvclk) {
++		ret = clk_prepare_enable(hi556->xvclk);
++		if (ret) {
++			dev_err(dev, "failed to enable xvclk: %d\n", ret);
++			return ret;
++		}
++	}
++
++	/* Hold the sensor down while the rails come up. */
++	gpiod_set_value_cansleep(hi556->reset_gpio, 1);
++	gpiod_set_value_cansleep(hi556->powerdown_gpio, 1);
++
++	/*
++	 * Enabled one at a time, not with regulator_bulk_enable(): the vendor
++	 * sequence is ordered and spaced, and bulk enable is neither.
++	 */
++	for (i = 0; i < HI556_NUM_SUPPLIES; i++) {
++		if (!hi556->supplies[i].consumer)
++			continue;
++
++		ret = regulator_enable(hi556->supplies[i].consumer);
++		if (ret) {
++			dev_err(dev, "failed to enable %s: %d\n",
++				hi556_supply_names[i], ret);
++			goto err_supplies;
++		}
++		msleep(HI556_PWR_STEP_MS);
++	}
++
++	gpiod_set_value_cansleep(hi556->reset_gpio, 0);
++	msleep(HI556_PWR_STEP_MS);
++	gpiod_set_value_cansleep(hi556->powerdown_gpio, 0);
++	msleep(HI556_PWR_STEP_MS);
++
++	return 0;
++
++err_supplies:
++	while (--i >= 0)
++		if (hi556->supplies[i].consumer)
++			regulator_disable(hi556->supplies[i].consumer);
++	if (hi556->xvclk)
++		clk_disable_unprepare(hi556->xvclk);
++	return ret;
++}
++
++static int hi556_power_off(struct device *dev)
++{
++	struct v4l2_subdev *sd = dev_get_drvdata(dev);
++	struct hi556 *hi556 = to_hi556(sd);
++	int i;
++
++	gpiod_set_value_cansleep(hi556->powerdown_gpio, 1);
++	gpiod_set_value_cansleep(hi556->reset_gpio, 1);
++
++	for (i = HI556_NUM_SUPPLIES - 1; i >= 0; i--)
++		if (hi556->supplies[i].consumer)
++			regulator_disable(hi556->supplies[i].consumer);
++
++	if (hi556->xvclk)
++		clk_disable_unprepare(hi556->xvclk);
++
++	return 0;
++}
++
++/*
++ * Device-tree resources. All optional, because the ACPI platforms this driver
++ * was written for supply none of them.
++ */
++static int hi556_get_dt_resources(struct hi556 *hi556, struct device *dev)
++{
++	unsigned long rate;
++	int i;
++
++	if (!dev_of_node(dev))
++		return 0;
++
++	hi556->xvclk = devm_clk_get_optional(dev, NULL);
++	if (IS_ERR(hi556->xvclk))
++		return dev_err_probe(dev, PTR_ERR(hi556->xvclk),
++				     "failed to get xvclk\n");
++
++	if (hi556->xvclk) {
++		rate = clk_get_rate(hi556->xvclk);
++		if (rate)
++			dev_dbg(dev, "xvclk runs at %lu Hz\n", rate);
++	}
++
++	/*
++	 * Both lines are asserted low in hardware; the DT flags say so, and
++	 * a logical 1 here means "held in reset" / "powered down".
++	 */
++	hi556->reset_gpio = devm_gpiod_get_optional(dev, "reset", GPIOD_OUT_HIGH);
++	if (IS_ERR(hi556->reset_gpio))
++		return dev_err_probe(dev, PTR_ERR(hi556->reset_gpio),
++				     "failed to get reset-gpios\n");
++
++	hi556->powerdown_gpio = devm_gpiod_get_optional(dev, "powerdown",
++						       GPIOD_OUT_HIGH);
++	if (IS_ERR(hi556->powerdown_gpio))
++		return dev_err_probe(dev, PTR_ERR(hi556->powerdown_gpio),
++				     "failed to get powerdown-gpios\n");
++
++	for (i = 0; i < HI556_NUM_SUPPLIES; i++)
++		hi556->supplies[i].supply = hi556_supply_names[i];
++
++	return devm_regulator_bulk_get(dev, HI556_NUM_SUPPLIES,
++				       hi556->supplies);
++}
++
+ static int hi556_probe(struct i2c_client *client)
+ {
+ 	struct hi556 *hi556;
+@@ -1278,12 +1472,26 @@
+ 
+ 	v4l2_i2c_subdev_init(&hi556->sd, client, &hi556_subdev_ops);
+ 
+-	full_power = acpi_dev_state_d0(&client->dev);
++	ret = hi556_get_dt_resources(hi556, &client->dev);
++	if (ret)
++		return ret;
++
++	/*
++	 * On ACPI the firmware decides whether the device is already powered;
++	 * on DT nothing else will power it, so this driver always does.
++	 */
++	full_power = !dev_of_node(&client->dev) ?
++		     acpi_dev_state_d0(&client->dev) : true;
++
+ 	if (full_power) {
++		ret = hi556_power_on(&client->dev);
++		if (ret)
++			return ret;
++
+ 		ret = hi556_identify_module(hi556);
+ 		if (ret) {
+ 			dev_err(&client->dev, "failed to find sensor: %d", ret);
+-			return ret;
++			goto probe_error_power_off;
+ 		}
+ 	}
+ 
+@@ -1328,12 +1536,23 @@
+ 	v4l2_ctrl_handler_free(hi556->sd.ctrl_handler);
+ 	mutex_destroy(&hi556->mutex);
+ 
++probe_error_power_off:
++	if (full_power)
++		hi556_power_off(&client->dev);
++
+ 	return ret;
+ }
+ 
+ static const struct dev_pm_ops hi556_pm_ops = {
+ 	SET_SYSTEM_SLEEP_PM_OPS(hi556_suspend, hi556_resume)
++	SET_RUNTIME_PM_OPS(hi556_power_off, hi556_power_on, NULL)
++};
++
++static const struct of_device_id hi556_of_match[] = {
++	{ .compatible = "hynix,hi556" },
++	{ }
+ };
++MODULE_DEVICE_TABLE(of, hi556_of_match);
+ 
+ #ifdef CONFIG_ACPI
+ static const struct acpi_device_id hi556_acpi_ids[] = {
+@@ -1349,6 +1568,7 @@
+ 		.name = "hi556",
+ 		.pm = &hi556_pm_ops,
+ 		.acpi_match_table = ACPI_PTR(hi556_acpi_ids),
++		.of_match_table = hi556_of_match,
+ 	},
+ 	.probe = hi556_probe,
+ 	.remove = hi556_remove,

@@ -174,7 +174,7 @@ diff --git a/drivers/misc/gemini-camera-power.c b/drivers/misc/gemini-camera-pow
 new file mode 100644
 --- /dev/null
 +++ b/drivers/misc/gemini-camera-power.c
-@@ -0,0 +1,672 @@
+@@ -0,0 +1,679 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Gemini PDA camera bring-up power controller.
@@ -687,14 +687,21 @@ new file mode 100644
 +	s->name = name;
 +	s->seninf = seninf;
 +
++	/*
++	 * Optional, and increasingly absent: once a socket has a real sensor
++	 * subdev its reset and power-down lines belong on the sensor's own
++	 * node, where V4L2 can see them, and they disappear from here. The
++	 * sub socket went that way with #64. gpiod_set_value() tolerates a
++	 * NULL descriptor, so the sequence below needs no other change.
++	 */
 +	scnprintf(prop, sizeof(prop), "%s-reset", name);
-+	s->reset = devm_gpiod_get(cam->dev, prop, GPIOD_OUT_HIGH);
++	s->reset = devm_gpiod_get_optional(cam->dev, prop, GPIOD_OUT_HIGH);
 +	if (IS_ERR(s->reset))
 +		return dev_err_probe(cam->dev, PTR_ERR(s->reset),
 +				     "%s-reset-gpios\n", name);
 +
 +	scnprintf(prop, sizeof(prop), "%s-powerdown", name);
-+	s->powerdown = devm_gpiod_get(cam->dev, prop, GPIOD_OUT_HIGH);
++	s->powerdown = devm_gpiod_get_optional(cam->dev, prop, GPIOD_OUT_HIGH);
 +	if (IS_ERR(s->powerdown))
 +		return dev_err_probe(cam->dev, PTR_ERR(s->powerdown),
 +				     "%s-powerdown-gpios\n", name);

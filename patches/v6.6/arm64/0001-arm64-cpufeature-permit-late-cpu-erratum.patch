@@ -1,0 +1,124 @@
+From: Gemini PDA Linux bring-up
+Subject: [PATCH] arm64: cpufeature: permit a late CPU's local erratum instead of killing it
+
+MT6797 is 4x Cortex-A53 + 4x Cortex-A53 + 2x Cortex-A72, and the A72s cannot be
+brought up during boot: their cluster is fed by an external buck on i2c6, which
+is not probed during early SMP bring-up. They are hotplugged later instead (the
+vendor kernel does the same), which makes every A72 a *late* CPU.
+
+A late CPU carrying a capability the system does not have is fatal for
+ARM64_CPUCAP_LOCAL_CPU_ERRATUM, which is OPTIONAL but not PERMITTED for late
+CPUs. The system capability set is computed from the A53s alone, and the A72
+brings Spectre-v2/v3a/v4/BHB plus errata 1742098 and 1319367, so
+verify_local_cpu_caps() cpu_die_early()s every one of them:
+
+  CPU8: Detected conflict for capability 58 (Spectre-v2), System: 0, CPU: 1
+  CPU8: will not boot
+
+Permit the erratum on the late CPU, but do NOT enable it and do not touch
+system_cpucaps. Enabling this late is not merely useless but harmful: the
+capability's alternatives were patched during boot for a system that did not
+have it, so cpu_enable() installs half a mitigation. Concretely,
+spectre_bhb_enable_mitigation() points the CPU's VBAR_EL1 at a BHB vector table
+whose alternatives are still NOPs; update_mitigation_state() already WARNs that
+it cannot advance the state after system_capabilities_finalized().
+
+Measured on MT6797: with cpu_enable() called, an A72 survives indefinitely while
+only kernel threads run on it (1.19e9 idle-poll iterations and ~9500 interrupts
+over 20s with userspace confined to the A53s) and dies within ~280ms of the
+scheduler placing the first userspace task on it -- i.e. at the first exception
+taken from EL0 through those vectors.
+
+The cost is that such a core runs unmitigated, exactly as "nospectre_v2" would
+leave it. That is the same trade the command line already offers, and it is the
+difference between a usable CPU and one that hangs the machine.
+
+Features are unaffected: only errata are permitted, because a missing feature
+changes what userspace is told it may execute.
+
+---
+--- a/arch/arm64/kernel/cpufeature.c
++++ b/arch/arm64/kernel/cpufeature.c
+@@ -3100,11 +3100,78 @@
+ 				caps->cpu_enable(caps);
+ 		} else {
+ 			/*
+-			 * Check if the CPU has this capability if it isn't
+-			 * safe to have when the system doesn't.
++			 * MT6797 (Gemini PDA): adopt a late CPU's local erratum
++			 * rather than killing the CPU.
++			 *
++			 * This SoC is 4x Cortex-A53 + 4x Cortex-A53 + 2x
++			 * Cortex-A72, and the A72s cannot be brought up during
++			 * boot: their cluster needs an external buck enabled
++			 * over i2c and an ARMCAXPLL2 programmed to 750 MHz
++			 * before ATF's CPU_ON will complete, none of which is
++			 * available that early, so they are hotplugged later
++			 * (the vendor kernel does the same). That makes every
++			 * A72 a *late* CPU, and it carries errata the A53 boot
++			 * CPUs do not: Spectre-v2/v3a/v4/BHB, 1742098 and
++			 * 1319367. The system capability set is finalised from
++			 * the A53s alone, so verify_local_cpu_caps() takes this
++			 * branch and cpu_die_early()s every A72:
++			 *
++			 *   CPU8: Detected conflict for capability 58
++			 *         (Spectre-v2), System: 0, CPU: 1
++			 *   CPU8: will not boot
++			 *
++			 * For a LOCAL_CPU_ERRATUM the safe resolution is to
++			 * turn the capability on system-wide and let this CPU
++			 * enable it, which is strictly more mitigation than
++			 * refusing to boot the core. Alternatives patched at
++			 * boot are not revisited, so the A53s are unaffected;
++			 * the A72 gets the cap's own cpu_enable().
++			 *
++			 * Only errata are adopted. A missing *feature* still
++			 * kills the CPU, because features change what userspace
++			 * is told it may execute.
+ 			 */
+-			if (cpu_has_cap && !cpucap_late_cpu_permitted(caps))
+-				break;
++			if (cpu_has_cap && !cpucap_late_cpu_permitted(caps)) {
++				if (!(caps->type & ARM64_CPUCAP_OPTIONAL_FOR_LATE_CPU))
++					break;
++
++				/*
++				 * Permit it, but do NOT enable it, and do not
++				 * touch system_cpucaps.
++				 *
++				 * Enabling is not possible this late and is
++				 * actively harmful. The capability's
++				 * alternatives were patched during boot for a
++				 * system that did not have it, so cpu_enable()
++				 * installs half a mitigation:
++				 * spectre_bhb_enable_mitigation() points this
++				 * CPU's VBAR_EL1 at a BHB vector table whose
++				 * alternatives are still NOPs, and
++				 * update_mitigation_state() already WARNs that
++				 * it cannot advance the state after
++				 * system_capabilities_finalized().
++				 *
++				 * Measured on this SoC (2026-08-23): with
++				 * cpu_enable() called, an A72 survives
++				 * indefinitely while only kernel threads run on
++				 * it — 1.19e9 idle-poll iterations and ~9500
++				 * interrupts over 20 s with userspace confined
++				 * to the A53s — and dies within ~280 ms of the
++				 * scheduler placing the first *userspace* task
++				 * on it, i.e. at the first exception taken from
++				 * EL0 through those vectors.
++				 *
++				 * The cost of permitting without enabling is
++				 * that this core runs unmitigated, exactly as
++				 * "nospectre_v2" would leave it. That is the
++				 * same trade the command line already offers,
++				 * and it is the difference between a usable CPU
++				 * and one that hangs the machine.
++				 */
++				pr_info_once("CPU%d: permitting capability %d (%s) on a late CPU without enabling it\n",
++					     smp_processor_id(), caps->capability,
++					     caps->desc ? caps->desc : "unnamed");
++			}
+ 		}
+ 	}
+ 

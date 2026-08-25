@@ -1,0 +1,686 @@
+From: Gemini PDA Linux bring-up
+Subject: [PATCH] soc: mediatek: bring up MT6797's Cortex-A72 cluster
+
+MT6797's two Cortex-A72 cores (cpu8, cpu9) sit behind a power domain fed by an
+external DA9214 buck on i2c6, and the firmware refuses to power the cluster
+unless that rail, the cluster PLL and an SRAM LDO are all set up before PSCI
+CPU_ON. Nothing in mainline does any of it, so onlining cpu8 returns -EIO at
+best and hangs the caller inside the secure monitor at worst.
+
+The vendor kernel does this work in cpu_psci_cpu_boot(); do the same from a
+CPUHP_BP_PREPARE_DYN callback. With this, cpu8 and cpu9 online through plain
+sysfs hotplug and behave as ordinary CPUs.
+
+Once the first core is up, the cluster is retuned from the firmware-gate
+750 MHz to 2002 MHz through the firmware's own BIGIDVFSPLLSETFREQ call (the
+MCUMIXED CON1 interface is dead at runtime: writes stick in the register and
+the PLL ignores them). 2002 MHz measures 2.9x the bring-up value and 1.66x the
+fastest A53 single-thread, with ~180 mV margin under the 1180 mV rail; the
+silicon's rated 2496 MHz measured stable and is reachable at runtime through
+/sys/kernel/mt6797_a72/freq_mhz. Vsram is raised to Android's upper-bin 1.20 V
+before any clock past 1 GHz.
+
+Details that are load-bearing and commented in the driver: touch no hardware
+at init (a power-controller poke while the machine boots latches a failure for
+the whole boot); leave the frequency meter holding a true source-36 reading
+(CLK26CALI_1 latches the previous run; the firmware's check is single-shot);
+free the CSPM semaphore (the firmware polls it unbounded); first core only
+(retuning the PLL under a running core hangs it — hence the backup-mux dance
+for runtime retunes); never pre-power the cluster (the firmware's power-up
+transition is what withdraws the interconnect's pwrdnack).
+
+The prepare callback also reads the cluster power controller at rest and
+refuses to proceed when it is in a bad latched state (a per-boot condition
+that no retry clears, and on which CPU_ON would spin forever at EL3). The
+refusal surfaces as a failed sysfs write instead of a wedged machine, which is
+what makes unattended onlining safe to automate.
+
+---
+--- /dev/null
++++ b/drivers/soc/mediatek/mt6797-a72.c
+@@ -0,0 +1,608 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * MT6797 (Planet Computers Gemini PDA) — bring the Cortex-A72 cluster online.
++ *
++ * This SoC is 4x Cortex-A53 + 4x Cortex-A53 + 2x Cortex-A72. The A53s boot
++ * normally. The A72s (cpu8, cpu9) cannot: their cluster sits behind a separate
++ * power domain fed by an *external* buck on i2c6 (Dialog DA9214 BUCKB), and
++ * the firmware refuses to power it up unless several things are already true
++ * before PSCI CPU_ON is issued. Nothing in mainline knows to do any of that, so
++ * `echo 1 > /sys/devices/system/cpu/cpu8/online` returns -EIO at best and hangs
++ * the caller inside the secure monitor at worst.
++ *
++ * The vendor kernel solves this in cpu_psci_cpu_boot() (arch/arm64/kernel/psci.c
++ * in the 3.18 tree), which runs a cpu_power_on_buck() prologue for cpu8/9 before
++ * calling PSCI. We do the same work, but from a CPUHP_BP_PREPARE_DYN callback:
++ * that runs on the controlling CPU immediately before bringup_cpu(), which is
++ * exactly the vendor's insertion point, and needs no change to generic code.
++ *
++ * The sequence, and why each step is here:
++ *
++ *   1. MP2_CPUSYS_PWR_CON |= PWR_RST_B, and a dummy read of the iDVFS block.
++ *      Both are the vendor's, in that order.
++ *   2. Enable VPROC2 (DA9214 BUCKB) at 1180 mV. This is the A72 cluster's
++ *      supply; without it the cluster cannot be powered at all. Done once at
++ *      probe rather than per-hotplug so the rail has already settled.
++ *   3. Hold the PMIC wrapper's SPI controller in reset across the external-buck
++ *      isolation change (WDT_SWSYSRST bit 11, key 0x88), then release it. The
++ *      vendor brackets the isolation change this way; it is an interlock, not a
++ *      cluster reset — WDT_SWSYSRST has no big-cluster reset bit.
++ *   4. Clear CPU_EXT_BUCK_ISO, then set the big cluster's SRAM LDO to 1.10 V
++ *      through the firmware's own SIP call.
++ *   5. Program ARMCAXPLL2 to 750 MHz. The firmware measures the cluster clock
++ *      with its own frequency meter and spins forever unless it reads
++ *      742500..757500 kHz. This is a real clock change, not a trick: the meter
++ *      reads 749988 kHz afterwards.
++ *
++ * Deliberately NOT done: powering the MP2 CPUTOP ourselves. Doing so makes the
++ * firmware's own PWR_ON a no-op, so the cluster's power controller never runs
++ * its power-up *transition* — and the interconnect handshake that withdraws
++ * MP2's pwrdnack is part of that transition. Pre-powering the cluster is what
++ * made every earlier attempt hang forever on INFRA_TOPAXI_PROTEXTSTA3 bit 10.
++ * Leave the cluster alone and let the firmware raise it.
++ *
++ * Both cores work as ordinary CPUs once up: they run userspace, idle in WFI and
++ * wake from it, and take interrupts normally.
++ */
++
++#define pr_fmt(fmt) "mt6797-a72: " fmt
++
++#include <linux/arm-smccc.h>
++#include <linux/cpu.h>
++#include <linux/cpuhotplug.h>
++#include <linux/delay.h>
++#include <linux/i2c.h>
++#include <linux/io.h>
++#include <linux/math64.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/sysfs.h>
++#include <linux/kobject.h>
++
++/* System Power Manager: the SoC-internal power switches. */
++#define SPM_PHYS		0x10006000
++#define SPM_SIZE		0x1000
++#define SPM_POWERON_CONFIG_EN	0x000
++#define SPM_KEY			0x0b160001
++#define MP2_CPUSYS_PWR_CON	0x218
++#define CPU_EXT_BUCK_ISO	0x290
++#define PWR_RST_B		BIT(0)
++
++/* MCUMIXED: the big cluster's PLL. */
++#define MCUMIXED_PHYS		0x1001a000
++#define MCUMIXED_SIZE		0x1000
++#define ARMCAXPLL2_CON1		0x224
++#define ARMCAXPLL2_SHADOW	0x268
++
++/* Reset generation unit: only bit 11 of WDT_SWSYSRST is touched. */
++#define RGU_PHYS		0x10007000
++#define RGU_SIZE		0x100
++#define WDT_SWSYSRST		0x018
++#define WDT_SWSYSRST_KEY	0x88000000
++#define WDT_PWRAP_SPI_CTL_RST	0x800
++
++/* DA9214 on i2c6 (adapter 2). Code to volts: mV = 300 + code * 10. */
++#define DA9214_ADDR		0x68
++#define DA9214_PAGE_CON		0x00
++#define DA9214_BUCKB_CONT	0x5e
++#define DA9214_VBUCKB_A		0xd9
++#define VPROC2_MV		1180
++
++/*
++ * CSPM. The firmware takes this hardware semaphore around its own accesses to
++ * the cluster clock dividers, and polls for it WITHOUT A BOUND. If anything
++ * left it held, PSCI CPU_ON never returns and the calling CPU is stuck at EL3
++ * — which is indistinguishable from the cluster failing to power up.
++ */
++#define CSPM_PHYS		0x11015000
++#define CSPM_SIZE		0x1000
++#define CSPM_POWERON_CONFIG	0x000
++#define CSPM_KEY		0x0b160001
++#define CSPM_SEMA		0x448
++
++/*
++ * TOPCKGEN's frequency meter, and the reason we have to use it.
++ *
++ * The firmware measures the cluster clock here before it will power the
++ * cluster, and CLK26CALI_1 on this silicon latches the *previous* run's count:
++ * a single-shot read returns whatever was measured last. The firmware's own
++ * routine is single-shot, so it consumes whatever we leave behind. Leaving a
++ * stale count there sends it into a retry loop that has no bound, and PSCI
++ * CPU_ON never returns.
++ *
++ * So take one real measurement of source 37 (the A72 cluster clock) after
++ * programming the PLL. This is not a trick: the value left latched is the true
++ * current frequency, which is why it has to happen after mt6797_a72_set_clk().
++ */
++#define TOPCKGEN_PHYS		0x10000000
++#define TOPCKGEN_SIZE		0x1000
++#define CLK_DBG_CFG		0x10c
++#define CLK_MISC_CFG_0		0x104
++#define CLK26CALI_0		0x220
++#define CLK26CALI_1		0x224
++/*
++ * Source 36 is ARMCAXPLL2's raw output; source 37 is the cluster clock fed
++ * from it. Measure 36: source 37 reads 0 while the cluster is still unpowered
++ * and its clock gated, which is exactly the state we are in here — the whole
++ * point is that the firmware has not raised the cluster yet. 36 reports the
++ * PLL we just programmed, which is the clock the cluster will run on the
++ * instant the firmware ungates it.
++ */
++#define ABIST_SRC_ARMCAXPLL2	36
++
++/* Firmware SIP calls into the iDVFS block. */
++#define SIP_IDVFS_SRAMLDOSET	0xC20003BFU
++#define SIP_IDVFS_PLLSETFREQ	0xC20003B8U
++
++/* TOPCKGEN's backup-mux exposure bits, used while the big PLL is retuned. */
++#define ARMPLLDIV_MUXSEL	0x270
++#define SIP_MCUSYS_READ		0xC200035FU
++#define SPMC_CPUTOP		0x102222a0
++
++#define A72_CLK_KHZ		750000
++#define MPIDR_CLUSTER_A72	2
++
++/*
++ * Where the cluster runs once it is up.
++ *
++ * The firmware's power-on gate demands ~750 MHz, so CPU_ON always happens
++ * there; afterwards the PLL is retuned through the firmware's own
++ * BIGIDVFSPLLSETFREQ call. 2002 MHz is the default: measured 2.9x the 750 MHz
++ * bring-up value and 1.66x the fastest A53 single-thread, while keeping
++ * ~180 mV of margin under the 1180 mV rail (Android runs ~1.0 V here) and a
++ * sustained power level this heatsink-less, thermal-sensor-less board can
++ * take (blockers.md B-47). The silicon is rated to 2.6 GHz; 2496 measured
++ * stable and bit-exact, and is available at runtime through
++ * /sys/kernel/mt6797_a72/freq_mhz for bursts the user wants to pay for.
++ *
++ * Vsram goes to Android's upper-bin 1.20 V before any raise past 1 GHz.
++ */
++#define A72_RUN_MHZ_DEFAULT	2002
++#define A72_VSRAM_X100MV	120000
++
++/*
++ * Scheduler capacities, from the gbench scorecards (04-docs/bench/): serial
++ * integer throughput per core at each cluster's ceiling, normalised to the
++ * A72 at its default clock. With these set, the capacity-asymmetry pass marks
++ * the domains SD_ASYM_CPUCAPACITY and misfit migration moves long-running
++ * work onto the big cores — which is what turns a faster core into a faster
++ * *machine* for unpinned tasks.
++ */
++/* Scheduler capacities (608/617/1024) are in the DT — see mt6797.dtsi. */
++
++static void __iomem *spm_base, *mcumixed_base, *rgu_base, *cspm_base;
++static void __iomem *topckgen_base;
++static bool a72_ready;
++static bool vproc2_on;
++
++static int da9214_write(struct i2c_adapter *ad, u8 reg, u8 val)
++{
++	union i2c_smbus_data d = { .byte = val };
++
++	return i2c_smbus_xfer(ad, DA9214_ADDR, 0, I2C_SMBUS_WRITE, reg,
++			      I2C_SMBUS_BYTE_DATA, &d);
++}
++
++static int da9214_read(struct i2c_adapter *ad, u8 reg)
++{
++	union i2c_smbus_data d;
++	int r = i2c_smbus_xfer(ad, DA9214_ADDR, 0, I2C_SMBUS_READ, reg,
++			       I2C_SMBUS_BYTE_DATA, &d);
++
++	return r ? r : d.byte;
++}
++
++/*
++ * Bring up VPROC2, the A72 cluster's external supply, and verify it by reading
++ * the chip back. The regulator framework caches what it last asked for and will
++ * report that even when the part disagreed, so the readback matters.
++ */
++static int mt6797_a72_enable_vproc2(void)
++{
++	struct i2c_adapter *ad = i2c_get_adapter(2);
++	u8 code = (VPROC2_MV - 300) / 10;
++	int r, cont;
++
++	if (!ad) {
++		pr_err("i2c6 adapter not available; cannot enable VPROC2\n");
++		return -ENODEV;
++	}
++
++	r = da9214_write(ad, DA9214_PAGE_CON, 0);
++	if (!r)
++		r = da9214_write(ad, DA9214_VBUCKB_A, code | 0x80);
++	if (!r)
++		r = da9214_write(ad, DA9214_BUCKB_CONT, 0x1);
++	if (r) {
++		pr_err("DA9214 access failed (%d); cannot enable VPROC2\n", r);
++		i2c_put_adapter(ad);
++		return r;
++	}
++
++	msleep(20);
++	cont = da9214_read(ad, DA9214_BUCKB_CONT);
++	i2c_put_adapter(ad);
++
++	if (cont < 0 || !(cont & 1)) {
++		pr_err("VPROC2 did not come up (BUCKB_CONT=0x%02x)\n", cont);
++		return -EIO;
++	}
++
++	pr_info("VPROC2 enabled at %d mV\n", VPROC2_MV);
++	return 0;
++}
++
++/*
++ * The firmware measures this clock and will not proceed unless it reads
++ * 742500..757500 kHz. CON1 bit 31 is the PCW-change trigger and self-clears
++ * once latched; the shadow register is what the hardware DVFS path reloads
++ * from, so both are written.
++ */
++static void mt6797_a72_set_clk(void)
++{
++	u32 con1 = readl(mcumixed_base + ARMCAXPLL2_CON1);
++	unsigned int posdiv = (con1 >> 24) & 7;
++	u32 pcw = (u32)div_u64((u64)A72_CLK_KHZ << (14 + posdiv), 26000);
++
++	writel(pcw & 0x3fffff, mcumixed_base + ARMCAXPLL2_SHADOW);
++	writel((con1 & ~0x3fffffu) | (pcw & 0x3fffff) | BIT(31),
++	       mcumixed_base + ARMCAXPLL2_CON1);
++	udelay(200);
++}
++
++static unsigned int mt6797_a72_meter_once(void)
++{
++	u32 dbg, misc;
++	int i;
++
++	dbg = readl(topckgen_base + CLK_DBG_CFG);
++	writel((dbg & 0xffc0fffc) | (ABIST_SRC_ARMCAXPLL2 << 16),
++	       topckgen_base + CLK_DBG_CFG);
++	misc = readl(topckgen_base + CLK_MISC_CFG_0);
++	writel((misc & 0x00ffffff) | 0x01000000, topckgen_base + CLK_MISC_CFG_0);
++
++	writel(0x1000, topckgen_base + CLK26CALI_0);
++	writel(0x1010, topckgen_base + CLK26CALI_0);
++	for (i = 0; i < 100; i++) {
++		if (!(readl(topckgen_base + CLK26CALI_0) & 0x10))
++			break;
++		udelay(1);
++	}
++	return (readl(topckgen_base + CLK26CALI_1) & 0xffff) * 26000 / 1024 * 2;
++}
++
++/*
++ * The register half of the vendor's cpu_power_on_buck(), run twice.
++ *
++ * Once at init and once again immediately before CPU_ON, which is what the
++ * bring-up tool does and the only arrangement observed to work: the tool runs
++ * its stage 1 (this sequence), waits, then repeats the whole thing before
++ * issuing the SMC. Applying it only once, immediately before CPU_ON, leaves
++ * the cluster's power controller failing to acknowledge and the firmware
++ * spinning at EL3 — and that failure latches for the rest of the boot, so it
++ * is not something a later retry can recover.
++ */
++static unsigned int mt6797_a72_apply_prereqs(void)
++{
++	struct arm_smccc_res res;
++	unsigned int khz;
++	u32 w;
++
++	writel(SPM_KEY, spm_base + SPM_POWERON_CONFIG_EN);
++	writel(readl(spm_base + MP2_CPUSYS_PWR_CON) | PWR_RST_B,
++	       spm_base + MP2_CPUSYS_PWR_CON);
++
++	/* The vendor's dummy read of the iDVFS block, kept in its place. */
++	arm_smccc_smc(SIP_MCUSYS_READ, 0x102224a0, 0, 0, 0, 0, 0, 0, &res);
++
++	w = readl(rgu_base + WDT_SWSYSRST);
++	writel(w | WDT_SWSYSRST_KEY | WDT_PWRAP_SPI_CTL_RST,
++	       rgu_base + WDT_SWSYSRST);
++
++	writel(readl(spm_base + CPU_EXT_BUCK_ISO) & ~0x3u,
++	       spm_base + CPU_EXT_BUCK_ISO);
++
++	w = readl(rgu_base + WDT_SWSYSRST);
++	writel((w & ~(u32)WDT_PWRAP_SPI_CTL_RST) | WDT_SWSYSRST_KEY,
++	       rgu_base + WDT_SWSYSRST);
++
++	udelay(240);
++	arm_smccc_smc(SIP_IDVFS_SRAMLDOSET, 110000, 0, 0, 0, 0, 0, 0, &res);
++	udelay(240);
++
++	mt6797_a72_set_clk();
++
++	/*
++	 * Two measurements: the first flushes whatever stale count was latched,
++	 * the second leaves a fresh, true reading for the firmware to consume.
++	 */
++	mt6797_a72_meter_once();
++	khz = mt6797_a72_meter_once();
++	if (khz < 742500 || khz > 757500)
++		pr_warn("cluster clock measures %u kHz, outside the firmware's %u..%u window; CPU_ON may not return\n",
++			khz, 742500, 757500);
++
++	/* Hand the semaphore back if anything is still holding it. */
++	writel(CSPM_KEY, cspm_base + CSPM_POWERON_CONFIG);
++	w = readl(cspm_base + CSPM_SEMA);
++	if (w & 1) {
++		writel(1, cspm_base + CSPM_SEMA);
++		pr_info("released a held CSPM semaphore (%08x -> %08x)\n",
++			w, readl(cspm_base + CSPM_SEMA));
++	}
++
++	return khz;
++}
++
++static void a72_raise_fn(struct work_struct *w);
++static DECLARE_WORK(a72_raise_work, a72_raise_fn);
++
++static DEFINE_MUTEX(a72_freq_lock);
++static unsigned int a72_cur_mhz = A72_CLK_KHZ / 1000;
++static bool a72_vsram_high;
++
++/*
++ * Retune the running cluster's PLL the vendor's way. The MCUMIXED CON1/shadow
++ * interface goes dead once the cluster is up (writes stick in the register,
++ * the PLL ignores them — measured, the abist meter disagreed with the
++ * readback), so this uses the firmware's BIGIDVFSPLLSETFREQ call, whose EL3
++ * implementation disables the PLL mid-change. The cluster must therefore sit
++ * on the backup mux while it happens — the same MAINPLL-backup dance the
++ * vendor's adjust_armpll_dds() does, under the CSPM hardware semaphore that
++ * ATF itself takes around ARMPLLDIV.
++ */
++static int mt6797_a72_retune(unsigned int mhz)
++{
++	struct arm_smccc_res res;
++	u32 mux, misc;
++	bool sema = false;
++	int i, ret = 0;
++
++	if (mhz < 750 || mhz > 2600)
++		return -EINVAL;
++
++	mutex_lock(&a72_freq_lock);
++	cpus_read_lock();
++	if (!cpu_online(8) && !cpu_online(9)) {
++		ret = -ENODEV;	/* the firmware call needs the cluster powered */
++		goto out;
++	}
++
++	if (mhz > 1001 && !a72_vsram_high) {
++		arm_smccc_smc(SIP_IDVFS_SRAMLDOSET, A72_VSRAM_X100MV,
++			      0, 0, 0, 0, 0, 0, &res);
++		udelay(240);
++		a72_vsram_high = true;
++	}
++
++	writel(CSPM_KEY, cspm_base + CSPM_POWERON_CONFIG);
++	for (i = 0; i < 200; i++) {
++		writel(1, cspm_base + CSPM_SEMA);
++		if (readl(cspm_base + CSPM_SEMA) & 1) {
++			sema = true;
++			break;
++		}
++		udelay(10);
++	}
++	if (!sema) {
++		pr_err("CSPM semaphore not granted; leaving the clock alone\n");
++		ret = -EBUSY;
++		goto out;
++	}
++
++	misc = readl(topckgen_base + CLK_MISC_CFG_0);
++	mux = readl(mcumixed_base + ARMPLLDIV_MUXSEL);
++
++	writel(misc | (3u << 4), topckgen_base + CLK_MISC_CFG_0);
++	writel((mux & ~3u) | 2u, mcumixed_base + ARMPLLDIV_MUXSEL);
++	udelay(2);
++
++	arm_smccc_smc(SIP_IDVFS_PLLSETFREQ, mhz, 0, 0, 0, 0, 0, 0, &res);
++
++	writel((readl(mcumixed_base + ARMPLLDIV_MUXSEL) & ~3u) | 1u,
++	       mcumixed_base + ARMPLLDIV_MUXSEL);
++	writel(readl(topckgen_base + CLK_MISC_CFG_0) & ~(3u << 4),
++	       topckgen_base + CLK_MISC_CFG_0);
++
++	writel(1, cspm_base + CSPM_SEMA);
++
++	if (res.a0) {
++		pr_err("BIGIDVFSPLLSETFREQ(%u) failed (%ld)\n", mhz, (long)res.a0);
++		ret = -EIO;
++	} else {
++		a72_cur_mhz = mhz;
++		pr_info("A72 cluster now %u MHz\n", mhz);
++	}
++out:
++	cpus_read_unlock();
++	mutex_unlock(&a72_freq_lock);
++	return ret;
++}
++
++/* Runs ON the A72, at the tail of its own bring-up. */
++static int mt6797_a72_online(unsigned int cpu)
++{
++	if (MPIDR_AFFINITY_LEVEL(cpu_logical_map(cpu), 1) != MPIDR_CLUSTER_A72)
++		return 0;
++	if (a72_cur_mhz < A72_RUN_MHZ_DEFAULT)
++		schedule_work(&a72_raise_work);
++	return 0;
++}
++
++static void a72_raise_fn(struct work_struct *w)
++{
++	mt6797_a72_retune(A72_RUN_MHZ_DEFAULT);
++}
++
++static ssize_t freq_mhz_show(struct kobject *k, struct kobj_attribute *a, char *b)
++{
++	return sysfs_emit(b, "%u\n", a72_cur_mhz);
++}
++
++static ssize_t freq_mhz_store(struct kobject *k, struct kobj_attribute *a,
++			      const char *b, size_t n)
++{
++	unsigned int mhz;
++	int ret;
++
++	if (kstrtouint(b, 0, &mhz))
++		return -EINVAL;
++	ret = mt6797_a72_retune(mhz);
++	return ret ? ret : n;
++}
++
++static struct kobj_attribute a72_freq_attr = __ATTR_RW(freq_mhz);
++
++/* Runs on the controlling CPU, immediately before the target is brought up. */
++static int mt6797_a72_prepare(unsigned int cpu)
++{
++	struct arm_smccc_res res;
++	unsigned int khz;
++	int other;
++
++	if (!a72_ready)
++		return 0;
++	if (MPIDR_AFFINITY_LEVEL(cpu_logical_map(cpu), 1) != MPIDR_CLUSTER_A72)
++		return 0;
++
++	/*
++	 * Only the first core of the cluster needs any of this, and the second
++	 * one must NOT get it: the sequence reprograms ARMCAXPLL2 with its
++	 * change-trigger bit, and that PLL is what the already-running core is
++	 * executing on. Redoing it for cpu9 hangs cpu8. The firmware likewise
++	 * skips its own cluster power-up once the cluster is up, and goes
++	 * straight to the core.
++	 */
++	for_each_online_cpu(other) {
++		if (other != cpu &&
++		    MPIDR_AFFINITY_LEVEL(cpu_logical_map(other), 1) ==
++		    MPIDR_CLUSTER_A72) {
++			pr_info("cpu%u: cluster already up (cpu%u); nothing to do\n",
++				cpu, other);
++			return 0;
++		}
++	}
++
++	if (!vproc2_on) {
++		int r = mt6797_a72_enable_vproc2();
++
++		if (r) {
++			pr_err("cpu%u: VPROC2 unavailable (%d); refusing\n", cpu, r);
++			return r;
++		}
++		vproc2_on = true;
++		/* Let the rail settle before the cluster is asked to use it. */
++		msleep(1000);
++	}
++
++	khz = mt6797_a72_apply_prereqs();
++	a72_cur_mhz = A72_CLK_KHZ / 1000;	/* the prereqs park the PLL at 750 */
++
++	/*
++	 * The cluster power controller's state before anything asks it to run —
++	 * and the gate that makes unattended onlining safe.
++	 *
++	 * The controller's at-rest value is a per-boot property: most boots read
++	 * 0x004x0100 (FSM_STATE_OUT, bits [27:23], == FSM_OFF with all-off
++	 * acked), but some come up latched in a bad state (0x04500100 and
++	 * friends), and on those the failure holds for the entire boot — the
++	 * firmware's own retry does not clear it, and a CPU_ON issued anyway
++	 * spins forever at EL3, taking the calling CPU with it. Nothing can be
++	 * read back from a core lost that way; the only winning move is not to
++	 * issue the call. Refusing here aborts the hotplug cleanly (the sysfs
++	 * write returns an error) and costs nothing: everything this callback
++	 * did is idempotent, and the next boot gets a fresh roll.
++	 */
++	arm_smccc_smc(SIP_MCUSYS_READ, SPMC_CPUTOP, 0, 0, 0, 0, 0, 0, &res);
++	if ((res.a0 >> 23) & 0x1f) {
++		pr_err("cpu%u: cluster power controller is in a bad latched state (%08lx) — refusing CPU_ON; this lasts until reboot\n",
++		       cpu, (unsigned long)res.a0);
++		return -EIO;
++	}
++
++	pr_info("cpu%u: ready (MP2=%08x ISO=%08x SEMA=%08x clk=%u kHz SPMC=%08lx)\n",
++		cpu, readl(spm_base + MP2_CPUSYS_PWR_CON),
++		readl(spm_base + CPU_EXT_BUCK_ISO),
++		readl(cspm_base + CSPM_SEMA), khz, (unsigned long)res.a0);
++	return 0;
++}
++
++static int __init mt6797_a72_init(void)
++{
++	int ret;
++
++	if (!of_machine_is_compatible("mediatek,mt6797"))
++		return 0;
++
++	spm_base = ioremap(SPM_PHYS, SPM_SIZE);
++	mcumixed_base = ioremap(MCUMIXED_PHYS, MCUMIXED_SIZE);
++	rgu_base = ioremap(RGU_PHYS, RGU_SIZE);
++	cspm_base = ioremap(CSPM_PHYS, CSPM_SIZE);
++	topckgen_base = ioremap(TOPCKGEN_PHYS, TOPCKGEN_SIZE);
++	if (!spm_base || !mcumixed_base || !rgu_base || !cspm_base ||
++	    !topckgen_base) {
++		pr_err("ioremap failed\n");
++		ret = -ENOMEM;
++		goto err;
++	}
++
++	/*
++	 * Deliberately touch no hardware here. Bringing the rail up or poking
++	 * the cluster's power controller while the machine is still booting
++	 * makes it fail to acknowledge later, and that failure latches for the
++	 * rest of the boot — no retry recovers it. Everything happens in the
++	 * callback, when someone actually asks for the CPU.
++	 */
++	ret = cpuhp_setup_state_nocalls(CPUHP_BP_PREPARE_DYN,
++					"soc/mt6797-a72:prepare",
++					mt6797_a72_prepare, NULL);
++	if (ret < 0) {
++		pr_err("cannot register the hotplug callback (%d)\n", ret);
++		goto err;
++	}
++	ret = cpuhp_setup_state_nocalls(CPUHP_AP_ONLINE_DYN,
++					"soc/mt6797-a72:online",
++					mt6797_a72_online, NULL);
++	if (ret < 0)
++		pr_warn("no online callback (%d); the cluster stays at 750 MHz\n", ret);
++
++	/*
++	 * Scheduler capacities are NOT set here. They live in the device tree
++	 * (capacity-dmips-mhz), because asym_cpu_capacity_scan() runs once at
++	 * sched_init_domains() and again only when arch_update_cpu_topology()
++	 * reports a change — which plain hotplug never does. Capacities set
++	 * from an initcall are therefore invisible to the asymmetry machinery
++	 * forever: cpu_capacity reads back correctly, and SD_ASYM_CPUCAPACITY
++	 * still never appears (measured, build #66-#67). The DT values are
++	 * parsed before domain init, so the scan sees a big.LITTLE machine
++	 * from the first build.
++	 */
++	if (sysfs_create_file(kobject_create_and_add("mt6797_a72", kernel_kobj),
++			      &a72_freq_attr.attr))
++		pr_warn("no sysfs knob; the cluster is fixed at its default clock\n");
++
++	a72_ready = true;
++	pr_info("registered; cpu8/cpu9 can be onlined (the rail comes up on demand)\n");
++	return 0;
++
++err:
++	if (spm_base)
++		iounmap(spm_base);
++	if (mcumixed_base)
++		iounmap(mcumixed_base);
++	if (rgu_base)
++		iounmap(rgu_base);
++	if (cspm_base)
++		iounmap(cspm_base);
++	if (topckgen_base)
++		iounmap(topckgen_base);
++	spm_base = mcumixed_base = rgu_base = cspm_base = NULL;
++	topckgen_base = NULL;
++	return ret;
++}
++
++/*
++ * late_initcall: i2c6 and the firmware SIP interface must both be up, and there
++ * is no reason to hold up earlier boot for a cluster nothing is waiting on.
++ */
++late_initcall(mt6797_a72_init);
+--- a/drivers/soc/mediatek/Kconfig
++++ b/drivers/soc/mediatek/Kconfig
+@@ -91,6 +91,24 @@
+ 	  chip process corner, temperatures and other factors. Then DVFS
+ 	  driver could apply SVS bank voltage to PMIC/Buck.
+ 
++config MTK_MT6797_A72
++	bool "MT6797 Cortex-A72 cluster bring-up (Gemini PDA)"
++	depends on ARM64 && I2C && HAS_IOMEM
++	default n
++	help
++	  MT6797's two Cortex-A72 cores sit behind a power domain fed by an
++	  external DA9214 buck on i2c6, and the firmware refuses to power the
++	  cluster unless that rail, the cluster PLL and an SRAM LDO are all set
++	  up before PSCI CPU_ON. Nothing in mainline does that, so cpu8 and cpu9
++	  cannot be onlined.
++
++	  This runs the vendor's prerequisites from a CPUHP_BP_PREPARE_DYN
++	  callback, which is the same insertion point the vendor kernel uses.
++	  With it, cpu8 and cpu9 online through plain sysfs hotplug and behave
++	  as ordinary CPUs.
++
++	  Say Y on the Gemini PDA.
++
+ config MTK_CONSYS_SPIKE
+ 	tristate "MediaTek MT6797 CONSYS feasibility spike (Gemini PDA)"
+ 	depends on HAS_IOMEM
+--- a/drivers/soc/mediatek/Makefile
++++ b/drivers/soc/mediatek/Makefile
+@@ -5,6 +5,7 @@
+ obj-$(CONFIG_MTK_PMIC_WRAP) += mtk-pmic-wrap.o
+ obj-$(CONFIG_MTK_REGULATOR_COUPLER) += mtk-regulator-coupler.o
+ obj-$(CONFIG_MTK_MMSYS) += mtk-mmsys.o
++obj-$(CONFIG_MTK_MT6797_A72) += mt6797-a72.o
+ obj-$(CONFIG_MTK_MMSYS) += mtk-mutex.o
+ obj-$(CONFIG_MTK_SVS) += mtk-svs.o
+ obj-$(CONFIG_MTK_CONSYS_SPIKE) += mtk-consys-spike.o

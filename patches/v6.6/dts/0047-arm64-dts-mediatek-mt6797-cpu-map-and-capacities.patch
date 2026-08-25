@@ -1,0 +1,167 @@
+From: Gemini PDA Linux bring-up
+Subject: [PATCH] arm64: dts: mediatek: mt6797: cpu-map and CPU capacities
+
+Two omissions that together made the scheduler blind to this SoC's shape.
+
+Without a cpu-map, arm64's MPIDR fallback reports each cluster as a separate
+*package* (package_id = Aff1), and the scheduler builds three disjoint domain
+trees: no domain spans more than one cluster, so nothing ever balances between
+them. A task that starts on an A53 can never reach an idle A72; the two A53
+clusters could not balance with each other either, and never could. Measured
+on the Gemini PDA (2026-08-24): every CPU's only sched domain was MC over its
+own cluster. With the map, all ten CPUs form one package of three clusters and
+one domain spans the machine.
+
+Without capacity-dmips-mhz, every CPU defaults to capacity 1024 at
+sched_init_domains() time — and that moment is the only unconditional run of
+asym_cpu_capacity_scan(). Capacities set later (e.g. from a driver initcall)
+are read back correctly in sysfs but the asymmetry list stays empty forever:
+partition_sched_domains_locked() only rescans when arch_update_cpu_topology()
+reports a change, which plain hotplug never does. So SD_ASYM_CPUCAPACITY never
+appears and misfit migration never runs. Declared in the DT, the scan sees a
+big.LITTLE machine from the first domain build.
+
+The values are the measured single-thread throughput of each cluster at its
+ceiling clock (gbench stint): A53-LL 642 Mops/s @1222 MHz -> 608, A53-L 689
+@1209 -> 617, A72 1143 @2002 -> 1024. The at-ceiling ratio is encoded directly
+because the big cluster has no cpufreq policy, so the kernel's frequency-based
+renormalisation (which waits for every CPU's policy) never completes and the
+raw values become the final capacities.
+
+Effect, measured: an unpinned CPU hog that starts on an A53 migrates to an
+idle A72 within ~300 ms and runs 1.6x faster; before, it never moved.
+
+---
+--- a/arch/arm64/boot/dts/mediatek/mt6797.dtsi
++++ b/arch/arm64/boot/dts/mediatek/mt6797.dtsi
+@@ -26,6 +26,17 @@
+ 		#address-cells = <1>;
+ 		#size-cells = <0>;
+ 
++		/*
++		 * Measured single-thread throughput at each cluster's ceiling
++		 * (gbench stint, Gemini PDA 2026-08-24): A53-LL 642 Mops/s at
++		 * 1222 MHz, A53-L 689 at 1209, A72 1143 at 2002. Encoded as
++		 * the at-ceiling ratio because the big cluster has no cpufreq
++		 * policy, so the kernel's frequency renormalisation never runs
++		 * and these raw values become the scheduler capacities as-is.
++		 * They are what makes asym_cpu_capacity_scan() see a
++		 * big.LITTLE machine at boot — set later (e.g. from a driver),
++		 * the scan has already run symmetric and never reruns.
++		 */
+ 		cpu0: cpu@0 {
+ 			device_type = "cpu";
+ 			compatible = "arm,cortex-a53";
+@@ -34,6 +45,7 @@
+ 			clocks = <&mcumixed CLK_MCU_LL_SEL>,
+ 				 <&topckgen CLK_TOP_ARMPLL_DIV_PLL1>;
+ 			clock-names = "cpu", "intermediate";
++			capacity-dmips-mhz = <608>;
+ 		};
+ 
+ 		cpu1: cpu@1 {
+@@ -44,6 +56,7 @@
+ 			clocks = <&mcumixed CLK_MCU_LL_SEL>,
+ 				 <&topckgen CLK_TOP_ARMPLL_DIV_PLL1>;
+ 			clock-names = "cpu", "intermediate";
++			capacity-dmips-mhz = <608>;
+ 		};
+ 
+ 		cpu2: cpu@2 {
+@@ -54,6 +67,7 @@
+ 			clocks = <&mcumixed CLK_MCU_LL_SEL>,
+ 				 <&topckgen CLK_TOP_ARMPLL_DIV_PLL1>;
+ 			clock-names = "cpu", "intermediate";
++			capacity-dmips-mhz = <608>;
+ 		};
+ 
+ 		cpu3: cpu@3 {
+@@ -64,6 +78,7 @@
+ 			clocks = <&mcumixed CLK_MCU_LL_SEL>,
+ 				 <&topckgen CLK_TOP_ARMPLL_DIV_PLL1>;
+ 			clock-names = "cpu", "intermediate";
++			capacity-dmips-mhz = <608>;
+ 		};
+ 
+ 		cpu4: cpu@100 {
+@@ -74,6 +89,7 @@
+ 			clocks = <&mcumixed CLK_MCU_L_SEL>,
+ 				 <&topckgen CLK_TOP_ARMPLL_DIV_PLL1>;
+ 			clock-names = "cpu", "intermediate";
++			capacity-dmips-mhz = <617>;
+ 		};
+ 
+ 		cpu5: cpu@101 {
+@@ -84,6 +100,7 @@
+ 			clocks = <&mcumixed CLK_MCU_L_SEL>,
+ 				 <&topckgen CLK_TOP_ARMPLL_DIV_PLL1>;
+ 			clock-names = "cpu", "intermediate";
++			capacity-dmips-mhz = <617>;
+ 		};
+ 
+ 		cpu6: cpu@102 {
+@@ -94,6 +111,7 @@
+ 			clocks = <&mcumixed CLK_MCU_L_SEL>,
+ 				 <&topckgen CLK_TOP_ARMPLL_DIV_PLL1>;
+ 			clock-names = "cpu", "intermediate";
++			capacity-dmips-mhz = <617>;
+ 		};
+ 
+ 		cpu7: cpu@103 {
+@@ -104,6 +122,7 @@
+ 			clocks = <&mcumixed CLK_MCU_L_SEL>,
+ 				 <&topckgen CLK_TOP_ARMPLL_DIV_PLL1>;
+ 			clock-names = "cpu", "intermediate";
++			capacity-dmips-mhz = <617>;
+ 		};
+ 
+ 		cpu8: cpu@200 {
+@@ -111,6 +130,7 @@
+ 			compatible = "arm,cortex-a72";
+ 			enable-method = "psci";
+ 			reg = <0x200>;
++			capacity-dmips-mhz = <1024>;
+ 		};
+ 
+ 		cpu9: cpu@201 {
+@@ -118,6 +138,40 @@
+ 			compatible = "arm,cortex-a72";
+ 			enable-method = "psci";
+ 			reg = <0x201>;
++			capacity-dmips-mhz = <1024>;
++		};
++
++		/*
++		 * Without this map, arm64's MPIDR fallback reports each cluster
++		 * as a separate PACKAGE (package_id = Aff1), so the scheduler
++		 * builds three disjoint domain trees and never balances between
++		 * clusters at all: a task that starts on an A53 can never reach
++		 * an idle A72, and misfit migration has no domain to act in
++		 * (measured on the Gemini PDA, 2026-08-24 — each CPU's only
++		 * domain was MC over its own cluster). With the map, all ten
++		 * CPUs share one package split into three clusters, the
++		 * full-span domain carries SD_ASYM_CPUCAPACITY, and big.LITTLE
++		 * placement works.
++		 */
++		cpu-map {
++			cluster0 {
++				core0 { cpu = <&cpu0>; };
++				core1 { cpu = <&cpu1>; };
++				core2 { cpu = <&cpu2>; };
++				core3 { cpu = <&cpu3>; };
++			};
++
++			cluster1 {
++				core0 { cpu = <&cpu4>; };
++				core1 { cpu = <&cpu5>; };
++				core2 { cpu = <&cpu6>; };
++				core3 { cpu = <&cpu7>; };
++			};
++
++			cluster2 {
++				core0 { cpu = <&cpu8>; };
++				core1 { cpu = <&cpu9>; };
++			};
+ 		};
+ 	};
+ 
