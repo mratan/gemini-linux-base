@@ -77,16 +77,18 @@ matches the vendor, which is a much narrower place to be looking.
  static bool phy_pair = true;
  module_param(phy_pair, bool, 0644);
  MODULE_PARM_DESC(phy_pair, "configure this bank and its B half at +0x200 as a pair");
-@@ -547,7 +569,7 @@
+@@ -547,7 +569,9 @@
  	void __iomem *seninf;
  	void __iomem *camsv;
  	void __iomem *mipi_ana;
 -	struct clk_bulk_data clks[3];
-+	struct clk_bulk_data clks[7];
++	struct clk_bulk_data clks[3];	/* camsv0..2, required */
++	struct clk_bulk_data img_clks[4];	/* imgsys, OPTIONAL */
++	int num_img_clks;
  	int num_clks;
  	int irq;
  
-@@ -992,6 +1014,65 @@
+@@ -992,6 +1016,65 @@
  	writel(SENINF_CSI2_HSRX_DBG_EN_ALL, inst + SENINF_CSI2_INT_EN_EXT);
  }
  
@@ -152,7 +154,7 @@ matches the vendor, which is a much narrower place to be looking.
  static void gemini_cam_seninf_start(struct gemini_cam *cam)
  {
  	void __iomem *inst = seninf_inst_base(cam);
-@@ -1164,6 +1245,9 @@
+@@ -1164,6 +1247,9 @@
  
  	gemini_cam_seninf_route(cam);
  
@@ -162,38 +164,53 @@ matches the vendor, which is a much narrower place to be looking.
  	dev_dbg(cam->dev,
  		"seninf started: inst %u csi %u mux %u cam_mux %u; top_mux 0x%08x cam_mux 0x%08x mux_ctrl 0x%08x csi2_ctl 0x%08x\n",
  		seninf_inst, seninf_csi, seninf_mux, seninf_cam_mux,
-@@ -2139,13 +2223,30 @@
- 		return dev_err_probe(dev, PTR_ERR(cam->mipi_ana),
- 				     "cannot map the MIPI RX analog PHY\n");
- 
--	cam->clks[0].id = "camsv0";
--	cam->clks[1].id = "camsv1";
--	cam->clks[2].id = "camsv2";
-+	/*
-+	 * ORDER MATTERS, and it is the vendor's order. ISP_EnableClock() in
-+	 * the vendor's mt6797 camera_isp.c enables the IMG clocks BEFORE any
-+	 * CAM gate, with a comment saying the sequence must be kept.
-+	 * clk_bulk_prepare_enable() walks this array in order, so imgsys goes
-+	 * first here.
-+	 *
-+	 * Measured 2026-08-25: our kernel leaves imgsys (0x15000000) at 0xfff,
-+	 * every gate closed, while the vendor has them open the whole time its
-+	 * ISP runs. See #66 -- CAM_A is NOT bus-protected (119 non-zero rows
-+	 * read out of it on Android while the vendor streamed), so a missing
-+	 * clock in the wrong order is exactly the shape of what is left.
-+	 */
-+	cam->clks[0].id = "img_larb6";
-+	cam->clks[1].id = "img_dip";
-+	cam->clks[2].id = "img_dpe";
-+	cam->clks[3].id = "img_fdvt";
-+	cam->clks[4].id = "camsv0";
-+	cam->clks[5].id = "camsv1";
-+	cam->clks[6].id = "camsv2";
- 	cam->num_clks = ARRAY_SIZE(cam->clks);
- 	ret = devm_clk_bulk_get(dev, cam->num_clks, cam->clks);
+@@ -2147,6 +2233,27 @@
  	if (ret)
--		return dev_err_probe(dev, ret, "CAMSV clocks\n");
-+		return dev_err_probe(dev, ret, "camsys/imgsys clocks\n");
+ 		return dev_err_probe(dev, ret, "CAMSV clocks\n");
  
++	/*
++	 * The imgsys clocks are OPTIONAL, deliberately. The vendor enables them
++	 * before it touches any CAM gate -- ISP_EnableClock() in its mt6797
++	 * camera_isp.c goes DIS -> MM_SMI_COMMON -> SCP_SYS_ISP -> IMG -> CAM,
++	 * and its comment says the order must be kept -- so we do the same when
++	 * the device tree describes them. But an older DTB will not, and
++	 * refusing to probe over that is wrong: it cost a working camera on a
++	 * rolled-back kernel (2026-08-25) and left the driver unable to load at
++	 * all.
++	 */
++	cam->img_clks[0].id = "img_larb6";
++	cam->img_clks[1].id = "img_dip";
++	cam->img_clks[2].id = "img_dpe";
++	cam->img_clks[3].id = "img_fdvt";
++	cam->num_img_clks = ARRAY_SIZE(cam->img_clks);
++	ret = devm_clk_bulk_get_optional(dev, cam->num_img_clks, cam->img_clks);
++	if (ret) {
++		dev_info(dev, "no imgsys clocks in DT; continuing without\n");
++		cam->num_img_clks = 0;
++	}
++
  	cam->irq = platform_get_irq(pdev, 0);
  	if (cam->irq < 0)
+ 		return cam->irq;
+@@ -2331,6 +2438,12 @@
+ 	 * domain and the camsys gates up by the time this runs; the CAMSV
+ 	 * gates live in that same domain and are ours to hold.
+ 	 */
++	if (cam->num_img_clks) {
++		int r = clk_bulk_prepare_enable(cam->num_img_clks, cam->img_clks);
++
++		if (r)
++			return r;		/* IMG before CAM: the vendor's order */
++	}
+ 	return clk_bulk_prepare_enable(cam->num_clks, cam->clks);
+ }
+ 
+@@ -2339,6 +2452,8 @@
+ 	struct gemini_cam *cam = dev_get_drvdata(dev);
+ 
+ 	clk_bulk_disable_unprepare(cam->num_clks, cam->clks);
++	if (cam->num_img_clks)
++		clk_bulk_disable_unprepare(cam->num_img_clks, cam->img_clks);
+ 	return 0;
+ }
+ 
