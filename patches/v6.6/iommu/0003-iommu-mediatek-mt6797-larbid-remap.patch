@@ -1,0 +1,68 @@
+Subject: [PATCH] iommu/mediatek: mt6797: stop labelling every fault as larb0
+
+mt6797_data carried `.larbid_remap = {{0}}` with the comment "linear mapping;
+larb0 only". That was true when only the display was behind the M4U. It became
+a lie when the camera arrived on larb2, and the array is zero-initialised, so
+the fault handler's
+
+	fault_larb = data->plat_data->larbid_remap[fault_larb][sub_comm];
+
+turned every larb the hardware reported into 0. A CAM_SV0 translation fault
+printed as
+
+	fault type=0x5 iova=0x2 pa=0x0 master=0x118(larb=0 port=6) layer=0 write
+
+and larb0 port6 is M4U_PORT_MDP_WROT0 -- a display block that was not running.
+The real decode of master=0x118 is larb2 port6 = M4U_PORT_CAM_SV0:
+
+	F_MMU_INT_ID_LARB_ID(0x118) = (0x118 >> 7) & 0x7 = 2
+	F_MMU_INT_ID_PORT_ID(0x118) = (0x118 >> 2) & 0x1f = 6
+
+The raw master ID in the message was right all along, so the information was
+recoverable by hand -- but only by someone who already suspected the table.
+It cost a wrong-path investigation on #74.
+
+MT6797 has seven larbs (the vendor's gM4uPort[] spans larb0..larb6) and this
+tree now instantiates larb0, larb2 and larb5. Eight entries are listed anyway,
+because F_MMU_INT_ID_LARB_ID() masks to three bits: an impossible id 7 should
+print as 7 rather than silently as 0, which is the whole point of the fix.
+
+Same form mt8173 and mt6795 already use.
+
+--- a/drivers/iommu/mtk_iommu.c
++++ b/drivers/iommu/mtk_iommu.c
+@@ -1570,9 +1570,22 @@
+  * gate. Claiming HAS_BCLK here would fail the probe looking for a clock the
+  * SoC does not have.
+  *
+- * Only larb0 is listed. The hardware has seven (vendor gM4uPort[] spans
+- * larb0..larb6), but larb0 is the only one this tree instantiates, and the
+- * display pipeline is entirely behind it.
++ * larbid_remap is the identity over all eight indices the fault handler can
++ * produce. It used to be {{0}} with the comment "linear mapping; larb0 only",
++ * which was true when only the display was wired up and became a lie when the
++ * camera arrived on larb2. The array is zero-initialised, so every larb the
++ * hardware reported came back as larb0: a CAM_SV0 fault printed as
++ *
++ *   fault type=0x5 iova=0x2 pa=0x0 master=0x118(larb=0 port=6) ... write
++ *
++ * and larb0 port6 is MDP_WROT0, a display block that was not running. The raw
++ * master ID was right all along; only the parenthesised decode was wrong, so
++ * it cost a wrong-path investigation rather than a wrong fix. See #74/#75.
++ *
++ * MT6797 has seven larbs (vendor gM4uPort[] spans larb0..larb6) and this tree
++ * now instantiates larb0, larb2 and larb5. Eight entries are listed anyway
++ * because F_MMU_INT_ID_LARB_ID() masks to 3 bits: an impossible id 7 should
++ * print as 7, not silently as 0.
+  */
+ static const struct mtk_iommu_plat_data mt6797_data = {
+ 	.m4u_plat     = M4U_MT6797,
+@@ -1598,7 +1611,7 @@
+ 	.banks_enable = {true},
+ 	.iova_region  = single_domain,
+ 	.iova_region_nr = ARRAY_SIZE(single_domain),
+-	.larbid_remap = {{0}}, /* Linear mapping; larb0 only. */
++	.larbid_remap = {{0}, {1}, {2}, {3}, {4}, {5}, {6}, {7}}, /* Linear. */
+ };
+ 
+ static const struct mtk_iommu_plat_data mt8167_data = {
