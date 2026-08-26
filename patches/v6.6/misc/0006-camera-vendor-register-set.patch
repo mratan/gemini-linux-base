@@ -34,7 +34,28 @@ matches the vendor, which is a much narrower place to be looking.
 ---
 --- a/drivers/misc/gemini-cam-bridge.c
 +++ b/drivers/misc/gemini-cam-bridge.c
-@@ -451,6 +451,21 @@
+@@ -364,11 +364,18 @@
+ MODULE_PARM_DESC(seninf_csi,
+ 		 "D-PHY port index for SENINF_TOP_PHY_CTL (0 = CSI0 at +0x1c)");
+ 
+-static unsigned int seninf_mux = 1;
++/*
++ * The vendor's topology, read off its streaming capture: CSI-2 is received on
++ * SENINF instance 1, TOP_MUX_CTRL (00043211) routes source 1 into FIFO mux 0,
++ * and INSTANCE 0's mux carries the video -- its +0xd14/+0xd18 hold 0a200798,
++ * 2592x1944, the full sensor frame. So the receiver and the mux are on
++ * DIFFERENT instances, which is not what this driver originally assumed.
++ */
++static unsigned int seninf_mux = 0;
+ module_param(seninf_mux, uint, 0644);
+ MODULE_PARM_DESC(seninf_mux, "SENINF FIFO mux index (0 = seninf1_mux)");
+ 
+-static unsigned int seninf_cam_mux = 2;
++static unsigned int seninf_cam_mux = 0;	/* identity crossbar, as the vendor uses */
+ module_param(seninf_cam_mux, uint, 0644);
+ MODULE_PARM_DESC(seninf_cam_mux,
+ 		 "CAM MUX output index CAMSV0 consumes. CAM0/CAM1 are CAM_A/CAM_B (the ISP), so 2 is the first CAMSV.");
+@@ -451,6 +458,21 @@
   * Only the A half was ever written before this. The halves differ in exactly
   * one bit: the A half puts lane 2 in clock mode, the B half does not.
   */
@@ -56,7 +77,7 @@ matches the vendor, which is a much narrower place to be looking.
  static bool phy_pair = true;
  module_param(phy_pair, bool, 0644);
  MODULE_PARM_DESC(phy_pair, "configure this bank and its B half at +0x200 as a pair");
-@@ -992,6 +1007,65 @@
+@@ -992,6 +1014,65 @@
  	writel(SENINF_CSI2_HSRX_DBG_EN_ALL, inst + SENINF_CSI2_INT_EN_EXT);
  }
  
@@ -122,7 +143,7 @@ matches the vendor, which is a much narrower place to be looking.
  static void gemini_cam_seninf_start(struct gemini_cam *cam)
  {
  	void __iomem *inst = seninf_inst_base(cam);
-@@ -1164,6 +1238,9 @@
+@@ -1164,6 +1245,9 @@
  
  	gemini_cam_seninf_route(cam);
  
