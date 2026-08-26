@@ -420,7 +420,7 @@ mediatek,mt6797-musb's driver change itself, and gemini,mt6797-consys-wmt
  
    reg:
      maxItems: 1
-@@ -33,17 +35,24 @@
+@@ -33,17 +35,38 @@
        - const: mc
  
    clocks:
@@ -442,10 +442,24 @@ mediatek,mt6797-musb's driver change itself, and gemini,mt6797-consys-wmt
 +      - high-speed
 +      - full-speed
 +
++  mediatek,quirk-vendor-toggle:
++    description:
++      Follow the vendor's session-bit toggle sequence when forcing host role,
++      rather than mainline's. An opt-in experiment on the MT6797's musbfsh
++      instance; harmless but pointless elsewhere.
++    type: boolean
++
++  mediatek,babble-keep-session:
++    description:
++      On a babble interrupt, log it and keep the session up instead of
++      dropping it, which is what the vendor driver does. Also MT6797-only and
++      also opt-in.
++    type: boolean
++
    phys:
      maxItems: 1
  
-@@ -80,6 +89,27 @@
+@@ -80,6 +103,32 @@
    - clocks
    - clock-names
  
@@ -460,9 +474,14 @@ mediatek,mt6797-musb's driver change itself, and gemini,mt6797-consys-wmt
 +      # bus gate; there are no separate mcu/univpll gates on this SoC.
 +      properties:
 +        clocks:
-+          maxItems: 1
++          minItems: 1
++          maxItems: 2
 +        clock-names:
-+          maxItems: 1
++          minItems: 1
++          maxItems: 2
++          items:
++            - const: main
++            - const: mcu
 +    else:
 +      properties:
 +        clocks:

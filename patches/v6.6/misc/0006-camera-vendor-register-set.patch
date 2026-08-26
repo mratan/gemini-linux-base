@@ -1,0 +1,134 @@
+From: Gemini PDA Linux port <mratan/gemini-linux>
+Subject: [PATCH] camera: apply the vendor register set captured while it streamed (#65)
+
+The streaming vendor capture (2026-08-25) gave, for the first time, the
+register values the vendor actually uses. This applies them.
+
+  * vendor_regs (new, default on) writes the values observed on SENINF
+    instance 1 -- the vendor's ACTIVE receiver -- as a final override
+    after the normal configuration, so the two can be compared by
+    toggling one knob. They latch at stream start; poking them from
+    userspace mid-stream does nothing, which was tested.
+
+  * MUX_CTRL now follows the vendor's topology rather than ours. The
+    vendor receives CSI-2 on instance 1, routes source 1 into FIFO mux 0
+    via TOP_MUX_CTRL = 00043211, and carries the video on INSTANCE 0's
+    mux -- whose +0xd14/+0xd18 hold 0a200798, i.e. 2592x1944, the full
+    sensor frame. The active mux takes a6df8080 and the receiver
+    instance takes 86df0080; we had them the other way round.
+
+    Reached with seninf_inst=1 seninf_mux=0 seninf_cam_mux=0, which also
+    makes the driver compute TOP_MUX_CTRL and TOP_CAM_MUX to exactly the
+    vendor's 00043211 / 76543210.
+
+Instance-1 differences against the vendor fall from 30 to 10, and the
+remaining ten are status registers that read differently precisely
+because the vendor is receiving data and we are not (+0xa74 is the packet
+counter, +0xb20 the lane FSM; +0xa14 and +0xa1c stay zero when written,
+so they are read-only).
+
+Frames still do not flow. But the D-PHY now trains -- see the analog
+liveness registers -- and every configuration register we can write now
+matches the vendor, which is a much narrower place to be looking.
+
+---
+--- a/drivers/misc/gemini-cam-bridge.c
++++ b/drivers/misc/gemini-cam-bridge.c
+@@ -451,6 +451,21 @@
+  * Only the A half was ever written before this. The halves differ in exactly
+  * one bit: the A half puts lane 2 in clock mode, the B half does not.
+  */
++/*
++ * Write the register values observed on the VENDOR while it was genuinely
++ * streaming (2026-08-25, boot1 Android, gemini_regdump module; capture in
++ * 04-docs/captures/vendor-streaming-*). Applied as a final override rather
++ * than by rewriting the composition above, so the two can be compared by
++ * toggling one knob.
++ *
++ * Instance 1 is the vendor's ACTIVE receiver -- it carries the +0x800 page and
++ * the offset-calibration values -- which is why seninf_inst defaults to 1.
++ */
++static bool vendor_regs = true;
++module_param(vendor_regs, bool, 0644);
++MODULE_PARM_DESC(vendor_regs,
++		 "apply the register values captured from the streaming vendor stack");
++
+ static bool phy_pair = true;
+ module_param(phy_pair, bool, 0644);
+ MODULE_PARM_DESC(phy_pair, "configure this bank and its B half at +0x200 as a pair");
+@@ -992,6 +1007,65 @@
+ 	writel(SENINF_CSI2_HSRX_DBG_EN_ALL, inst + SENINF_CSI2_INT_EN_EXT);
+ }
+ 
++/*
++ * The vendor's own values, read off the hardware while its camera app was
++ * streaming. Everything here is a literal from that capture, on SENINF
++ * instance 1, with our value beside it.
++ *
++ * These are latched at stream start: writing them mid-stream from userspace
++ * does nothing (tested). They have to be applied here.
++ */
++static void gemini_cam_vendor_regs(struct gemini_cam *cam, void __iomem *inst,
++				   void __iomem *mux)
++{
++	/* CSI-2 decoder. ours 03896173 -> vendor 0d8961f3 */
++	writel(0x0d8961f3, inst + SENINF_CSI2_CTL);
++	writel(0x00000400, inst + 0x0a08);	/* ours 00001500 */
++	writel(0x9fffbfff, inst + 0x0a10);	/* ours 9fffffff */
++	writel(0x00009004, inst + 0x0a14);	/* we never wrote this */
++	writel(0x00000799, inst + 0x0a1c);	/* nor this */
++	writel(0xffffffff, inst + 0x0a20);	/* ours fffffffe */
++	writel(0x01010101, inst + 0x0a2c);	/* ours 01011001 */
++	writel(0x00000000, inst + 0x0a40);	/* ours 00000008 */
++	writel(0x00000000, inst + 0x0aac);	/* ours 00000002 */
++	writel(0x01010100, inst + 0x0ab4);	/* ours 01201000 */
++	writel(0x00000000, inst + 0x0ae8);	/* ours 00000402 */
++
++	/*
++	 * The mipi_RX_config page. We write far more of it than the vendor
++	 * does; these are the registers it leaves at zero and we do not.
++	 */
++	writel(0x00000000, inst + 0x087c);
++	writel(0x00000000, inst + 0x0880);
++	writel(0x00000000, inst + 0x088c);
++	writel(0x00000000, inst + 0x0890);
++	writel(0x00000000, inst + 0x08a0);
++	writel(0x00000000, inst + 0x08b0);
++	writel(0x00000000, inst + 0x08b4);
++	writel(0x00000000, inst + 0x08b8);
++	writel(0x00000000, inst + 0x08bc);
++	writel(0x80000000, inst + 0x08c0);	/* ours 800000ff */
++	writel(0x00100100, inst + 0x08cc);	/* ours 00100180 */
++
++	/*
++	 * MUX_CTRL. The vendor's topology is: SENINF instance 1 receives CSI-2,
++	 * TOP_MUX_CTRL (00043211, nibble 0 = 1) routes source 1 into FIFO mux 0,
++	 * and INSTANCE 0's mux carries the video -- its +0xd14/+0xd18 hold
++	 * 0a200798, i.e. 2592x1944, the full sensor frame. So the active mux is
++	 * instance 0's and takes a6df8080; instance 1's takes 86df0080.
++	 *
++	 * `mux` here is whichever seninf_mux selects, so it gets the active
++	 * value and the receiver instance gets the other one.
++	 */
++	writel(0xa6df8080, mux + SENINF_MUX_CTRL);
++	if (mux != inst)
++		writel(0x86df0080, inst + SENINF_MUX_CTRL);
++	writel(0x000e2000, mux + 0x0d2c);	/* ours 000c2000 */
++	writel(0x00000000, mux + 0x0d3c);	/* ours 00000001 */
++
++	dev_dbg(cam->dev, "vendor register set applied\n");
++}
++
+ static void gemini_cam_seninf_start(struct gemini_cam *cam)
+ {
+ 	void __iomem *inst = seninf_inst_base(cam);
+@@ -1164,6 +1238,9 @@
+ 
+ 	gemini_cam_seninf_route(cam);
+ 
++	if (vendor_regs)
++		gemini_cam_vendor_regs(cam, inst, mux);
++
+ 	dev_dbg(cam->dev,
+ 		"seninf started: inst %u csi %u mux %u cam_mux %u; top_mux 0x%08x cam_mux 0x%08x mux_ctrl 0x%08x csi2_ctl 0x%08x\n",
+ 		seninf_inst, seninf_csi, seninf_mux, seninf_cam_mux,
