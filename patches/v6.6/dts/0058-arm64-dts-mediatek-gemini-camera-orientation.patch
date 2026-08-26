@@ -1,0 +1,35 @@
+Subject: [PATCH] arm64: dts: mediatek: gemini: mark the camera front-facing
+
+This unit has only the user-facing module fitted (the rear module is not
+populated -- see #70), so orientation = 0 is a fact about the hardware.
+
+"rotation" is deliberately NOT set. It has never been measured on this
+device, and a wrong value silently turns every captured image upside down in
+anything that honours it. Absent, no control is created and consumers default
+to 0 -- the same result, without the false claim.
+
+Rebuilt clean, and `make CHECK_DTBS=y` still reports 0 warnings.
+
+--- a/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
++++ b/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
+@@ -2752,6 +2752,20 @@
+ 		reset-gpios = <&pio 33 GPIO_ACTIVE_LOW>;
+ 		powerdown-gpios = <&pio 29 GPIO_ACTIVE_LOW>;
+ 
++		/*
++		 * 0 = front. This unit has only the user-facing module fitted
++		 * (see #70), so this is a fact about the hardware, not a guess.
++		 * libcamera requires V4L2_CID_CAMERA_ORIENTATION and complains
++		 * that "the sensor kernel driver needs to be fixed" without it.
++		 *
++		 * "rotation" is deliberately NOT set. It has never been
++		 * measured on this device, and a wrong value silently turns
++		 * every captured image upside down in anything that honours it.
++		 * Absent, no control is created and consumers default to 0,
++		 * which is the same result without the false claim.
++		 */
++		orientation = <0>;
++
+ 		port {
+ 			hi556_out: endpoint {
+ 				remote-endpoint = <&cam_bridge_in>;

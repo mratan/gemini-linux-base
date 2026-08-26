@@ -1,0 +1,69 @@
+Subject: [PATCH] media: hi556: expose orientation and rotation from the fwnode
+
+libcamera treats V4L2_CID_CAMERA_ORIENTATION as a requirement and says so
+plainly when it is missing:
+
+  'hi556 3-0020': Recommended V4L2 control 0x009a0922 not supported
+  'hi556 3-0020': The sensor kernel driver needs to be fixed
+  'hi556 3-0020': Failed to retrieve the camera location
+
+Parse the standard "orientation" and "rotation" device-tree properties and
+create the corresponding controls, the same way ov5675 already does.
+
+Both properties are optional in the fwnode helper: one that is absent creates
+no control, so this does not become a new requirement on device trees that do
+not carry them.
+
+The controls are read-only, so __v4l2_ctrl_handler_setup() skips them and
+hi556_set_ctrl()'s default -EINVAL case is never reached for them --
+verified against the skip in __v4l2_ctrl_handler_setup().
+
+--- a/drivers/media/i2c/hi556.c
++++ b/drivers/media/i2c/hi556.c
+@@ -815,12 +815,14 @@
+ 
+ static int hi556_init_controls(struct hi556 *hi556)
+ {
++	struct v4l2_fwnode_device_properties props;
++	struct i2c_client *client = v4l2_get_subdevdata(&hi556->sd);
+ 	struct v4l2_ctrl_handler *ctrl_hdlr;
+ 	s64 exposure_max, h_blank;
+ 	int ret;
+ 
+ 	ctrl_hdlr = &hi556->ctrl_handler;
+-	ret = v4l2_ctrl_handler_init(ctrl_hdlr, 8);
++	ret = v4l2_ctrl_handler_init(ctrl_hdlr, 10);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -874,6 +876,30 @@
+ 	if (ctrl_hdlr->error)
+ 		return ctrl_hdlr->error;
+ 
++	/*
++	 * V4L2_CID_CAMERA_ORIENTATION and V4L2_CID_CAMERA_SENSOR_ROTATION,
++	 * from the "orientation" and "rotation" device-tree properties.
++	 * libcamera treats the first as a requirement and says so:
++	 *
++	 *   'hi556 3-0020': Recommended V4L2 control 0x009a0922 not supported
++	 *   'hi556 3-0020': The sensor kernel driver needs to be fixed
++	 *
++	 * Both are optional in the fwnode helper: a property that is absent
++	 * simply creates no control, so this does not become a requirement on
++	 * device trees that do not carry them.
++	 */
++	ret = v4l2_fwnode_device_parse(&client->dev, &props);
++	if (ret)
++		return ret;
++
++	ret = v4l2_ctrl_new_fwnode_properties(ctrl_hdlr, &hi556_ctrl_ops,
++					      &props);
++	if (ret)
++		return ret;
++
++	if (ctrl_hdlr->error)
++		return ctrl_hdlr->error;
++
+ 	hi556->sd.ctrl_handler = ctrl_hdlr;
+ 
+ 	return 0;
