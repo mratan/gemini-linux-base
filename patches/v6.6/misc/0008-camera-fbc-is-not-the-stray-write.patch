@@ -1,0 +1,39 @@
+Subject: [PATCH] camera: record that the FBC is not #74's stray write
+
+The frame-buffer controller looked like the source of the per-frame unmapped
+write to iova=0x2, and it is not. Measured on build #90, 120-frame captures,
+counting printed AND ratelimit-suppressed faults:
+
+  use_fbc=0   120 frames, 0 dropped, 120 unmapped writes
+  use_fbc=1   120 frames, 0 dropped, 120 unmapped writes
+
+Exactly one per frame either way, so the FBC stays on -- which is what the
+vendor does.
+
+Worth recording because a first pass at this measurement said the opposite,
+convincingly. mtk_iommu reports faults with dev_err_ratelimited(), roughly ten
+messages per five seconds; three back-to-back runs read 10 / 0 / 10 and the
+middle zero was the previous run's suppression window, not an absence of
+faults. Comment only -- no behaviour change.
+
+--- a/drivers/misc/gemini-cam-bridge.c
++++ b/drivers/misc/gemini-cam-bridge.c
+@@ -437,6 +437,18 @@
+ MODULE_PARM_DESC(pixel_mode,
+ 		 "pixels per clock through the SENINF FIFO mux and CAMSV: 1, 2 or 4. The mux and the DMA must agree — they are configured from this one value for exactly that reason.");
+ 
++/*
++ * The frame-buffer controller is NOT implicated in #74, though it looked like
++ * it was. Measured on build #90, 120-frame captures, counting printed AND
++ * ratelimit-suppressed faults:
++ *
++ *   use_fbc=0   120 frames, 0 dropped, 120 unmapped writes
++ *   use_fbc=1   120 frames, 0 dropped, 120 unmapped writes
++ *
++ * Exactly one per frame either way. Leaving it on, which is what the vendor
++ * does. See scripts/gemini-cam-iommu-fault-test.sh for why a first pass at
++ * this measurement said the opposite.
++ */
+ static bool use_fbc = true;
+ module_param(use_fbc, bool, 0644);
+ MODULE_PARM_DESC(use_fbc, "use the CAMSV frame-buffer controller (default yes)");
