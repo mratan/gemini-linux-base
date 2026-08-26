@@ -1,0 +1,302 @@
+From: Gemini PDA Linux port <mratan/gemini-linux>
+Subject: [PATCH] camera: raw Bayer frames land in memory (#65)
+
+Three defects, each of which alone was enough to deliver nothing, and each
+of which was invisible behind the one upstream of it.
+
+1. SENINF_CSI2_RESYNC_MERGE_CTL bit 4 (new name RESYNC_MERGE_EN). Set,
+   the D-PHY trains perfectly -- analog bank byte-identical to the
+   vendor's, clock lane FSM 0x10, data lanes alternating 0x01011010
+   exactly as the vendor's do -- and the CSI-2 decoder decodes nothing at
+   all: zero packets, and not one interrupt of any kind. Clear, packets
+   appear immediately. Found by poking the register mid-stream and
+   bisecting three candidates; it is the only one of them that moves
+   anything.
+
+   0x15 came from a C-PHY code path. So did the 0x15 next door in
+   SENINF_CSI2_CTRL_TRIO_CON, which the streaming vendor leaves at 0.
+
+2. SENINF_MUX_CTRL_EXT was programmed BEFORE the mux software reset that
+   clears it, so SRC_SEL_EXT read back 0 against the vendor's 1 and the
+   FIFO mux ignored the stream: MUX_INTSTA 0, no frame size, nothing
+   reaching CAMSV -- with a decoder that by then worked. It is now
+   programmed after the reset.
+
+   gemini_cam_vendor_regs() then undid it a second time. Its +0x0d2c and
+   +0x0d3c values had been transcribed from a diff of SENINF instance 1,
+   whose mux is idle on the vendor; the mux that carries video is
+   instance 0's, and there the vendor reads 000e0000 and 00000001.
+
+3. seninf_cam_mux was 0, "the identity crossbar, as the vendor uses". The
+   vendor does use the identity map -- and consumes the result from
+   CAM_A, cam output 0. We consume it from CAMSV0. Swept 0..7 once the
+   two faults above were fixed: 2 delivers frames, every other value
+   delivers nothing.
+
+Also retires the +0xb10 story that shaped the last several days of this
+issue. "The vendor has bits 8..10 set there and we never reach that state"
+was a comparison against the vendor's instance 0, whose decoder is idle.
+0x71f is that register's reset value; this driver writes 0x1f into it
+itself, and the vendor's ACTIVE instance reads 0x1f, exactly as ours does.
+There was never a gap. The refuted ORDER knobs are kept as instruments with
+their comment corrected, along with the module parameters that had drifted
+into the build tree without ever reaching this series.
+
+Measured on build #87 at the machine, 2026-08-26:
+
+  12 start/stop cycles   10/10 frames each, 0 dropped, 0 errors
+  sustained capture      200 frames, 200 sof, 0 dropped, 0 errors
+  tg frmsize             0x051003cd (1296x972), matching the negotiated
+                         format and the mux's own measurement
+  sensor TPG, colour bars   4 frames bit-identical, 12 unique values in
+                         the frame, 8 bars in the standard order
+  optical capture        a recognisable scene; mean 138, std 228, frames
+                         differing from one another
+
+---
+--- a/drivers/misc/gemini-cam-bridge.c
++++ b/drivers/misc/gemini-cam-bridge.c
+@@ -200,6 +200,12 @@
+ #define SENINF_CSI2_HS_TRAIL_PARAM		GENMASK(7, 0)
+ #define SENINF_CSI2_RESYNC_MERGE_CTL		0x0a74
+ #define SENINF_CSI2_RESYNC_CPHY_CNT		GENMASK(2, 0)
++/*
++ * Bit 4 gates the CSI-2 decoder behind the resync/merge stage that a C-PHY
++ * link needs and a D-PHY link must not have. Set, the lanes train and nothing
++ * is ever decoded; clear, packets appear. See gemini_cam_rx_config().
++ */
++#define SENINF_CSI2_RESYNC_MERGE_EN		BIT(4)
+ #define SENINF_CSI2_RESYNC_BYPASS		BIT(10)
+ #define SENINF_CSI2_RESYNC_CDPHY_SEL		BIT(11)
+ #define SENINF_CSI2_MODE			0x0ae8
+@@ -375,7 +381,15 @@
+ module_param(seninf_mux, uint, 0644);
+ MODULE_PARM_DESC(seninf_mux, "SENINF FIFO mux index (0 = seninf1_mux)");
+ 
+-static unsigned int seninf_cam_mux = 0;	/* identity crossbar, as the vendor uses */
++/*
++ * 2, measured. The vendor's crossbar is the identity map, but the vendor
++ * consumes the stream from CAM_A -- cam output 0 -- and we consume it from
++ * CAMSV0. Swept 0..7 on 2026-08-26 with a working decoder and a working FIFO
++ * mux behind it: 2 delivers frames and SOF interrupts, every other value
++ * delivers nothing at all. Copying the vendor's identity map here was reading
++ * its topology one step too literally.
++ */
++static unsigned int seninf_cam_mux = 2;
+ module_param(seninf_cam_mux, uint, 0644);
+ MODULE_PARM_DESC(seninf_cam_mux,
+ 		 "CAM MUX output index CAMSV0 consumes. CAM0/CAM1 are CAM_A/CAM_B (the ISP), so 2 is the first CAMSV.");
+@@ -468,6 +482,39 @@
+  * Instance 1 is the vendor's ACTIVE receiver -- it carries the +0x800 page and
+  * the offset-calibration values -- which is why seninf_inst defaults to 1.
+  */
++/*
++ * Bring-up ORDER experiments (#65). These are kept as instruments, and as a
++ * recorded negative: none of them ever moved anything, singly or combined.
++ *
++ * They were built on a reading of +0xb10 -- "the vendor has bits 8..10 set
++ * there and we never reach that state" -- which was simply wrong. That
++ * comparison was against the vendor's SENINF instance 0, whose decoder is
++ * IDLE; 0x71f is the reset value of a register this driver writes 0x1f into
++ * itself, and the vendor's active instance reads 0x1f exactly as ours does.
++ * Nothing was ever failing to be "arrived at".
++ *
++ * The lesson is narrower than the wasted time: when diffing against a vendor
++ * capture, diff the instance the vendor is actually USING. The real fault was
++ * a configuration value after all -- SENINF_CSI2_RESYNC_MERGE_EN, see
++ * gemini_cam_rx_config().
++ *
++ * phy_late      configure the decoder first, bias the analog afterwards
++ * decoder_reset toggle SENINF_EN after the PHY is up, so the FSM re-latches
++ *               against a settled configuration
++ * hsrx_det      arm HS detection instead of clearing it
++ */
++static bool phy_late;
++module_param(phy_late, bool, 0644);
++MODULE_PARM_DESC(phy_late, "bias the analog PHY after configuring the decoder");
++
++static bool decoder_reset;
++module_param(decoder_reset, bool, 0644);
++MODULE_PARM_DESC(decoder_reset, "toggle SENINF_EN once the PHY is up");
++
++static bool hsrx_det;
++module_param(hsrx_det, bool, 0644);
++MODULE_PARM_DESC(hsrx_det, "leave CSI2 HSRX_DET_EN set instead of clearing it");
++
+ static bool vendor_regs = true;
+ module_param(vendor_regs, bool, 0644);
+ MODULE_PARM_DESC(vendor_regs,
+@@ -1002,10 +1049,25 @@
+ 	reg_update(inst + SENINF_MIPI_RX_CONBC, 0x030f7f0fu, 0x00050400u);
+ 	reg_update(inst + SENINF_MIPI_RX_COND0, 0x0000003fu, 0x0000000fu);
+ 
+-	/* Decode configuration the upstream drivers leave at zero. */
+-	writel(0x15, inst + SENINF_CSI2_CTRL_TRIO_CON);
++	/*
++	 * Decode configuration the upstream drivers leave at zero. These are
++	 * the streaming vendor's own values, and two of the three used to be
++	 * 0x15 here -- a number carried over from a C-PHY code path.
++	 *
++	 * SENINF_CSI2_RESYNC_MERGE_EN in particular is the whole of #65. With
++	 * it set the receiver behaves perfectly at every level this driver can
++	 * observe -- the analog bank matches the vendor byte for byte, the
++	 * clock lane FSM reads 0x10 and the data lanes alternate 0x01011010,
++	 * exactly as the vendor's do -- and the decoder still counts ZERO
++	 * packets and raises not one interrupt. Clearing it, with nothing else
++	 * changed, starts the packet counter immediately. Measured by poking
++	 * this one register mid-stream, 2026-08-26; the bit is the difference
++	 * between a link that trains and a link that decodes.
++	 */
++	writel(0x00, inst + SENINF_CSI2_CTRL_TRIO_CON);
+ 	writel(0x402, inst + SENINF_CSI2_MODE);
+-	reg_update(inst + SENINF_CSI2_RESYNC_MERGE_CTL, 0x17u, 0x15u);
++	reg_update(inst + SENINF_CSI2_RESYNC_MERGE_CTL,
++		   0x17u | SENINF_CSI2_RESYNC_MERGE_EN, 0x01u);
+ 	reg_update(inst + SENINF_CSI2_SYNC_RESYNC_CTL, 0x7u, 0x1u);
+ 	writel(readl(inst + SENINF_CSI2_POST_DETECT_CTL) | 2,
+ 	       inst + SENINF_CSI2_POST_DETECT_CTL);
+@@ -1027,6 +1089,17 @@
+ static void gemini_cam_vendor_regs(struct gemini_cam *cam, void __iomem *inst,
+ 				   void __iomem *mux)
+ {
++	/*
++	 * These three were missing from this list until 2026-08-26, because
++	 * the diff they were transcribed from was of the wrong SENINF
++	 * instance. +0x0a74 is the one that mattered: see
++	 * gemini_cam_rx_config(). They are written before CSI2_CTL so the
++	 * decoder is enabled last, against a settled configuration.
++	 */
++	writel(0x00000000, inst + SENINF_CSI2_DPCM);		/* ours 00000080 */
++	writel(0x00000001, inst + SENINF_CSI2_RESYNC_MERGE_CTL);/* ours 00000015 */
++	writel(0x00000000, inst + SENINF_CSI2_CTRL_TRIO_CON);	/* ours 00000015 */
++
+ 	/* CSI-2 decoder. ours 03896173 -> vendor 0d8961f3 */
+ 	writel(0x0d8961f3, inst + SENINF_CSI2_CTL);
+ 	writel(0x00000400, inst + 0x0a08);	/* ours 00001500 */
+@@ -1069,8 +1142,16 @@
+ 	writel(0xa6df8080, mux + SENINF_MUX_CTRL);
+ 	if (mux != inst)
+ 		writel(0x86df0080, inst + SENINF_MUX_CTRL);
+-	writel(0x000e2000, mux + 0x0d2c);	/* ours 000c2000 */
+-	writel(0x00000000, mux + 0x0d3c);	/* ours 00000001 */
++	/*
++	 * These two are per-mux, and until 2026-08-26 they carried INSTANCE
++	 * 1's values -- transcribed from a diff of the receiver instance,
++	 * whose mux is idle on the vendor. On the mux that actually carries
++	 * video, instance 0, the vendor reads 000e0000 and 00000001. Writing
++	 * instance 1's 00000000 to +0x0d3c here silently undid SRC_SEL_EXT
++	 * every time seninf_start() set it, which is the second half of #65.
++	 */
++	writel(0x000e0000, mux + 0x0d2c);
++	writel(0x00000001, mux + 0x0d3c);
+ 
+ 	dev_dbg(cam->dev, "vendor register set applied\n");
+ }
+@@ -1099,7 +1180,8 @@
+ 	 * because the part predates them. The analog PHY is configured through
+ 	 * mipi_RX_ana instead, and the SENINF-to-PHY mapping is fixed.
+ 	 */
+-	gemini_cam_phy_setup(cam);
++	if (!phy_late)
++		gemini_cam_phy_setup(cam);
+ 
+ 	reg_update(inst + SENINF_MIPI_RX_CON24,
+ 		   SENINF_MIPI_RX_CON24_LN0_MUX | SENINF_MIPI_RX_CON24_LN1_MUX |
+@@ -1142,8 +1224,14 @@
+ 		inst_update(cam, SENINF_CTRL_EXT, SENINF_CTRL_EXT_NCSI2_IP_EN, 0);
+ 	}
+ 
+-	/* Plain RAW10, no DPCM compression. */
+-	writel(SENINF_CSI2_DPCM_DI_30_EN, inst + SENINF_CSI2_DPCM);
++	/*
++	 * Plain RAW10, no DPCM compression -- so leave the DPCM block alone.
++	 * The streaming vendor reads 0 here; we used to set DI_30_EN, which
++	 * asks the decoder to expand data type 0x30 that this sensor never
++	 * sends. Harmless on its own (measured), but there is no reason to
++	 * differ from the vendor on a register this driver does not need.
++	 */
++	writel(0, inst + SENINF_CSI2_DPCM);
+ 
+ 	inst_update(cam, SENINF_CSI2_LNRD_TIMING,
+ 		    SENINF_CSI2_LNRD_TIMING_DATA_SETTLE, settle_delay);
+@@ -1158,8 +1246,16 @@
+ 		    SENINF_CSI2_RESYNC_BYPASS, 0);
+ 	inst_update(cam, SENINF_CSI2_RESYNC_MERGE_CTL,
+ 		    SENINF_CSI2_RESYNC_CDPHY_SEL, 0);
++	/*
++	 * 1, not the 3 this used to write: the streaming vendor's whole
++	 * register reads 0x01. gemini_cam_rx_config() runs after this and sets
++	 * the same field, so the two have to agree or the readback lies about
++	 * which line configured it.
++	 */
++	inst_update(cam, SENINF_CSI2_RESYNC_MERGE_CTL,
++		    SENINF_CSI2_RESYNC_CPHY_CNT, 1);
+ 	inst_update(cam, SENINF_CSI2_RESYNC_MERGE_CTL,
+-		    SENINF_CSI2_RESYNC_CPHY_CNT, 3);
++		    SENINF_CSI2_RESYNC_MERGE_EN, 0);
+ 	inst_update(cam, SENINF_CSI2_MODE, SENINF_CSI2_MODE_CSI2_MODE, 0);
+ 	inst_update(cam, SENINF_CSI2_MODE, SENINF_CSI2_MODE_HEADER_LEN, 0);
+ 	inst_update(cam, SENINF_CSI2_DPHY_SYNC, SENINF_CSI2_DPHY_SYNC_MASK_0,
+@@ -1168,7 +1264,8 @@
+ 		    0x001d);
+ 
+ 	inst_update(cam, SENINF_CSI2_CTL, SENINF_CSI2_CTL_CLOCK_HS_OPTION, 0);
+-	inst_update(cam, SENINF_CSI2_CTL, SENINF_CSI2_CTL_HSRX_DET_EN, 0);
++	inst_update(cam, SENINF_CSI2_CTL, SENINF_CSI2_CTL_HSRX_DET_EN,
++		    hsrx_det ? 1 : 0);
+ 	if (csi2_ctl_or)
+ 		writel(readl(inst + SENINF_CSI2_CTL) | csi2_ctl_or,
+ 		       inst + SENINF_CSI2_CTL);
+@@ -1216,13 +1313,25 @@
+ 	inst_update(cam, SENINF_CTRL, SENINF_CTRL_CSI2_SW_RST, 0);
+ 
+ 	/* FIFO mux: one pixel per clock, normal (non-JPEG) FIFO thresholds. */
++	if (phy_late)
++		gemini_cam_phy_setup(cam);
++
++	if (decoder_reset) {
++		/*
++		 * Re-latch the receiver against a now-settled configuration.
++		 * Drop SENINF_EN, let the block see a clean edge, bring it
++		 * back. If the lane FSM was stuck from being enabled while the
++		 * analog was already toggling, this is what would free it.
++		 */
++		inst_update(cam, SENINF_CTRL, SENINF_CTRL_SENINF_EN, 0);
++		udelay(20);
++		inst_update(cam, SENINF_CTRL, SENINF_CTRL_SENINF_EN, 1);
++		udelay(20);
++	}
++
+ 	mux_update(cam, SENINF_MUX_CTRL, SENINF_MUX_CTRL_MUX_EN, 1);
+ 	mux_update(cam, SENINF_MUX_CTRL, SENINF_MUX_CTRL_SRC_SEL,
+ 		   SENINF_MIPI_SENSOR);
+-	mux_update(cam, SENINF_MUX_CTRL_EXT, SENINF_MUX_CTRL_EXT_SRC_SEL_EXT,
+-		   SENINF_NORMAL_MODEL);
+-	mux_update(cam, SENINF_MUX_CTRL_EXT, SENINF_MUX_CTRL_EXT_PIX_SEL_EXT,
+-		   pixel_mode == 4 ? 1 : 0);
+ 	mux_update(cam, SENINF_MUX_CTRL, SENINF_MUX_CTRL_PIX_SEL,
+ 		   pixel_mode == 2 ? 1 : 0);
+ 	mux_update(cam, SENINF_MUX_CTRL, SENINF_MUX_CTRL_FIFO_FULL_WR_EN, 2);
+@@ -1239,6 +1348,22 @@
+ 	writel(val & ~(SENINF_MUX_CTRL_IRQ_SW_RST | SENINF_MUX_CTRL_MUX_SW_RST),
+ 	       mux + SENINF_MUX_CTRL);
+ 
++	/*
++	 * MUX_CTRL_EXT is programmed HERE, after the mux software reset, and
++	 * not before it: the reset clears the register, and for as long as
++	 * these two writes were the other way round SRC_SEL_EXT read back 0
++	 * against the vendor's 1 and the FIFO mux ignored the stream
++	 * completely -- MUX_INTSTA 0, no frame size, nothing reaching CAMSV,
++	 * with a CSI-2 decoder that was by then working perfectly. Setting it
++	 * mid-stream by hand is what proved it (2026-08-26): MUX_INTSTA went
++	 * to the vendor's 0x58 and the mux began measuring frames in the same
++	 * second.
++	 */
++	mux_update(cam, SENINF_MUX_CTRL_EXT, SENINF_MUX_CTRL_EXT_SRC_SEL_EXT,
++		   SENINF_NORMAL_MODEL);
++	mux_update(cam, SENINF_MUX_CTRL_EXT, SENINF_MUX_CTRL_EXT_PIX_SEL_EXT,
++		   pixel_mode == 4 ? 1 : 0);
++
+ 	writel(SENINF_MUX_SPARE_FIFO_FULL_SEL | 0xc0000, mux + SENINF_MUX_SPARE);
+ 
+ 	/* Report every mux error the block can raise, so overflows are counted. */
