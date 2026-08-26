@@ -283,7 +283,43 @@ schema's two-level shape.
  			pinmux = <MT6797_GPIO70__FUNC_GPIO70>,
  				 <MT6797_GPIO71__FUNC_GPIO71>,
  				 <MT6797_GPIO72__FUNC_GPIO72>;
-@@ -2855,8 +2865,8 @@
+@@ -2802,10 +2812,33 @@
+ 		 * per CAMSV pair, and the vendor enables all three together
+ 		 * whenever any CAMSV runs.
+ 		 */
++		/*
++		 * The imgsys clocks are here because the VENDOR enables them
++		 * before it touches any CAM gate. ISP_EnableClock() in the
++		 * vendor's mt6797 camera_isp.c goes
++		 *
++		 *   SCP_SYS_DIS -> MM_SMI_COMMON -> SCP_SYS_ISP
++		 *     -> IMG_LARB6 -> IMG_DIP -> IMG_DPE -> IMG_FDVT
++		 *     -> CAM_LARB2 -> CAM_CAMSYS -> ... -> CAM_CAMSV*
++		 *
++		 * and its comment says the order must be kept. Measured
++		 * 2026-08-25: on our kernel imgsys (0x15000000) reads 0xfff --
++		 * every gate closed -- while the vendor has them open the whole
++		 * time its ISP runs. That is a real difference between the two
++		 * and one of only two candidates left for CAM_A reading zero on
++		 * us (#66); the block itself is NOT bus-protected, which was
++		 * confirmed by reading 119 non-zero rows out of it on Android
++		 * while the vendor streamed.
++		 */
+ 		clocks = <&camsys CLK_CAM_CAMSV0>,
+ 			 <&camsys CLK_CAM_CAMSV1>,
+-			 <&camsys CLK_CAM_CAMSV2>;
+-		clock-names = "camsv0", "camsv1", "camsv2";
++			 <&camsys CLK_CAM_CAMSV2>,
++			 <&imgsys CLK_IMG_LARB6>,
++			 <&imgsys CLK_IMG_DIP>,
++			 <&imgsys CLK_IMG_DPE>,
++			 <&imgsys CLK_IMG_FDVT>;
++		clock-names = "camsv0", "camsv1", "camsv2",
++			      "img_larb6", "img_dip", "img_dpe", "img_fdvt";
+ 
+ 		/*
+ 		 * The camera domain: rails, camsys gates, the ISP MTCMOS
+@@ -2855,8 +2888,8 @@
  	 * pinconf), so the vendor's ISP_DRIVING_8MA drive strength cannot be
  	 * expressed here and the pads keep whatever the preloader left.
  	 */

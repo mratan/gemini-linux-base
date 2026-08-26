@@ -77,6 +77,15 @@ matches the vendor, which is a much narrower place to be looking.
  static bool phy_pair = true;
  module_param(phy_pair, bool, 0644);
  MODULE_PARM_DESC(phy_pair, "configure this bank and its B half at +0x200 as a pair");
+@@ -547,7 +569,7 @@
+ 	void __iomem *seninf;
+ 	void __iomem *camsv;
+ 	void __iomem *mipi_ana;
+-	struct clk_bulk_data clks[3];
++	struct clk_bulk_data clks[7];
+ 	int num_clks;
+ 	int irq;
+ 
 @@ -992,6 +1014,65 @@
  	writel(SENINF_CSI2_HSRX_DBG_EN_ALL, inst + SENINF_CSI2_INT_EN_EXT);
  }
@@ -153,3 +162,38 @@ matches the vendor, which is a much narrower place to be looking.
  	dev_dbg(cam->dev,
  		"seninf started: inst %u csi %u mux %u cam_mux %u; top_mux 0x%08x cam_mux 0x%08x mux_ctrl 0x%08x csi2_ctl 0x%08x\n",
  		seninf_inst, seninf_csi, seninf_mux, seninf_cam_mux,
+@@ -2139,13 +2223,30 @@
+ 		return dev_err_probe(dev, PTR_ERR(cam->mipi_ana),
+ 				     "cannot map the MIPI RX analog PHY\n");
+ 
+-	cam->clks[0].id = "camsv0";
+-	cam->clks[1].id = "camsv1";
+-	cam->clks[2].id = "camsv2";
++	/*
++	 * ORDER MATTERS, and it is the vendor's order. ISP_EnableClock() in
++	 * the vendor's mt6797 camera_isp.c enables the IMG clocks BEFORE any
++	 * CAM gate, with a comment saying the sequence must be kept.
++	 * clk_bulk_prepare_enable() walks this array in order, so imgsys goes
++	 * first here.
++	 *
++	 * Measured 2026-08-25: our kernel leaves imgsys (0x15000000) at 0xfff,
++	 * every gate closed, while the vendor has them open the whole time its
++	 * ISP runs. See #66 -- CAM_A is NOT bus-protected (119 non-zero rows
++	 * read out of it on Android while the vendor streamed), so a missing
++	 * clock in the wrong order is exactly the shape of what is left.
++	 */
++	cam->clks[0].id = "img_larb6";
++	cam->clks[1].id = "img_dip";
++	cam->clks[2].id = "img_dpe";
++	cam->clks[3].id = "img_fdvt";
++	cam->clks[4].id = "camsv0";
++	cam->clks[5].id = "camsv1";
++	cam->clks[6].id = "camsv2";
+ 	cam->num_clks = ARRAY_SIZE(cam->clks);
+ 	ret = devm_clk_bulk_get(dev, cam->num_clks, cam->clks);
+ 	if (ret)
+-		return dev_err_probe(dev, ret, "CAMSV clocks\n");
++		return dev_err_probe(dev, ret, "camsys/imgsys clocks\n");
+ 
+ 	cam->irq = platform_get_irq(pdev, 0);
+ 	if (cam->irq < 0)
