@@ -1,0 +1,93 @@
+From: Gemini PDA Linux port <mratan/gemini-linux>
+Subject: [PATCH] clk: mediatek: mt6797: number the imgsys clock IDs from 0
+
+The MT6797 imgsys clock IDs ran 1..4 with CLK_IMG_NR 5, while
+clk-mt6797-img.c sizes its provider with ARRAY_SIZE(img_clks) = 4. So the
+allocation covers indices 0..3 and CLK_IMG_LARB6 (4) falls outside it --
+any consumer asking for it gets -ENOENT and the clock can never be handed
+out.
+
+Raising num_clks to CLK_IMG_NR is NOT the fix, and it is worth writing
+down why: mtk_clk_desc uses num_clks for BOTH the clk_data allocation and
+the iteration over clks[] in __mtk_clk_simple_probe(). A 5 makes the gate
+registration read img_clks[4], off the end of the array. Tried on build
+#86: LK runs, the panel lights, then the kernel dies with no console and
+no USB gadget, and recovery took SP Flash Tool over the preloader window.
+
+Numbering the IDs from 0 fixes it cleanly. It is safe here because
+nothing else in tree consumes an MT6797 imgsys clock -- this SoC's first
+consumer is the camera bridge added alongside.
+
+The effect is not cosmetic. With the clocks reachable and enabled in the
+vendor's order (IMG before CAM, as ISP_EnableClock() does), the pass1 ISP
+becomes accessible for the first time:
+
+  before   CAM_A 0 non-zero of 256, CAM_B 0 of 256
+  after    CAM_A 51 non-zero of 256, CAM_B 51 of 256
+
+and every static CAM_B register matches the value read off the vendor
+while its camera streamed -- +0x00c 40000000, +0x014 00000010,
++0x040 00000002, +0x070 0000f000, +0x078 20140831, +0x07c 65990000,
++0x0a8 7fffffff, +0x0ac 000007bf.
+
+That retires the last hypothesis on #66. CAM_A was never bus-protected;
+it was unclocked, because the clock it needed could not be requested.
+---
+--- a/drivers/clk/mediatek/clk-mt6797-img.c
++++ b/drivers/clk/mediatek/clk-mt6797-img.c
+@@ -28,6 +28,23 @@
+ 
+ static const struct mtk_clk_desc img_desc = {
+ 	.clks = img_clks,
++	/*
++	 * DO NOT "fix" this to CLK_IMG_NR. It looks wrong -- the IDs run 1..4
++	 * so CLK_IMG_LARB6 (4) is outside the 0..3 that ARRAY_SIZE gives, and
++	 * consumers asking for it get -ENOENT -- but num_clks is used for BOTH
++	 * the clk_data allocation AND the iteration over clks[] in
++	 * __mtk_clk_simple_probe(). Raising it to 5 makes the gate
++	 * registration read img_clks[4], off the end of the array, and the
++	 * kernel does not survive it. Tried on build #86: boots to LK, panel
++	 * comes up, then dies with no console and no USB gadget; recovery
++	 * needed SP Flash Tool over the preloader.
++	 *
++	 * The underlying bug is real and still unfixed: this provider cannot
++	 * hand out CLK_IMG_LARB6. Fixing it properly means either renumbering
++	 * the IDs in dt-bindings/clock/mt6797-clk.h to start at 0 (safe here --
++	 * nothing else consumes them) or teaching mtk_clk_desc to size the
++	 * allocation separately from the array length.
++	 */
+ 	.num_clks = ARRAY_SIZE(img_clks),
+ };
+ 
+--- a/include/dt-bindings/clock/mt6797-clk.h
++++ b/include/dt-bindings/clock/mt6797-clk.h
+@@ -236,11 +236,24 @@
+ #define	CLK_CAM_NR				7
+ 
+ /* IMG_SYS */
+-#define	CLK_IMG_FDVT				1
+-#define	CLK_IMG_DPE				2
+-#define	CLK_IMG_DIP				3
+-#define	CLK_IMG_LARB6				4
+-#define	CLK_IMG_NR				5
++/*
++ * These IDs start at 0 on purpose. They used to run 1..4 with CLK_IMG_NR 5,
++ * and clk-mt6797-img.c sizes its provider with ARRAY_SIZE(img_clks) = 4 --
++ * so CLK_IMG_LARB6 fell outside the allocated 0..3 and consumers got -ENOENT.
++ *
++ * Raising num_clks to CLK_IMG_NR is NOT the fix: mtk_clk_desc uses num_clks
++ * for both the allocation and the iteration over clks[], so a 5 reads
++ * img_clks[4] off the end of the array and the kernel dies at boot (build
++ * #86, 2026-08-25 -- recovery needed SP Flash Tool over the preloader).
++ *
++ * Renumbering is safe here because nothing else in tree consumes an MT6797
++ * imgsys clock; this SoC's first consumer is the camera bridge.
++ */
++#define	CLK_IMG_FDVT				0
++#define	CLK_IMG_DPE				1
++#define	CLK_IMG_DIP				2
++#define	CLK_IMG_LARB6				3
++#define	CLK_IMG_NR				4
+ 
+ /* MM_SYS */
+ #define	CLK_MM_SMI_COMMON			1
