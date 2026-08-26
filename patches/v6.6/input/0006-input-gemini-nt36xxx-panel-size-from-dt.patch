@@ -1,0 +1,182 @@
+Subject: [PATCH] input: gemini-nt36xxx: take the panel size from the device tree
+
+The axes are registered at probe. The firmware cannot be asked at probe. So
+the axes were registered from a fallback that is wrong for this board.
+
+This is a TDDI part: the touch controller shares the panel's power domain and
+does not answer on I2C until the panel is prepared. Measured on build #89:
+
+  [ 0.851] gemini-nt36xxx 4-0062: firmware info read failed (-6); assuming 1080x1920
+  [ 5.483] gemini-nt36xxx 4-0062: page select failed: -6
+  [ 6.677] gemini-nt36xxx 4-0062: firmware reports 1080x2160
+
+Probe runs at 0.85 s; the controller does not ACK until 6.68 s. The later read
+updated ts->max_x/max_y but nothing ever revised the registered axis, so the
+driver reported over 0..2160 while having declared 0..1920. libinput
+normalises against the declaration, so every touch was stretched by
+2160/1920 = 1.125 and anything past x=1920 was delivered to no surface at all
+-- the right-hand 11% of the screen dead, which is where the taskbar's wifi
+and volume icons live.
+
+Retrying inside probe cannot fix this; it would have to spin for six seconds.
+-EPROBE_DEFER cannot either: deferred probe is retried when other drivers
+bind, and nothing binds at the moment DRM prepares the panel, so the driver
+could sit deferred indefinitely.
+
+The panel geometry is a property of the board and is known at probe. Take it
+from the standard touchscreen-size-x/y properties and use the firmware read
+only to confirm it, warning loudly if the two disagree rather than adopting a
+size the registered axis can no longer follow.
+
+The board's other, unused touch controller node (solomon,ssd2092-touch) has
+carried touchscreen-size-x/y = 1080/2160 all along, derived independently from
+the vendor driver's mapping -- so the geometry has two agreeing sources.
+
+Verified that dtbs_check actually validates this node rather than skipping it:
+inserting a bogus property produces
+"touchscreen@62 (novatek,nt36xxx-ts): Unevaluated properties are not allowed",
+and removing it returns the DTB to 0 warnings.
+
+--- a/drivers/input/touchscreen/gemini-nt36xxx.c
++++ b/drivers/input/touchscreen/gemini-nt36xxx.c
+@@ -76,7 +76,12 @@
+ #define NVT_MAX_FINGERS		10
+ #define NVT_MAX_PRESSURE	1000	/* TOUCH_FORCE_NUM */
+ 
+-/* Fallbacks if the firmware-info read fails; the vendor uses the same. */
++/*
++ * Last-resort fallbacks if neither the device tree nor the firmware says.
++ * The vendor uses the same, and on this board they are WRONG: the panel is
++ * 1080x2160. Prefer touchscreen-size-x/y in the device tree -- see the long
++ * comment above nvt_read_fw_info().
++ */
+ #define NVT_DEFAULT_MAX_X	1080
+ #define NVT_DEFAULT_MAX_Y	1920
+ 
+@@ -177,32 +182,73 @@
+ 	msleep(50);
+ }
+ 
++/*
++ * THE FIRMWARE CANNOT BE ASKED AT PROBE TIME, AND THE AXES ARE REGISTERED AT
++ * PROBE TIME.
++ *
++ * This is a TDDI part: the touch controller shares the panel's power domain,
++ * so it does not answer on I2C until the panel is prepared. Measured on this
++ * board (build #89):
++ *
++ *   [ 0.851] firmware info read failed (-6); assuming 1080x1920   <- probe
++ *   [ 5.483] page select failed: -6
++ *   [ 6.677] firmware reports 1080x2160                           <- panel up
++ *
++ * Probe runs at 0.85 s and the controller does not ACK until 6.68 s. So the
++ * probe-time read fails, the axes get registered from the fallback, and the
++ * later read updates ts->max_x/max_y without ever revising the registered
++ * range. The driver then REPORTS over 0..2160 while having DECLARED 0..1920,
++ * libinput normalises against the declaration, and the right-hand 11% of the
++ * screen is dead to touch -- which is how this was found (#76).
++ *
++ * Retrying inside probe cannot fix it; it would have to spin for six seconds.
++ * -EPROBE_DEFER cannot fix it either: deferred probe is retried when other
++ * drivers bind, and nothing binds at the moment DRM prepares the panel, so the
++ * driver could sit deferred forever.
++ *
++ * The panel geometry is a property of the BOARD, not something that has to be
++ * discovered. Take it from the standard touchscreen-size-x/y device-tree
++ * properties, which are known at probe, and use the firmware read only to
++ * confirm it.
++ */
+ static void nvt_read_fw_info(struct nvt_ts *ts)
+ {
++	u32 fw_x, fw_y;
+ 	u8 buf[17] = {};
+ 	int ret;
+ 
+ 	ret = nvt_read(ts, NVT_EVENT_FWINFO, buf, sizeof(buf));
+ 	if (ret) {
+ 		dev_warn(&ts->client->dev,
+-			 "firmware info read failed (%d); assuming %ux%u\n",
+-			 ret, NVT_DEFAULT_MAX_X, NVT_DEFAULT_MAX_Y);
+-		ts->max_x = NVT_DEFAULT_MAX_X;
+-		ts->max_y = NVT_DEFAULT_MAX_Y;
++			 "firmware info read failed (%d); keeping %ux%u\n",
++			 ret, ts->max_x, ts->max_y);
+ 		return;
+ 	}
+ 
+-	/* Panel resolution is reported by the firmware, not assumed. */
+-	ts->max_x = (buf[4] << 8) | buf[5];
+-	ts->max_y = (buf[6] << 8) | buf[7];
++	fw_x = (buf[4] << 8) | buf[5];
++	fw_y = (buf[6] << 8) | buf[7];
+ 
+-	if (!ts->max_x || !ts->max_y) {
+-		ts->max_x = NVT_DEFAULT_MAX_X;
+-		ts->max_y = NVT_DEFAULT_MAX_Y;
++	if (!fw_x || !fw_y) {
++		dev_warn(&ts->client->dev,
++			 "firmware reported a zero dimension (%ux%u); keeping %ux%u\n",
++			 fw_x, fw_y, ts->max_x, ts->max_y);
++		return;
+ 	}
+ 
+-	dev_info(&ts->client->dev, "firmware reports %ux%u\n",
+-		 ts->max_x, ts->max_y);
++	/*
++	 * Do not adopt a different size here: the input device's axis limits
++	 * were registered from ts->max_x/max_y at probe and cannot be revised
++	 * behind a client that has already opened it. Say so loudly instead --
++	 * a mismatch means the device tree is wrong, and silently reporting
++	 * outside the declared range is the bug this comment exists for.
++	 */
++	if (fw_x != ts->max_x || fw_y != ts->max_y)
++		dev_warn(&ts->client->dev,
++			 "firmware reports %ux%u but the axes were registered as %ux%u; fix touchscreen-size-x/y\n",
++			 fw_x, fw_y, ts->max_x, ts->max_y);
++	else
++		dev_dbg(&ts->client->dev, "firmware confirms %ux%u\n",
++			fw_x, fw_y);
+ }
+ 
+ static void nvt_ts_poll(struct input_dev *input)
+@@ -411,6 +457,18 @@
+ 	ts->swap_xy = device_property_read_bool(dev, "touchscreen-swapped-x-y");
+ 	ts->invert_y = device_property_read_bool(dev, "touchscreen-inverted-y");
+ 
++	/*
++	 * Before the reset, because nvt_read_fw_info() only confirms these --
++	 * it cannot supply them at probe time. See the comment above it.
++	 */
++	if (device_property_read_u32(dev, "touchscreen-size-x", &ts->max_x))
++		ts->max_x = NVT_DEFAULT_MAX_X;
++	if (device_property_read_u32(dev, "touchscreen-size-y", &ts->max_y))
++		ts->max_y = NVT_DEFAULT_MAX_Y;
++	if (!ts->max_x || !ts->max_y)
++		return dev_err_probe(dev, -EINVAL,
++				     "touchscreen-size-x/y must be non-zero\n");
++
+ 	nvt_reset(ts);
+ 	nvt_read_fw_info(ts);
+ 
+--- a/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
++++ b/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
+@@ -646,6 +646,19 @@
+ 		touchscreen-swapped-x-y;
+ 		touchscreen-inverted-y;
+ 		/*
++		 * The panel's native resolution, in the panel's own orientation
++		 * (the driver applies the swap above when it registers the
++		 * axes). This is NOT belt-and-braces for the firmware read: it
++		 * is the only source available in time. Being a TDDI part, the
++		 * controller does not answer on I2C until the panel is
++		 * prepared -- 6.68 s into boot, against a probe at 0.85 s -- so
++		 * the axes would otherwise be registered from the driver's
++		 * 1080x1920 fallback while the hardware reports up to 2160, and
++		 * the right-hand 11% of the screen is dead to touch (#76).
++		 */
++		touchscreen-size-x = <1080>;
++		touchscreen-size-y = <2160>;
++		/*
+ 		 * This is a TDDI part: the touch controller shares the panel's
+ 		 * die and its power domain, so the panel's prepare/unprepare is
+ 		 * this chip's power sequence. Naming the panel here makes the
