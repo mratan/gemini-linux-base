@@ -25,10 +25,10 @@ index 7a368fea6..ff69c47ae 100644
 +obj-$(CONFIG_TYPEC_FUSB301A) += fusb301a.o
 diff --git a/drivers/usb/typec/fusb301a.c b/drivers/usb/typec/fusb301a.c
 new file mode 100644
-index 000000000..e3d49ce6d
+index 0000000..162f68a
 --- /dev/null
 +++ b/drivers/usb/typec/fusb301a.c
-@@ -0,0 +1,205 @@
+@@ -0,0 +1,226 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * ON Semiconductor FUSB301 USB Type-C CC controller driver (Gemini PDA)
@@ -166,14 +166,35 @@ index 000000000..e3d49ce6d
 +				     "failed to read device ID\n");
 +
 +	/*
-+	 * Fixed SOURCE (host-side) role for the left port. LK/power-on
-+	 * default is SINK (0x04) — restored in shutdown so a reboot into
-+	 * the vendor Android chain sees the state it expects.
++	 * DRP (dual-role), NOT fixed SOURCE — and the difference is whether
++	 * this device can charge.
++	 *
++	 * This used to program FUSB301_MODE_SRC, so the left port was pinned
++	 * host-side. That was deliberate (B-19): both FUSB301 chips power up
++	 * as SINK, so host-mode devices presenting Rd were invisible until the
++	 * port was pinned as a source. What was never written down is the cost:
++	 * A TYPE-C CHARGER IS ALSO A SOURCE. Two sources never attach, so the
++	 * charger never enables VBUS — no charging, no LED, nothing in
++	 * software. It still charged from a Type-A -> C cable, because such a
++	 * cable carries a fixed Rp and supplies VBUS with no CC negotiation at
++	 * all, which is exactly why the fault presented as "one particular
++	 * charger is broken".
++	 *
++	 * Measured live on 2026-08-27 with a wall charger attached, by writing
++	 * the MODE register by hand:
++	 *   SOURCE: mode=0x01 status=0x00 online=0 Discharging 3.644 V
++	 *   DRP:    mode=0x10 status=0x2f online=1 Charging    4.164 V in 24 s
++	 *   CC change: status=0x2f type=0x08 (attach=1 vbusok=1 orient=2
++	 *              source-attached)
++	 *
++	 * DRP is strictly better here: the chip alternates Rp/Rd in hardware
++	 * and settles on whichever role the partner presents, so the port still
++	 * hosts devices and now also charges. Do not "restore" SRC.
 +	 */
-+	ret = regmap_write(fusb->regmap, FUSB301_REG_MODES, FUSB301_MODE_SRC);
++	ret = regmap_write(fusb->regmap, FUSB301_REG_MODES, FUSB301_MODE_DRP);
 +	if (ret)
 +		return dev_err_probe(&client->dev, ret,
-+				     "failed to set SOURCE mode\n");
++				     "failed to set DRP mode\n");
 +
 +	i2c_set_clientdata(client, fusb);
 +
@@ -183,7 +204,7 @@ index 000000000..e3d49ce6d
 +			      msecs_to_jiffies(FUSB301_POLL_MS));
 +
 +	dev_info(&client->dev,
-+		 "FUSB301 CC controller ready (id=0x%02x, SOURCE mode, polling)\n",
++		 "FUSB301 CC controller ready (id=0x%02x, DRP mode, polling)\n",
 +		 id);
 +	return 0;
 +}
