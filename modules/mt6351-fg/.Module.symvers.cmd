@@ -1,0 +1,1 @@
+savedcmd_/mercury/data/projects/gemini_linux/07-kernel/wt-main/modules/mt6351-fg/Module.symvers :=  scripts/mod/modpost -M        -o /mercury/data/projects/gemini_linux/07-kernel/wt-main/modules/mt6351-fg/Module.symvers -n -T /mercury/data/projects/gemini_linux/07-kernel/wt-main/modules/mt6351-fg/modules.order -i Module.symvers -e 

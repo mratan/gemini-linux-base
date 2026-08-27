@@ -1,0 +1,1 @@
+savedcmd_/mercury/data/projects/gemini_linux/07-kernel/wt-main/modules/mt6351-fg/mt6351_battery.mod := printf '%s\n'   mt6351_battery.o | awk '!x[$$0]++ { print("/mercury/data/projects/gemini_linux/07-kernel/wt-main/modules/mt6351-fg/"$$0) }' > /mercury/data/projects/gemini_linux/07-kernel/wt-main/modules/mt6351-fg/mt6351_battery.mod
