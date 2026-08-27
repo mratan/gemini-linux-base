@@ -1,0 +1,49 @@
+arm64: dts: mediatek: gemini: cap right-port USB to full speed
+
+The right port's MUSB host babbles at high speed with a real device. A CDC-NCM
+USB ethernet adapter enumerated, registered its interface, ran for 78 seconds
+and then died, reproducibly:
+
+    cdc_ncm 1-1:2.0 eth0: register 'cdc_ncm' at usb-musb-hdrc.3.auto-1
+    cdc_ncm 1-1:2.0 enx6c6e072b2e37: renamed from eth0
+    musb-hdrc musb-hdrc.3.auto: Babble
+    usb 1-1: USB disconnect, device number 2
+
+The node's own comment already offered the rollback -- "If HS regresses, drop
+back to full-speed (known good)" -- so take it. 12 Mbit/s is ample for what
+this port is for: ssh, tailscale and a terminal, not throughput.
+
+Not using "mediatek,babble-keep-session" (issue #27), which would keep high
+speed and ignore the babble: babble means the host saw traffic it could not
+frame, so ignoring it preserves a link that is corrupting data. A slower link
+that is correct is the better trade.
+
+diff --git a/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts b/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
+index 43e9f9d..a95878f 100644
+--- a/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
++++ b/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
+@@ -1927,8 +1927,23 @@
+ 		 * the num_eps=6 FIFO fix (usb/0002, build #254) removed the
+ 		 * actual defect, so high-speed (480 Mbps) is re-enabled.
+ 		 * If HS regresses, drop back to "full-speed" (known good).
++		 *
++		 * IT REGRESSED, 2026-08-27. A CDC-NCM USB ethernet adapter
++		 * enumerated and ran for 78 seconds, then:
++		 *     musb-hdrc musb-hdrc.3.auto: Babble
++		 *     usb 1-1: USB disconnect, device number 2
++		 * every time. So this takes the rollback the comment above
++		 * offers. Full speed is 12 Mbit/s, which is ample for ssh,
++		 * tailscale and a terminal -- the point of this port is a way
++		 * onto the network, not throughput.
++		 *
++		 * The alternative is "mediatek,babble-keep-session" (issue #27,
++		 * docs/usb11-hs-bulk-divergence.md), which ignores babble and
++		 * keeps the session up. Not chosen: babble means the host saw
++		 * traffic it could not frame, so ignoring it keeps a link that
++		 * is corrupting data. Prefer the slower link that is correct.
+ 		 */
+-		maximum-speed = "high-speed";
++		maximum-speed = "full-speed";
+ 		status = "okay";
+ 	};
+ };

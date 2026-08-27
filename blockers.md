@@ -5346,6 +5346,40 @@ so the last line before a wedge is already on the host. It caught the
 Not marked resolved: pstore would still be the better instrument for a failure
 that takes the network with it, and why the region does not survive is unknown.
 
+**🟢 RESOLVED 2026-08-27 (build #96) — THE PREMISE WAS WRONG. The region does
+survive, and pstore has been recording all along.**
+
+`/sys/fs/pstore` is empty on this device because **`systemd-pstore.service`
+empties it.** It ships enabled on Debian, runs at every boot, *moves* every
+record into `/var/lib/systemd/pstore/`, and clears the backend. An empty
+`/sys/fs/pstore` is indistinguishable from "no records were ever written",
+which is how it was read here for six days.
+
+There were 20 record files on the device going back to **2026-08-21 — the very
+day this blocker was opened** — grouping into three distinct crashes with full
+register dumps and complete Call traces. See `04-docs/captures/pstore-20260827/`
+and `gemini-oops` on the device.
+
+Both underlying facts were measured, not assumed:
+
+* **DRAM survives a `WDT_SWRST` on this SoC.** `scripts/gemini-dram-persistence.sh`
+  planted magics at thirteen reserved physical addresses; all came back
+  byte-exact after a full reset and bootloader run, including five inside
+  `ramoops@44410000` itself. Negative control worked: `lk@46000000` came back
+  holding ARM code (`0xea000007`), because LK really is reloaded there.
+* **The round trip works.** A string written to `/dev/pmsg0`, one
+  `gemini-reboot`, and the same string read back from
+  `/var/lib/systemd/pstore/pmsg-ramoops-0`.
+
+Answering the question at all required `CONFIG_STRICT_DEVMEM=n`
+(`configs/gemini-memdebug.config`): with it on, `busybox devmem 0x44410000`
+returns `mmap: Operation not permitted`, so no physical memory can be read and
+the "does the region survive" question cannot be put to the machine.
+
+The lesson worth carrying: **an empty directory is not a measurement.** The
+positive control — write something, reset, look for it — was available the whole
+time and costs one reboot.
+
 ## 🟡 B-36 — reading a DSI register block with the display asleep can hang the SoC
 
 **Opened 2026-08-21.** The documented trap was that such a read returns
