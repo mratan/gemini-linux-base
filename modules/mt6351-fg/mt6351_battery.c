@@ -15,7 +15,7 @@
  * at one voltage produced 23, 41, 23, 28, 28, 28. Worse, terminal voltage sags
  * under load, so the panel read 100% on the charger and 4% ten minutes later.
  *
- * WHAT ANDROID DOES, AND WHAT THIS COPIES
+ * WHAT ANDROID DOES, AND WHERE THIS NOW GOES FURTHER
  *
  * The vendor 3.18 tree (drivers/misc/mediatek/power/mt6797/battery_meter_hal.c)
  * does not guess. It reads a hardware gauge inside the MT6351:
@@ -27,22 +27,74 @@
  * and maps voltage to charge through a per-battery 82-point profile at four
  * temperatures, with a matching internal-resistance profile.
  *
- * This driver takes the same two inputs the vendor's software-OCV path uses --
- * measured current and terminal voltage -- and the vendor's own tables:
+ * The first version of this driver reproduced only the software-OCV half of
+ * that -- OCV = V_terminal + I * R_internal, then depth-of-discharge from the
+ * profile -- and did so with four defects that between them meant it was not
+ * actually doing it at all. Each is documented at the code that fixes it:
  *
- *   OCV = V_terminal + I * R_internal
+ *   1. FG_CURRENT_OUT was read without the latch sequence the vendor wraps it
+ *      in, so it never updated and I was 0. With I pinned at 0, OCV = V and
+ *      the driver was the bare voltage lookup it exists to replace.
+ *   2. the current register is sign-magnitude, not two's complement, so the
+ *      sign of the load compensation was inverted -- which would have made
+ *      things worse than no compensation the moment (1) was fixed.
+ *   3. terminal voltage came from the bq25890 charger's ADC, which steps in
+ *      20 mV. On this pack's plateau one LSB is about two percentage points,
+ *      and the reported capacity visibly flickered 79, 81, 79, 81 with the
+ *      battery doing nothing.
+ *   4. neither board calibration was applied: R_FG_VALUE (10 mOhm against a
+ *      20 mOhm base) and CAR_TUNE_VALUE (115). Together a factor of 2.3, so
+ *      every current and every coulomb count was low by more than half.
  *
- * with I from the hardware gauge (negative while charging) and R interpolated
- * from r_profile_t2. That removes the load-sag error that makes a bare voltage
- * reading useless, which is the entire complaint. State of charge then comes
- * from battery_profile_t2 as 100 - depth-of-discharge.
+ * With those fixed this matches the vendor's method. It then goes past it in
+ * three places, each because the vendor's choice was measurably worse on this
+ * board:
  *
- * WHAT IT DOES NOT DO YET
+ *   * COULOMB COUNTING. The vendor's software-OCV path reports whatever the
+ *     terminal voltage implies right now. This device lives on a charger, and
+ *     under load its pack voltage wanders 150 mV as the charger disengages and
+ *     re-engages -- measured, four cores of load: 4.174 -> 4.025 V and back,
+ *     on which the OCV-only gauge read 87, 70, 87%. The CAR is integrated in
+ *     hardware and moved smoothly through the same event. So the counter
+ *     carries the motion and the profile supplies the absolute reference,
+ *     combined in a complementary filter whose time constant depends on how
+ *     much the OCV estimate is currently worth.
+ *   * MEDIAN CURRENT. The vendor takes one instantaneous sample of
+ *     FG_CURRENT_OUT and multiplies it by the internal resistance. On this
+ *     board that sample swings +248, +267, +103, +94, -55, +114 mA under a
+ *     load that is not changing -- switching-charger ripple, straight into the
+ *     compensation term. A median of nine removes it.
+ *   * BATSNS, AVERAGED. Same channel and same scaling the vendor uses
+ *     (15 bits, 1800 mV, 1:3 divider = 0.165 mV per LSB) but averaged over
+ *     eight conversions, which costs nothing and is what defeats (3) above.
  *
- * It does not integrate the CAR. Coulomb counting needs a trustworthy starting
- * point and a reset policy, and the compensated-OCV path above is already a
- * large improvement and is self-correcting. CAR is read and exported as
- * CHARGE_COUNTER so the next step has a measured baseline to build on.
+ * WHAT IT STILL DOES NOT DO, AND WHY
+ *
+ * ONE TEMPERATURE PROFILE. The vendor carries four (T0 -10 C, T1 0 C, T2 25 C,
+ * T3 50 C) and interpolates between them; this uses T2 alone. The gap is small
+ * and it is measurable: at the same depth of discharge the T2 and T3 tables sit
+ * about 12 mV apart, which on this pack's plateau is roughly one percentage
+ * point, and the device runs near 38 C -- so about half a point of error.
+ *
+ * It is left undone deliberately rather than approximated, because the only
+ * temperature currently available is the bq25890's, and that driver's own
+ * comment for it reads "convert TS percentage into rough temperature". Feeding
+ * a rough number into a table interpolation manufactures precision that is not
+ * there, and can easily land further from the truth than simply using T2.
+ *
+ * Doing it properly means what the vendor does: BATON on the PMIC AUXADC
+ * (channel 3, r_val 2, 12-bit over 1800 mV, gated by PMIC_BATON_TDET_EN),
+ * converted to a resistance through the pull-up network and then to degrees
+ * through the vendor's NTC table -- and only then interpolating between two
+ * 82-point profiles. That is the shape of the work; it is worth about one
+ * percentage point.
+ *
+ * IT DOES NOT FORCE 100% WHEN THE CHARGER SAYS FULL, also deliberately.
+ * Mainline leaves the BQ25896 at its 4.208 V constant-voltage default where the
+ * vendor sets 4.352 V for this 4.35 V cell, so charging terminates with the
+ * pack resting near 4.18 V -- genuinely about 85% full, which is what this
+ * reports. Snapping to 100% at termination is the conventional lie and it would
+ * hide an open hardware question behind a satisfying number.
  *
  * ACCESS PATH
  *
@@ -62,6 +114,9 @@
 #include <linux/power_supply.h>
 #include <linux/delay.h>
 #include <linux/bits.h>
+#include <linux/mutex.h>
+#include <linux/jiffies.h>
+#include <linux/sort.h>
 
 #include "mt6351_battery_tables.h"
 
@@ -75,14 +130,123 @@
 #define CON0_LATCHDATA_ST	BIT(10)
 #define CON0_SW_CLEAR		BIT(11)
 
+/* MT6351 AUXADC. Channel 0 is BATSNS -- the battery sense line, which is what
+ * the vendor's read_adc_v_bat_sense() asks for via
+ * PMIC_IMM_GetOneChannelValue(PMIC_AUX_BATSNS_AP, times, 1).
+ */
+#define AUXADC_ADC23		0x0E2E	/* [14:0] CH0 value, [15] CH0 ready */
+#define AUXADC_RQST0_SET	0x0E98	/* write-1-to-set; bit 0 = request CH0 */
+#define AUXADC_RDY_CH0		BIT(15)
+#define AUXADC_VAL_MASK		0x7FFF
+/* pmic_auxadc.c: 15-bit converter, 1800 mV full scale, 1:3 divider on BATSNS */
+#define AUXADC_FULL_RANGE_MV	1800
+#define AUXADC_PRECISE		32768
+#define AUXADC_BAT_DIV		3
+/* The vendor averages VBAT (FG_VBAT_AVERAGE_SIZE 18). Eight is plenty here:
+ * one LSB is 3*1800/32768 = 0.165 mV, so the quantisation this replaces is
+ * already two orders of magnitude away.
+ */
+#define VBAT_SAMPLES		8
+/*
+ * FG_CURRENT_OUT is an INSTANTANEOUS sample, and on this board it is savage.
+ * Logged at 2 s intervals under a steady two-core load it read, in sequence:
+ * +248, +267, +103, +94, -55, +114, +73, +49, +69, +85 mA -- swinging sign,
+ * on a load that did not change. That is the switching charger's ripple, and
+ * the vendor's software-OCV path takes ONE such sample and multiplies it by
+ * the internal resistance, so its load compensation inherits the whole of it.
+ *
+ * A median of nine kills the spikes without the lag of a mean, and it is
+ * cheap: the samples come from nine latch cycles a few hundred microseconds
+ * apart, all inside the one-second cache window.
+ */
+#define CUR_SAMPLES		9
+
 /* battery_meter_hal.c: UNIT_FGCURRENT 158122 -> 158.122 uA per LSB */
 #define UNIT_FGCURRENT_NA	158122
+/*
+ * Board calibration, from mt6797 mt_battery_meter.h. NEITHER OF THESE WAS
+ * APPLIED, and together they are a factor of 2.3 -- so every current and every
+ * coulomb count this driver has ever reported was low by more than half.
+ *
+ *   R_FG_VALUE 10       the sense resistor is 10 mOhm and UNIT_FGCURRENT is
+ *                       calibrated against a 20 mOhm base, so half the volt
+ *                       drop for the same current: multiply by 20/10.
+ *   CAR_TUNE_VALUE 115  the board's own gauge trim, 1.15. (101 in the tree is
+ *                       the MT6353 variant; this device is MT6351.)
+ *
+ * R_FG_BOARD_SLOPE == R_FG_BOARD_BASE == 1000 on this board, so the vendor's
+ * K-current step is the identity and is not reproduced here.
+ */
+#define R_FG_VALUE		10
+#define R_FG_BASE		20
+#define CAR_TUNE_VALUE		115
+/* CAR LSB is 359.86 uAh before the FG_OSR=8 divider (battery_meter_hal.c) */
+#define CAR_LSB_UAH_X100	35986
+#define CAR_OSR			8
+#define CAR_RAW_MAX		0x1FFFF
 /* cust battery profile */
 #define Q_MAX_MAH		4268
+#define Q_MAX_UAH		((s64)Q_MAX_MAH * 1000)
+
+/*
+ * Complementary-filter time constants, in seconds.
+ *
+ * The charge estimate is carried by the coulomb counter and pulled towards the
+ * OCV estimate at a rate that depends on how much the OCV estimate is worth:
+ *
+ *   TAU_REST  nothing is flowing, so terminal voltage IS open-circuit voltage
+ *             and the profile lookup is trustworthy. Converge in ~2 minutes.
+ *             Note this includes a charger that has terminated: "at rest" is a
+ *             statement about current, not about the cable.
+ *   TAU_BUSY  actively charging, or under load. Charging holds the terminal
+ *             voltage up on the constant-voltage plateau where it says nothing
+ *             about charge; load drags it down by IR. Pull weakly, only enough
+ *             to bound coulomb-counter drift over an hour or so.
+ *
+ * Measured on this device 2026-08-27, four cores of load applied at t=69 s:
+ * terminal voltage went 4.174 -> 4.025 V and back, wandering 150 mV, while the
+ * charger re-engaged and disengaged. A pure OCV gauge reported 87, 70, 87% on
+ * that. The coulomb counter moved smoothly and monotonically throughout.
+ */
+#define TAU_REST		120
+#define TAU_BUSY		1800
+#define REST_CURRENT_UA		30000
+/*
+ * A single update may never close more than half the gap to the OCV estimate,
+ * however long it has been since the last one. Without this, an update after a
+ * long idle period clamps dt to tau and the correction term becomes the whole
+ * gap -- the estimate snaps to whatever the profile said at that instant, which
+ * is exactly the behaviour coulomb counting is here to avoid.
+ */
+#define MAX_CORRECTION_FRAC	2
+/*
+ * And the REPORTED percentage moves at most one point per this many seconds,
+ * whatever the estimate underneath does. Measured on 2026-08-27, before this
+ * was added: a deep load transient walked the reported value 77 -> 59 -> 89 in
+ * under a minute. Every one of those numbers had a defensible derivation and
+ * the sequence was still useless -- a battery indicator that jumps thirty
+ * points is not reporting charge, it is reporting weather. Real packs move at
+ * a few percent per minute at most, so anything faster is the estimator
+ * settling and should be spent smoothly rather than shown.
+ */
+#define SOC_SLEW_SECONDS	20
 
 static struct regmap *fg_regmap;
 static struct power_supply *bat_psy;
 static struct power_supply *chg_psy;
+
+/* The FGADC latch is a read-modify-write sequence on a single register and is
+ * emphatically not reentrant; the vendor wraps it in fgadc_hal_lock().
+ */
+static DEFINE_MUTEX(fg_lock);
+
+/* Raw-register tracing, for settling questions the decoded values cannot
+ * answer -- e.g. whether the CAR direction bit is actually being driven.
+ * echo 1 > /sys/module/mt6351_battery/parameters/fg_debug
+ */
+static bool fg_debug;
+module_param(fg_debug, bool, 0644);
+MODULE_PARM_DESC(fg_debug, "log raw FGADC registers on every snapshot");
 
 static struct regmap *pwrap_regmap(void)
 {
@@ -104,18 +268,37 @@ static struct regmap *pwrap_regmap(void)
 
 /* ---- hardware gauge reads ------------------------------------------------ */
 
-static int fg_current_ua(int *out)
-{
-	unsigned int v;
-	s32 lsb;
-
-	if (regmap_read(fg_regmap, FGADC_CON11, &v))
-		return -EIO;
-	lsb = (v & 0x8000) ? (s32)v - 0x10000 : (s32)v;
-	/* negative = charging, matching the vendor's decode */
-	*out = (int)div_s64((s64)lsb * UNIT_FGCURRENT_NA, 1000);
-	return 0;
-}
+/*
+ * THE FGADC OUTPUT REGISTERS DO NOT UPDATE UNLESS YOU LATCH THEM.
+ *
+ * This is the defect that mattered. fg_current_ua() used to be a bare
+ * regmap_read() of FGADC_CON11, with none of the sequence around it, so
+ * FG_CURRENT_OUT was never refreshed and the read came back 0 essentially
+ * always. Everything downstream inherited that: OCV = V + I*R with I == 0 is
+ * just V, so this driver has been a plain voltage lookup -- precisely the thing
+ * its own header says it exists to replace -- since the day it was written.
+ * Six consecutive samples on 2026-08-27 read 0, 0, 20, 0, 0, 0 mA on a machine
+ * that was drawing real current.
+ *
+ * The vendor sequence (battery_meter_hal.c, fgauge_read_current and
+ * fgauge_read_columb_internal, identical in both):
+ *
+ *   1. CON0[15:8] = 0x02      set SW_READ_PRE
+ *   2. wait for LATCHDATA_ST to go 1
+ *   3. read the output registers
+ *   4. CON0[15:8] = 0x08      clear the status
+ *   5. wait for LATCHDATA_ST to go 0
+ *   6. CON0[15:8] = 0x00      restore
+ *
+ * Current and CAR are latched by the SAME sequence, so this takes ONE snapshot
+ * of both. That is a small improvement on the vendor, which latches twice and
+ * therefore samples current and charge a few milliseconds apart.
+ */
+struct fg_snapshot {
+	int	cur_ua;		/* + discharging, - charging */
+	s64	car_uah;	/* + net charge in, - net charge out */
+	bool	valid;
+};
 
 static int fg_latch_wait(bool want_set)
 {
@@ -132,23 +315,211 @@ static int fg_latch_wait(bool want_set)
 	return -ETIMEDOUT;
 }
 
-/* CAR is latched, not directly readable: a naive read returns 0. */
-static int fg_car_raw(s64 *out)
+/*
+ * The raw current register is SIGN-MAGNITUDE-ish, not two's complement, and
+ * getting that wrong inverts the sign of the load compensation.
+ *
+ * The vendor decode is: 0 means zero; a raw value above 32767 means DIScharging
+ * with magnitude 65535 - raw; anything else means CHARGING with magnitude raw.
+ * Read as two's complement instead -- which is what this driver used to do --
+ * a discharge of 16 LSBs reads as -16 and is taken for a charge. OCV = V + I*R
+ * then SUBTRACTS the load drop instead of adding it, pushing the reported
+ * charge the wrong way by twice the error. It never showed because I was
+ * pinned at 0 by the missing latch above; it would have appeared the moment
+ * that was fixed.
+ */
+static int fg_decode_current(unsigned int raw)
 {
-	unsigned int hi, lo;
-	u32 car;
+	bool discharging;
+	s64 ua;
+	u32 mag;
 
-	if (regmap_update_bits(fg_regmap, FGADC_CON0, 0xFF00, 0x0200))
-		return -EIO;
-	fg_latch_wait(true);
-	if (regmap_read(fg_regmap, FGADC_CON1, &hi) ||
-	    regmap_read(fg_regmap, FGADC_CON2, &lo))
-		return -EIO;
-	car = (lo >> 11) | ((hi & 0x0FFF) << 5);
-	*out = (hi & 0x8000) ? -(s64)car : (s64)car;
+	if (raw == 0)
+		return 0;
+	if (raw > 32767) {
+		discharging = true;
+		mag = 65535 - raw;
+	} else {
+		discharging = false;
+		mag = raw;
+	}
+
+	ua = (s64)mag * UNIT_FGCURRENT_NA;
+	do_div(ua, 1000);				/* -> uA */
+	ua = ua * R_FG_BASE;
+	do_div(ua, R_FG_VALUE);				/* sense resistor */
+	ua = ua * CAR_TUNE_VALUE;
+	do_div(ua, 100);				/* board trim */
+
+	return discharging ? (int)ua : -(int)ua;
+}
+
+/*
+ * CAR is a free-running 35-bit accumulator; only bits [34:3] are exposed, as a
+ * 17-bit magnitude plus a direction bit.
+ *
+ * Two vendor details this driver did not have, both of which made the exported
+ * CHARGE_COUNTER meaningless:
+ *
+ *   * 0x1FFFF is a SENTINEL for "no reading", not a value. So is 0. The device
+ *     was reporting a constant -131060 from a raw of 0x1FFF4, which sits one
+ *     LSB shy of the sentinel -- a register that is not being driven.
+ *   * the discharge magnitude is 0x1FFFF - raw, not raw. Decoding it as raw
+ *     turns a value near the rail into an enormous negative number instead of
+ *     the small one it is, which is exactly what was observed.
+ *
+ * The result is scaled to real uAh here rather than left in LSBs, because
+ * POWER_SUPPLY_PROP_CHARGE_COUNTER is defined in uAh and anything else is a
+ * number that looks like an answer and is not one.
+ */
+static s64 fg_decode_car(unsigned int hi, unsigned int lo, bool *valid)
+{
+	u32 raw = (lo >> 11) | ((hi & 0x0FFF) << 5);
+	bool discharging = !!(hi & 0x8000);
+	s64 uah;
+	u32 mag;
+
+	*valid = true;
+	if (raw == 0 || raw == CAR_RAW_MAX) {
+		/* Not an error -- the vendor treats both as a legitimate zero. */
+		return 0;
+	}
+	mag = discharging ? (CAR_RAW_MAX - raw) : raw;
+
+	uah = (s64)mag * CAR_LSB_UAH_X100;
+	do_div(uah, 100);				/* LSB 359.86 uAh */
+	do_div(uah, CAR_OSR);				/* FG_OSR = 8 */
+	uah = uah * R_FG_BASE;
+	do_div(uah, R_FG_VALUE);
+	uah = uah * CAR_TUNE_VALUE;
+	do_div(uah, 100);
+
+	return discharging ? -uah : uah;
+}
+
+static int fg_read_snapshot(struct fg_snapshot *s)
+{
+	unsigned int cur_raw, car_hi, car_lo;
+	int ret;
+
+	s->valid = false;
+	mutex_lock(&fg_lock);
+
+	ret = regmap_update_bits(fg_regmap, FGADC_CON0, 0xFF00, 0x0200);
+	if (ret)
+		goto out;
+	ret = fg_latch_wait(true);
+	if (ret)
+		goto restore;
+
+	ret = regmap_read(fg_regmap, FGADC_CON11, &cur_raw);
+	if (!ret)
+		ret = regmap_read(fg_regmap, FGADC_CON1, &car_hi);
+	if (!ret)
+		ret = regmap_read(fg_regmap, FGADC_CON2, &car_lo);
+
+restore:
 	regmap_update_bits(fg_regmap, FGADC_CON0, 0xFF00, 0x0800);
 	fg_latch_wait(false);
 	regmap_update_bits(fg_regmap, FGADC_CON0, 0xFF00, 0x0000);
+out:
+	mutex_unlock(&fg_lock);
+	if (ret)
+		return ret;
+
+	if (fg_debug)
+		pr_info("mt6351-battery: raw CON11=%04x CON1=%04x CON2=%04x (car17=%05x dir=%d)\n",
+			cur_raw & 0xFFFF, car_hi, car_lo,
+			(car_lo >> 11) | ((car_hi & 0x0FFF) << 5),
+			!!(car_hi & 0x8000));
+
+	s->cur_ua = fg_decode_current(cur_raw & 0xFFFF);
+	s->car_uah = fg_decode_car(car_hi, car_lo, &s->valid);
+	s->valid = true;
+	return 0;
+}
+
+/*
+ * Battery voltage from the PMIC's own AUXADC, not from the charger.
+ *
+ * VOLTAGE_NOW used to be read straight off bq25890-charger-0, whose ADC steps
+ * in 20 mV. On the part of the discharge curve this pack sits on, 20 mV is
+ * about two percentage points of charge -- so the reported capacity flickered
+ * 79, 81, 79, 81 with the battery doing nothing at all, purely from one ADC
+ * LSB. That is not a smoothing problem, it is the wrong instrument.
+ *
+ * The vendor reads BATSNS on the PMIC AUXADC instead: 15 bits over 1800 mV
+ * through a 1:3 divider, so 0.165 mV per LSB. Two orders of magnitude finer,
+ * and it is the line the battery profile was characterised against.
+ */
+static int auxadc_read_ch0(unsigned int *out)
+{
+	unsigned int v;
+	int i, ret;
+
+	ret = regmap_write(fg_regmap, AUXADC_RQST0_SET, 0x1);
+	if (ret)
+		return ret;
+
+	for (i = 0; i < 200; i++) {
+		ret = regmap_read(fg_regmap, AUXADC_ADC23, &v);
+		if (ret)
+			return ret;
+		if (v & AUXADC_RDY_CH0) {
+			*out = v & AUXADC_VAL_MASK;
+			return 0;
+		}
+		udelay(100);
+	}
+	return -ETIMEDOUT;
+}
+
+static int cmp_int(const void *a, const void *b)
+{
+	return *(const int *)a - *(const int *)b;
+}
+
+/* Median of CUR_SAMPLES latched current reads; also returns the last CAR. */
+static int fg_current_median(int *out, s64 *car_uah, bool *car_valid)
+{
+	struct fg_snapshot s;
+	int v[CUR_SAMPLES];
+	int i, n = 0;
+
+	for (i = 0; i < CUR_SAMPLES; i++) {
+		if (fg_read_snapshot(&s))
+			continue;
+		v[n++] = s.cur_ua;
+		*car_uah = s.car_uah;
+		*car_valid = s.valid;
+	}
+	if (!n)
+		return -EIO;
+	sort(v, n, sizeof(v[0]), cmp_int, NULL);
+	*out = v[n / 2];
+	return 0;
+}
+
+static int auxadc_vbat_uv(int *uv)
+{
+	u64 acc = 0;
+	unsigned int raw;
+	int i, n = 0, ret;
+
+	for (i = 0; i < VBAT_SAMPLES; i++) {
+		ret = auxadc_read_ch0(&raw);
+		if (ret)
+			continue;
+		acc += raw;
+		n++;
+	}
+	if (!n)
+		return -EIO;
+
+	/* uV = raw * div * full_range_mV * 1000 / 2^15 */
+	acc = div_u64(acc, n);
+	acc = acc * AUXADC_BAT_DIV * AUXADC_FULL_RANGE_MV * 1000;
+	*uv = (int)div_u64(acc, AUXADC_PRECISE);
 	return 0;
 }
 
@@ -208,31 +579,222 @@ static int charger_prop(enum power_supply_property psp, int *val)
 	return 0;
 }
 
-/* Compensated state of charge, the vendor's software-OCV method. */
-static int compute_capacity(int *soc, int *ocv_mv_out, int *cur_ua_out)
+/* ---- state ---------------------------------------------------------------
+ *
+ * One cached reading, refreshed at most once a second. A panel widget asks for
+ * capacity, voltage, current and charge in quick succession; without this each
+ * of those would take its own FGADC latch and eight AUXADC conversions over
+ * the pwrap, and they would each see a slightly different instant.
+ */
+struct fg_state {
+	int	vbat_uv;
+	int	cur_ua;		/* + discharging, - charging */
+	int	ocv_mv;
+	s64	car_uah;	/* raw counter, + net charge in */
+	s64	q_uah;		/* tracked charge remaining */
+	int	soc;
+	int	soc_ocv;	/* what OCV alone would have said */
+	bool	car_valid;
+};
+
+/* Coulomb-counter tracking state. */
+static s64 tracked_q_uah;
+static s64 car_ref_uah;
+static bool tracking;
+static unsigned long tracked_at;
+static int soc_reported = -1;
+static bool seeded_at_rest;
+
+static struct fg_state cached;
+static unsigned long cached_at;
+static bool cached_ok;
+static DEFINE_MUTEX(state_lock);
+
+static int read_state_locked(struct fg_state *st)
 {
-	int vbat_uv, cur_ua = 0, ocv_mv, r, dod, i;
+	struct fg_snapshot snap;
+	int r, i, ret;
 
-	if (charger_prop(POWER_SUPPLY_PROP_VOLTAGE_NOW, &vbat_uv))
-		return -EIO;
-	fg_current_ua(&cur_ua);
+	ret = auxadc_vbat_uv(&st->vbat_uv);
+	if (ret) {
+		/* The charger's ADC is coarse but it is a real fallback. */
+		ret = charger_prop(POWER_SUPPLY_PROP_VOLTAGE_NOW, &st->vbat_uv);
+		if (ret)
+			return ret;
+	}
 
-	ocv_mv = vbat_uv / 1000;
+	if (fg_current_median(&snap.cur_ua, &snap.car_uah, &snap.valid)) {
+		snap.cur_ua = 0;
+		snap.car_uah = 0;
+		snap.valid = false;
+	}
+	st->cur_ua = snap.cur_ua;
+	st->car_uah = snap.car_uah;
+	st->car_valid = snap.valid;
+
 	/*
 	 * Two passes: R depends on OCV and OCV depends on R. The curve is
 	 * shallow so this converges immediately; the vendor iterates likewise.
 	 */
+	st->ocv_mv = st->vbat_uv / 1000;
 	for (i = 0; i < 2; i++) {
-		r = res_at_mv(ocv_mv);			/* 0.1 mOhm */
-		/* I is uA, r is 0.1 mOhm -> uA * 0.1 mOhm = 0.1 nV; /10^7 -> mV */
-		ocv_mv = vbat_uv / 1000 + (int)div_s64((s64)cur_ua * r, 10000000);
+		r = res_at_mv(st->ocv_mv);		/* 0.1 mOhm */
+		/* uA * 0.1 mOhm = 0.1 nV; /10^7 -> mV. I is + on discharge,
+		 * so this ADDS the load drop back, which is the whole point.
+		 */
+		st->ocv_mv = st->vbat_uv / 1000 +
+			     (int)div_s64((s64)st->cur_ua * r, 10000000);
 	}
 
-	dod = dod_at_mv(ocv_mv);
-	*soc = clamp(100 - dod, 0, 100);
-	*ocv_mv_out = ocv_mv;
-	*cur_ua_out = cur_ua;
+	st->soc_ocv = clamp(100 - dod_at_mv(st->ocv_mv), 0, 100);
+
+	/*
+	 * COULOMB COUNTING, corrected by OCV. This is the part the vendor's
+	 * software-OCV path does not do and the part that makes the number
+	 * usable on a machine that lives on a charger.
+	 *
+	 * The counter supplies the motion -- every microamp-hour in or out of
+	 * the pack, integrated in hardware at a 103.5 uAh quantum, immune to
+	 * the ripple that makes the instantaneous current unusable. The OCV
+	 * lookup supplies the absolute reference, because a counter alone
+	 * drifts and has no idea where it started.
+	 */
+	{
+		s64 q_ocv = div_s64((s64)st->soc_ocv * Q_MAX_UAH, 100);
+		unsigned long now = jiffies;
+		int chg_status = POWER_SUPPLY_STATUS_UNKNOWN;
+		bool at_rest;
+		u32 dt, tau, dt_report;
+
+		dt_report = jiffies_to_msecs(now - tracked_at) / 1000;
+		if (!tracking)
+			dt_report = 0;
+
+		charger_prop(POWER_SUPPLY_PROP_STATUS, &chg_status);
+		/*
+		 * "At rest" means terminal voltage IS open-circuit voltage, and
+		 * that is a statement about CURRENT, not about the cable.
+		 *
+		 * The condition here was DISCHARGING && small current, which is
+		 * correct and useless: this device lives on a charger and
+		 * essentially never reports DISCHARGING, so the fast correction
+		 * never engaged and the estimate coasted on whatever the seed
+		 * happened to be -- seeded, in one observed case, during a load
+		 * dip, and then held ten points low for as long as the machine
+		 * stayed plugged in.
+		 *
+		 * A charger that has TERMINATED is not pushing current. Once
+		 * status is Full and the gauge agrees that nothing is flowing,
+		 * the pack is as genuinely at rest as it would be unplugged.
+		 * The constant-voltage plateau that makes voltage a liar
+		 * applies while CHARGING, so that is the case to exclude -- and
+		 * only that one.
+		 */
+		at_rest = (chg_status != POWER_SUPPLY_STATUS_CHARGING) &&
+			  (abs(st->cur_ua) < REST_CURRENT_UA);
+
+		if (!tracking || !st->car_valid ||
+		    abs(tracked_q_uah - q_ocv) > div_s64(Q_MAX_UAH, 4)) {
+			/*
+			 * First reading, or the counter and the profile have
+			 * diverged past any plausible drift -- re-seed rather
+			 * than defend a number that is already wrong.
+			 */
+			tracked_q_uah = q_ocv;
+			car_ref_uah = st->car_uah;
+			tracking = true;
+			seeded_at_rest = at_rest;
+		} else if (!seeded_at_rest) {
+			/*
+			 * DO NOT ANCHOR THE COUNTER TO A READING TAKEN DURING
+			 * THE BOOT STORM.
+			 *
+			 * The reference this whole estimate hangs off is an OCV
+			 * lookup, and an OCV lookup is only worth anything when
+			 * nothing is flowing. Four seconds into boot this device
+			 * is drawing 709 mA, terminal voltage is 3.976 V, and the
+			 * profile says 65% for a pack that is really at 85%.
+			 * Seeding there locks in a twenty-point error and then
+			 * defends it, because coulomb counting is faithful to
+			 * whatever it was told to start from.
+			 *
+			 * So until a genuinely quiet sample turns up, follow the
+			 * OCV estimate directly -- no better than the vendor, but
+			 * no worse, and honest about it -- and keep the counter
+			 * reference rolling forward so nothing is double-counted
+			 * when the latch finally happens.
+			 */
+			tracked_q_uah = q_ocv;
+			car_ref_uah = st->car_uah;
+			if (at_rest) {
+				seeded_at_rest = true;
+				pr_info("mt6351-battery: anchored at %lld uAh (%d%%) on a resting sample\n",
+					tracked_q_uah,
+					(int)div_s64(tracked_q_uah * 100, Q_MAX_UAH));
+			}
+		} else {
+			s64 d = st->car_uah - car_ref_uah;
+
+			car_ref_uah = st->car_uah;
+			/* A jump larger than half the pack is the counter
+			 * wrapping or being reset, not real charge. */
+			if (abs(d) < div_s64(Q_MAX_UAH, 2))
+				tracked_q_uah += d;
+
+			dt = jiffies_to_msecs(now - tracked_at) / 1000;
+			tau = at_rest ? TAU_REST : TAU_BUSY;
+			if (dt > tau / MAX_CORRECTION_FRAC)
+				dt = tau / MAX_CORRECTION_FRAC;
+			if (dt)
+				tracked_q_uah += div_s64((q_ocv - tracked_q_uah) *
+							 dt, tau);
+			tracked_q_uah = clamp_t(s64, tracked_q_uah, 0, Q_MAX_UAH);
+		}
+		tracked_at = now;
+
+		st->q_uah = tracked_q_uah;
+		st->soc = (int)div_s64(tracked_q_uah * 100 + Q_MAX_UAH / 2,
+				       Q_MAX_UAH);
+		st->soc = clamp(st->soc, 0, 100);
+
+		/* Slew-limit what the world sees. The estimate above may step;
+		 * the reported percentage may not.
+		 */
+		if (soc_reported < 0 || !seeded_at_rest) {
+			/* Before the anchor there is nothing to protect: the
+			 * value is the OCV estimate and should track it. */
+			soc_reported = st->soc;
+		} else {
+			int budget = 1 + (int)(dt_report / SOC_SLEW_SECONDS);
+
+			if (st->soc > soc_reported + budget)
+				soc_reported += budget;
+			else if (st->soc < soc_reported - budget)
+				soc_reported -= budget;
+			else
+				soc_reported = st->soc;
+		}
+		st->soc = soc_reported;
+	}
 	return 0;
+}
+
+static int fg_state(struct fg_state *out)
+{
+	int ret = 0;
+
+	mutex_lock(&state_lock);
+	if (!cached_ok || time_after(jiffies, cached_at + HZ)) {
+		ret = read_state_locked(&cached);
+		if (!ret) {
+			cached_at = jiffies;
+			cached_ok = true;
+		}
+	}
+	if (!ret)
+		*out = cached;
+	mutex_unlock(&state_lock);
+	return ret;
 }
 
 /* ---- power_supply -------------------------------------------------------- */
@@ -255,8 +817,8 @@ static int bat_get_prop(struct power_supply *psy,
 			enum power_supply_property psp,
 			union power_supply_propval *val)
 {
-	int soc = 0, ocv = 0, cur = 0, tmp;
-	s64 car = 0;
+	struct fg_state st;
+	int tmp;
 
 	switch (psp) {
 	case POWER_SUPPLY_PROP_STATUS:
@@ -271,36 +833,38 @@ static int bat_get_prop(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_TECHNOLOGY:
 		val->intval = POWER_SUPPLY_TECHNOLOGY_LION;
 		return 0;
+	default:
+		break;
+	}
+
+	if (fg_state(&st))
+		return -EIO;
+
+	switch (psp) {
 	case POWER_SUPPLY_PROP_CAPACITY:
-		if (compute_capacity(&soc, &ocv, &cur))
-			return -EIO;
-		val->intval = soc;
+		val->intval = st.soc;
 		return 0;
 	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
-		return charger_prop(POWER_SUPPLY_PROP_VOLTAGE_NOW, &val->intval);
+		val->intval = st.vbat_uv;
+		return 0;
 	case POWER_SUPPLY_PROP_VOLTAGE_OCV:
-		if (compute_capacity(&soc, &ocv, &cur))
-			return -EIO;
-		val->intval = ocv * 1000;
+		val->intval = st.ocv_mv * 1000;
 		return 0;
 	case POWER_SUPPLY_PROP_CURRENT_NOW:
-		if (fg_current_ua(&cur))
-			return -EIO;
 		/* power_supply convention: positive = charging */
-		val->intval = -cur;
+		val->intval = -st.cur_ua;
 		return 0;
 	case POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN:
 	case POWER_SUPPLY_PROP_CHARGE_FULL:
 		val->intval = Q_MAX_MAH * 1000;		/* uAh */
 		return 0;
 	case POWER_SUPPLY_PROP_CHARGE_NOW:
-		if (compute_capacity(&soc, &ocv, &cur))
-			return -EIO;
-		val->intval = Q_MAX_MAH * 1000 / 100 * soc;
+		/* the tracked charge itself, not soc re-multiplied by Q_MAX --
+		 * that round trip threw away everything below one percent */
+		val->intval = (int)st.q_uah;
 		return 0;
 	case POWER_SUPPLY_PROP_CHARGE_COUNTER:
-		fg_car_raw(&car);
-		val->intval = (int)car;
+		val->intval = (int)st.car_uah;
 		return 0;
 	default:
 		return -EINVAL;
@@ -320,7 +884,7 @@ static struct platform_device *pdev_self;
 static int __init mt6351_bat_init(void)
 {
 	struct power_supply_config cfg = {};
-	int soc = 0, ocv = 0, cur = 0;
+	struct fg_state st;
 
 	fg_regmap = pwrap_regmap();
 	if (!fg_regmap) {
@@ -338,9 +902,10 @@ static int __init mt6351_bat_init(void)
 		return PTR_ERR(bat_psy);
 	}
 
-	if (!compute_capacity(&soc, &ocv, &cur))
-		pr_info("mt6351-battery: BAT0 ready — soc=%d%% ocv=%dmV current=%duA\n",
-			soc, ocv, cur);
+	if (!fg_state(&st))
+		pr_info("mt6351-battery: BAT0 ready — soc=%d%% (ocv-only %d%%) vbat=%duV ocv=%dmV I=%duA CAR=%lld uAh\n",
+			st.soc, st.soc_ocv, st.vbat_uv, st.ocv_mv, st.cur_ua,
+			st.car_uah);
 	else
 		pr_info("mt6351-battery: BAT0 ready (no reading yet)\n");
 	return 0;
