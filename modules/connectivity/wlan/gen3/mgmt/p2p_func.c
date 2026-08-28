@@ -3083,7 +3083,13 @@ VOID p2pFuncGenerateExtra_IEForBeacon(IN P_ADAPTER_T prAdapter, IN P_MSDU_INFO_T
 		if (p2pFuncIsAPMode(prAdapter->rWifiVar.prP2pFsmInfo))
 			break;
 
-		pucIEBuf = (PUINT_8) ((UINT_32) prMsduInfo->prPacket + (UINT_32) prMsduInfo->u2FrameLength);
+		/*
+		 * (ULONG) on the pointer, not (UINT_32): prPacket is a pointer and
+		 * this arithmetic produces one. Line 3854 of this same file already
+		 * says ULONG for the identical expression -- that one was fixed for
+		 * 64-bit and this one was missed.
+		 */
+		pucIEBuf = (PUINT_8) ((ULONG) prMsduInfo->prPacket + (UINT_32) prMsduInfo->u2FrameLength);
 
 		kalMemCopy(pucIEBuf, prP2pSpeBssInfo->aucBeaconIECache, prP2pSpeBssInfo->u2IELenForBCN);
 

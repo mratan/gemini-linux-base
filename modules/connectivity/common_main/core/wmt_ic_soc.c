@@ -1933,9 +1933,9 @@ static INT32 mtk_wcn_soc_crystal_triming_set(VOID)
 
 	bIsNvramExist = MTK_WCN_BOOL_FALSE;
 	 /**/ ctrlData.ctrlId = WMT_CTRL_CRYSTAL_TRIMING_GET;
-	ctrlData.au4CtrlData[0] = (UINT32) "/data/nvram/APCFG/APRDEB/WIFI";
-	ctrlData.au4CtrlData[1] = (UINT32) &pbuf;
-	ctrlData.au4CtrlData[2] = (UINT32) &bufLen;
+	ctrlData.au4CtrlData[0] = (size_t) "/data/nvram/APCFG/APRDEB/WIFI";
+	ctrlData.au4CtrlData[1] = (size_t) &pbuf;
+	ctrlData.au4CtrlData[2] = (size_t) &bufLen;
 
 	iRet = wmt_ctrl(&ctrlData);
 	if (0 != iRet) {
@@ -1965,7 +1965,7 @@ static INT32 mtk_wcn_soc_crystal_triming_set(VOID)
 				     bIsCrysTrimEnabled);
 		}
 		ctrlData.ctrlId = WMT_CTRL_CRYSTAL_TRIMING_PUT;
-		ctrlData.au4CtrlData[0] = (UINT32) "/data/nvram/APCFG/APRDEB/WIFI";
+		ctrlData.au4CtrlData[0] = (size_t) "/data/nvram/APCFG/APRDEB/WIFI";
 		iRet = wmt_ctrl(&ctrlData);
 		if (0 != iRet) {
 			WMT_ERR_FUNC("0x%x: WMT_CTRL_CRYSTAL_TRIMING_PUT fail:%d\n", wmt_ic_ops_soc.icId, iRet);
@@ -2374,21 +2374,43 @@ static INT32 mtk_wcn_soc_patch_dwn(VOID)
 	if (0 == iRet) {
 		/* patch with correct Hw Ver Major Num found */
 		ctrlData.ctrlId = WMT_CTRL_GET_PATCH_NAME;
-		ctrlData.au4CtrlData[0] = (UINT32) &gFullPatchName;
+/*
+		 * (size_t), NOT (UINT32) -- these are POINTERS.
+		 *
+		 * au4CtrlData is SIZE_T[] (wmt_ctrl.h), i.e. 64-bit here, and wmt_ctrl_get_patch()
+		 * casts these entries straight back to pointers and WRITES THROUGH THEM:
+		 *
+		 *     PPUINT8 ppBuf = (PPUINT8) pWmtCtrlData->au4CtrlData[2];
+		 *     PUINT32 pSize = (PUINT32) pWmtCtrlData->au4CtrlData[3];
+		 *     ...
+		 *     *ppBuf = (PUINT8)(pPatch)->data;
+		 *     *pSize = (pPatch)->size;
+		 *
+		 * &pbuf and &patchSize are kernel STACK addresses (0xffff8000_xxxxxxxx on
+		 * arm64). Casting through UINT32 discards the top half, so the consumer writes
+		 * eight bytes and four bytes through a pointer that is now in the low 4 GiB --
+		 * the userspace range -- on every CONSYS func-on.
+		 *
+		 * This is a 32-bit-era cast that the 64-bit port missed. The identical
+		 * operations in wmt_ic_6628.c already say (size_t); this file was not updated
+		 * with it, and this file is the one this SoC builds (Makefile: mtk_stp_wmt-objs
+		 * includes core/wmt_ic_soc.o, and 6620/6628 are not built at all).
+		 */
+		ctrlData.au4CtrlData[0] = (size_t) &gFullPatchName;
 		iRet = wmt_ctrl(&ctrlData);
 
 		WMT_INFO_FUNC("valid patch found: (%s)\n", gFullPatchName);
 		/* <2.2> read patch content */
 		ctrlData.ctrlId = WMT_CTRL_GET_PATCH;
 		ctrlData.au4CtrlData[0] = (UINT32) NULL;
-		ctrlData.au4CtrlData[1] = (UINT32) &gFullPatchName;
+		ctrlData.au4CtrlData[1] = (size_t) &gFullPatchName;
 
 	} else {
 		iRet -= 1;
 		return iRet;
 	}
-	ctrlData.au4CtrlData[2] = (UINT32) &pbuf;
-	ctrlData.au4CtrlData[3] = (UINT32) &patchSize;
+	ctrlData.au4CtrlData[2] = (size_t) &pbuf;
+	ctrlData.au4CtrlData[3] = (size_t) &patchSize;
 	iRet = wmt_ctrl(&ctrlData);
 	if (iRet) {
 		WMT_ERR_FUNC("wmt_core: WMT_CTRL_GET_PATCH fail:%d\n", iRet);
