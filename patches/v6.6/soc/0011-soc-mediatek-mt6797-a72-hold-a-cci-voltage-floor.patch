@@ -1,0 +1,160 @@
+soc: mediatek: mt6797-a72: pay for the CCI overclock this bring-up performs
+
+ARMCAXPLL2 is the CCI's PLL, not this cluster's, and mt6797_a72_set_clk()
+reprograms it to 750 MHz as a prerequisite for the firmware's CPU_ON gate. So
+onlining an A72 raises the interconnect from the 630 MHz the bootloader chose
+and leaves it there — measured three ways:
+
+  * the vendor maps LL/L/B/CCI to ARMCAXPLL0/1/NULL/2 (mt_cpufreq.c:5438), the
+    B cluster being the one with no PLL at all;
+  * with the A72s running at 1989 MHz, ARMCAXPLL2_CON1 still decodes to
+    750 MHz, which cannot be clocking a cluster at 1989;
+  * every pre-bring-up capture reads 0xc10c1d89 there, which is 630.4 MHz, and
+    every post-bring-up one reads 0x410e6c4e, which is 750.4.
+
+The CCI shares VPROC1 with the eight A53s, and their OPP tables floor at
+1000 mV — a floor the DTS justifies *by* the CCI being at 630 MHz. The vendor's
+CCI table prices 754 MHz at 1070 mV. So since the first build that onlined an
+A72, every boot has run the interconnect a full operating point under its
+specified voltage whenever both A53 clusters idle low, on a rail nothing told
+about the change.
+
+This holds a floor rather than pinning a voltage, and the difference is what
+makes it composable: the regulator core aggregates consumers by INTERSECTION,
+and mediatek-cpufreq asks for [vproc, proc_max_volt] — open at the top — so
+[1070000, max] can only ever raise the rail and never restricts what cpufreq
+may ask for above it. Held for exactly as long as the cluster is powered, which
+is exactly as long as the CCI is at 750 MHz. Taken before
+mt6797_a72_apply_prereqs(), because that is what moves the CCI.
+
+Never fatal. A cluster running with the interconnect slightly under-volted is
+what every boot has done so far; failing to improve on that is not a reason to
+refuse the cores.
+
+WHAT IT COSTS, stated rather than buried: the A53s idle at 624/650 MHz, priced
+at 1000 mV, so idle VPROC1 goes up 70 mV. That is the price of the overclock
+this driver already performs — it has simply been unpaid. The way to stop
+paying it is to stop overclocking the CCI: restore ARMCAXPLL2 after CPU_ON,
+which the firmware's gate may well allow, since it consumes the LATCHED
+CLK26CALI_1 count rather than measuring anything itself. That is a separate
+experiment with a hang risk — an unsatisfied gate spins forever at EL3 — and is
+deliberately not attempted here.
+
+Issue #84.
+
+--- a/drivers/soc/mediatek/mt6797-a72.c
++++ b/drivers/soc/mediatek/mt6797-a72.c
+@@ -126,6 +126,43 @@
+ #define A72_VPROC2_MAX_UV	1180000
+ 
+ /*
++ * VPROC1, the OTHER rail this bring-up moves — and it moves it without ever
++ * having said so. Issue #84.
++ *
++ * mt6797_a72_set_clk() below reprograms ARMCAXPLL2 to 750 MHz as a
++ * prerequisite for CPU_ON. ARMCAXPLL2 is the CCI's PLL, not this cluster's:
++ * the vendor maps LL/L/B/CCI to ARMCAXPLL0/1/NULL/2 (mt_cpufreq.c), and it is
++ * measurable here — with the A72s running at 1989 MHz, ARMCAXPLL2_CON1 still
++ * decodes to 750 MHz, while every pre-bring-up capture we have reads
++ * 0xc10c1d89, which is 630 MHz.
++ *
++ * So onlining an A72 raises the interconnect from 630 to 750 MHz. The CCI
++ * shares VPROC1 with the eight A53s, whose OPP tables floor at 1000 mV — and
++ * that floor is justified in the DTS *by* the CCI being at 630. The vendor's
++ * CCI table prices 754 MHz at 1070 mV. Every boot since the A72s first came up
++ * has therefore run the interconnect a full operating point under its
++ * specified voltage whenever both A53 clusters idle low.
++ *
++ * Fixed by holding a floor, not by pinning a voltage. The regulator core
++ * aggregates consumers by intersection, and mediatek-cpufreq asks for
++ * [vproc, proc_max_volt] — open at the top — so [1070000, max] composes with it
++ * and can only ever raise the rail, never restrict what cpufreq may ask for
++ * above it. Held for as long as the cluster is powered, which is exactly as
++ * long as the CCI is at 750 MHz.
++ *
++ * WHAT THIS COSTS, honestly: the A53s idle at 624/650 MHz, which their tables
++ * price at 1000 mV, so idle VPROC1 goes up by 70 mV. That is the price of the
++ * overclock this driver performs, not a new cost — it has simply been unpaid
++ * until now. The way to stop paying it is to stop overclocking the CCI:
++ * restore ARMCAXPLL2 after CPU_ON, which the firmware's frequency gate may well
++ * allow, since it consumes the LATCHED CLK26CALI_1 count rather than measuring
++ * anything itself. That is a separate experiment with a hang risk (an
++ * unsatisfied gate spins forever at EL3) and is not attempted here.
++ */
++#define CCI_MIN_UV		1070000
++#define CCI_MAX_UV		1200000
++
++/*
+  * CSPM. The firmware takes this hardware semaphore around its own accesses to
+  * the cluster clock dividers, and polls for it WITHOUT A BOUND. If anything
+  * left it held, PSCI CPU_ON never returns and the calling CPU is stuck at EL3
+@@ -214,6 +251,7 @@
+ static bool a72_ready;
+ static bool vproc2_on;
+ static struct regulator *vproc2_reg;
++static struct regulator *cci_reg;
+ static unsigned int a72_cur_mv = VPROC2_MV;
+ static bool a72_cpufreq_managed;
+ static int a72_set_vproc2_mv(unsigned int mv);
+@@ -346,6 +384,47 @@
+ 	return 0;
+ }
+ 
++/*
++ * Raise the floor under VPROC1 to cover the CCI at the frequency this driver is
++ * about to put it at. See the CCI_MIN_UV comment. Never fatal: a cluster
++ * running with the interconnect slightly under-volted is what every boot has
++ * done so far, so failing to improve on that is not a reason to refuse the
++ * cores.
++ */
++static void a72_hold_cci_floor(void)
++{
++	struct device *cpu_dev;
++	int ret;
++
++	if (cci_reg)
++		return;
++
++	cpu_dev = get_cpu_device(8);
++	if (!cpu_dev)
++		return;
++
++	cci_reg = regulator_get_optional(cpu_dev, "cci");
++	if (IS_ERR(cci_reg)) {
++		ret = PTR_ERR(cci_reg);
++		cci_reg = NULL;
++		pr_warn("no \"cci\" supply for cpu8 (%d); the interconnect will run at 750 MHz on whatever the A53 tables ask for (#84)\n",
++			ret);
++		return;
++	}
++
++	ret = regulator_set_voltage(cci_reg, CCI_MIN_UV, CCI_MAX_UV);
++	if (ret) {
++		pr_warn("could not floor VPROC1 at %u uV for the CCI (%d) (#84)\n",
++			CCI_MIN_UV, ret);
++		regulator_put(cci_reg);
++		cci_reg = NULL;
++		return;
++	}
++
++	pr_info("VPROC1 floored at %u uV: this bring-up puts the CCI at 750 MHz, which the vendor prices there (#84)\n",
++		CCI_MIN_UV);
++}
++
+ static int mt6797_a72_enable_vproc2(void)
+ {
+ 	int ret;
+@@ -936,6 +1015,13 @@
+ 		msleep(1000);
+ 	}
+ 
++	/*
++	 * Before the prerequisites, not after: mt6797_a72_apply_prereqs() is
++	 * what moves the CCI to 750 MHz, so the rail has to be able to carry it
++	 * first.
++	 */
++	a72_hold_cci_floor();
++
+ 	khz = mt6797_a72_apply_prereqs();
+ 
+ 	/*

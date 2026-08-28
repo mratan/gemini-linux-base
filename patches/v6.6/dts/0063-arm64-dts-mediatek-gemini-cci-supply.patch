@@ -1,0 +1,36 @@
+arm64: dts: mediatek: gemini: name the rail the A72 bring-up moves the CCI onto
+
+`cci-supply` on cpu8 is not a standard property and is not that CPU's own
+supply. It is the rail the CCI sits on, named here because cpu8 is where the
+driver that moves the CCI lives and this SoC has no node for the interconnect
+itself — inventing one for a device with no driver would be more fiction, not
+less.
+
+What it is for is in soc/0011 and in the comment: onlining cpu8 reprograms
+ARMCAXPLL2, which is the CCI's PLL, from 630 to 750 MHz, and VPROC1's 1000 mV
+floor was chosen assuming 630. Issue #84.
+
+--- a/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
++++ b/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
+@@ -3164,6 +3164,21 @@
+ &cpu8 {
+ 	operating-points-v2 = <&cpu_opp_b>;
+ 	proc-supply = <&da9214_vproc2>;
++
++	/*
++	 * NOT a standard property, and not this CPU's own supply. It is the rail
++	 * the CCI sits on, named here because cpu8 is where the driver that
++	 * moves the CCI lives and there is no node for the interconnect itself.
++	 *
++	 * Onlining this core reprograms ARMCAXPLL2 — the CCI's PLL, not the A72
++	 * cluster's — from the 630 MHz the bootloader chose to 750 MHz, as a
++	 * prerequisite for the firmware's CPU_ON gate. The CCI shares VPROC1
++	 * with the eight A53s, whose tables floor at 1000 mV on the strength of
++	 * the CCI being at 630; the vendor prices 754 MHz at 1070 mV.
++	 * mt6797-a72.c claims this and holds a 1070 mV floor for as long as the
++	 * cluster is up. Issue #84.
++	 */
++	cci-supply = <&da9214_vproc>;
+ };
+ 
+ &cpu9 {
