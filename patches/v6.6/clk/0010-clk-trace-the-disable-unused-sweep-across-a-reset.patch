@@ -1,0 +1,253 @@
+From: Gemini PDA Linux bring-up
+Subject: [PATCH] clk: trace the disable-unused sweep across a reset
+
+DIAGNOSTIC for #85, to be deleted with the defect it names.
+
+MT6797 loses roughly half its reboots to a 5-20 minute loop. The boot wedges
+inside clk_disable_unused(): 23 seconds of silence after "clk: Disabling unused
+clocks" where a healthy boot's next line is one millisecond later, then a hard
+LOCKUP on two CPUs, /init never running, and watchdog.open_timeout=120
+reclaiming the machine. clk_ignore_unused removes it, 12/12.
+
+WHY NOT printk. The obvious instrument -- print each clock as it is gated --
+was built (build #116) and it lies twice over.
+
+  * The console truncates when the machine loses the CPU carrying it, so the
+    last name PRINTED is only where output STOPPED, not necessarily what
+    stopped it. Read as the culprit it produced two fixes that both still
+    looped (#117 claimed the audio PLL mux group; #118 added a five-clock skip
+    list covering every name the record showed).
+  * 111 printks inside the sweep, each under clk_enable_lock() with interrupts
+    off, move the race they exist to observe: #116 failed once in nine reboots
+    where the uninstrumented #113 failed on its first.
+
+So this prints nothing while the sweep runs. One 32-byte store per clock goes
+into ramconsole@44400000 -- nomap, claimed by nothing in this kernel, and
+measured to survive this SoC's reset (scripts/gemini-dram-persistence.sh calls
+it "the honest proxy"). Each entry is stamped phase=1 immediately before the
+hardware is touched and phase=2 once that returns, so a wedged sweep leaves a
+record ending on an entry that never reached phase 2. That clock, and no other,
+is the one whose gate did not come back -- a claim the printing instrument
+could not make.
+
+The record is printed only after the sweep has finished, and what is printed is
+the PREVIOUS boot's. A boot that dies names its own culprit on the next boot
+that gets through, which is the only way to see this at all: the failure only
+happens on boots that never reach userspace.
+
+Both passes are covered (disable and unprepare) and the entry is placed around
+the clk_core_is_enabled()/is_prepared() read as well as the gate itself, since
+that read is MMIO too.
+
+Measured working on build #119: 390 entries on a healthy boot, "previous boot's
+sweep FINISHED", 200 disable-pass and 190 unprepare-pass.
+
+This patch also DROPS the five-clock skip list that used to live here
+(0009-clk-do-not-gate-the-five-clocks-mt6797-needs.patch). It was built on the
+misread above and #118 measured it not to work.
+
+--- a/drivers/clk/clk.c
++++ b/drivers/clk/clk.c
+@@ -21,6 +21,7 @@
+ #include <linux/pm_runtime.h>
+ #include <linux/sched.h>
+ #include <linux/clkdev.h>
++#include <linux/io.h>
+ 
+ #include "clk.h"
+ 
+@@ -1344,6 +1345,144 @@
+ 	clk_core_unprepare_lock(core);
+ }
+ 
++/*
++ * #85 -- a reset-persistent, printk-free trace of the disable-unused sweep.
++ *
++ * DIAGNOSTIC. It is meant to be deleted along with the defect it names.
++ *
++ * WHY NOT printk. The obvious instrument -- print each clock as it is gated --
++ * was built (build #116) and it lies. The console truncates when the machine
++ * loses the CPU carrying it, so the last name PRINTED is only where output
++ * stopped, not necessarily what stopped it; reading it as the culprit produced
++ * two fixes that both still looped (#117, #118). And 111 printks inside the
++ * sweep, each under clk_enable_lock() with interrupts off, move the very race
++ * they are there to observe: #116 failed once in nine reboots where the
++ * uninstrumented #113 failed on its first.
++ *
++ * So this writes nothing to any console while the sweep runs. One 32-byte
++ * store per clock goes into ramconsole@44400000 -- nomap, claimed by nothing in
++ * this kernel, and measured to survive this SoC's reset
++ * (scripts/gemini-dram-persistence.sh calls it "the honest proxy"). Each entry
++ * is stamped phase=1 immediately before the hardware is touched and phase=2
++ * once that returns, so the record of a wedged sweep ends on an entry that
++ * never reached phase 2: that clock, and no other, is the one whose gate did
++ * not come back.
++ *
++ * The record is printed only AFTER the sweep has finished, and what is printed
++ * is the PREVIOUS boot's. A boot that dies therefore names its own culprit on
++ * the next boot that gets through -- which is the whole point, because this
++ * failure only happens on boots that never reach userspace.
++ */
++#define GEMINI_CLKTRACE_PHYS	0x44400000UL
++#define GEMINI_CLKTRACE_SIZE	0x8000
++#define GEMINI_CLKTRACE_MAGIC	0x4b4c4347	/* "GCLK" */
++#define GEMINI_CLKTRACE_MAX	1000
++#define GEMINI_CLKTRACE_NAMELEN	28
++
++struct gemini_clktrace_entry {
++	char	name[GEMINI_CLKTRACE_NAMELEN];
++	u8	pass;		/* 1 = disable pass, 2 = unprepare pass */
++	u8	phase;		/* 1 = hardware about to be touched, 2 = returned */
++	u8	pad[2];
++};
++
++struct gemini_clktrace {
++	u32	magic;
++	u32	state;		/* 1 = sweep running, 2 = sweep finished */
++	u32	count;		/* entries written, including the unfinished one */
++	u32	pad;
++	struct gemini_clktrace_entry entry[GEMINI_CLKTRACE_MAX];
++};
++
++static void __iomem *gemini_clktrace __initdata;
++static u32 gemini_clktrace_n __initdata;
++static struct gemini_clktrace gemini_clktrace_prev __initdata;
++
++static void __init gemini_clktrace_begin(void)
++{
++	BUILD_BUG_ON(sizeof(struct gemini_clktrace) > GEMINI_CLKTRACE_SIZE);
++
++	gemini_clktrace = ioremap(GEMINI_CLKTRACE_PHYS, GEMINI_CLKTRACE_SIZE);
++	if (!gemini_clktrace)
++		return;
++
++	/* Take a copy before overwriting it; it is printed once the sweep ends. */
++	memcpy_fromio(&gemini_clktrace_prev, gemini_clktrace,
++		      sizeof(gemini_clktrace_prev));
++
++	writel(0, gemini_clktrace + offsetof(struct gemini_clktrace, magic));
++	writel(1, gemini_clktrace + offsetof(struct gemini_clktrace, state));
++	writel(0, gemini_clktrace + offsetof(struct gemini_clktrace, count));
++	writel(GEMINI_CLKTRACE_MAGIC,
++	       gemini_clktrace + offsetof(struct gemini_clktrace, magic));
++	gemini_clktrace_n = 0;
++}
++
++static void __iomem * __init gemini_clktrace_slot(void)
++{
++	if (!gemini_clktrace || gemini_clktrace_n >= GEMINI_CLKTRACE_MAX)
++		return NULL;
++
++	return gemini_clktrace + offsetof(struct gemini_clktrace, entry) +
++	       gemini_clktrace_n * sizeof(struct gemini_clktrace_entry);
++}
++
++/* Stamp the clock we are about to touch. No lock: the sweep is single-threaded. */
++static void __init gemini_clktrace_enter(const char *name, u8 pass)
++{
++	struct gemini_clktrace_entry e = { .pass = pass, .phase = 1 };
++	void __iomem *slot = gemini_clktrace_slot();
++
++	if (!slot)
++		return;
++
++	strscpy(e.name, name ? name : "(unnamed)", sizeof(e.name));
++	memcpy_toio(slot, &e, sizeof(e));
++	writel(gemini_clktrace_n + 1,
++	       gemini_clktrace + offsetof(struct gemini_clktrace, count));
++}
++
++static void __init gemini_clktrace_leave(void)
++{
++	void __iomem *slot = gemini_clktrace_slot();
++
++	if (!slot)
++		return;
++
++	writeb(2, slot + offsetof(struct gemini_clktrace_entry, phase));
++	gemini_clktrace_n++;
++}
++
++static void __init gemini_clktrace_end(void)
++{
++	const struct gemini_clktrace *prev = &gemini_clktrace_prev;
++	u32 i, n;
++
++	if (!gemini_clktrace)
++		return;
++
++	writel(2, gemini_clktrace + offsetof(struct gemini_clktrace, state));
++	iounmap(gemini_clktrace);
++	gemini_clktrace = NULL;
++
++	if (prev->magic != GEMINI_CLKTRACE_MAGIC) {
++		pr_info("clk-trace: no record from the previous boot (cold start)\n");
++		return;
++	}
++
++	n = min_t(u32, prev->count, (u32)GEMINI_CLKTRACE_MAX);
++	pr_info("clk-trace: previous boot's sweep %s after %u entries\n",
++		prev->state == 2 ? "FINISHED" : "DID NOT FINISH", n);
++
++	for (i = 0; i < n; i++) {
++		const struct gemini_clktrace_entry *e = &prev->entry[i];
++
++		pr_info("clk-trace: %4u %-9s %-28.28s %s\n", i,
++			e->pass == 1 ? "disable" : "unprepare", e->name,
++			e->phase == 2 ? "ok" : "<-- NEVER RETURNED");
++	}
++}
++
+ static void __init clk_unprepare_unused_subtree(struct clk_core *core)
+ {
+ 	struct clk_core *child;
+@@ -1362,6 +1501,7 @@
+ 	if (clk_pm_runtime_get(core))
+ 		return;
+ 
++	gemini_clktrace_enter(core->name, 2);
+ 	if (clk_core_is_prepared(core)) {
+ 		trace_clk_unprepare(core);
+ 		if (core->ops->unprepare_unused)
+@@ -1370,6 +1510,7 @@
+ 			core->ops->unprepare(core->hw);
+ 		trace_clk_unprepare_complete(core);
+ 	}
++	gemini_clktrace_leave();
+ 
+ 	clk_pm_runtime_put(core);
+ }
+@@ -1403,6 +1544,7 @@
+ 	 * sequence.  call .disable_unused if available, otherwise fall
+ 	 * back to .disable
+ 	 */
++	gemini_clktrace_enter(core->name, 1);
+ 	if (clk_core_is_enabled(core)) {
+ 		trace_clk_disable(core);
+ 		if (core->ops->disable_unused)
+@@ -1411,6 +1553,7 @@
+ 			core->ops->disable(core->hw);
+ 		trace_clk_disable_complete(core);
+ 	}
++	gemini_clktrace_leave();
+ 
+ unlock_out:
+ 	clk_enable_unlock(flags);
+@@ -1439,6 +1582,8 @@
+ 
+ 	pr_info("clk: Disabling unused clocks\n");
+ 
++	gemini_clktrace_begin();
++
+ 	clk_prepare_lock();
+ 
+ 	hlist_for_each_entry(core, &clk_root_list, child_node)
+@@ -1455,6 +1600,8 @@
+ 
+ 	clk_prepare_unlock();
+ 
++	gemini_clktrace_end();
++
+ 	return 0;
+ }
+ late_initcall_sync(clk_disable_unused);
