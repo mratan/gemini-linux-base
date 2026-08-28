@@ -198,10 +198,11 @@
  *             and the profile lookup is trustworthy. Converge in ~2 minutes.
  *             Note this includes a charger that has terminated: "at rest" is a
  *             statement about current, not about the cable.
- *   TAU_BUSY  actively charging, or under load. Charging holds the terminal
- *             voltage up on the constant-voltage plateau where it says nothing
- *             about charge; load drags it down by IR. Pull weakly, only enough
- *             to bound coulomb-counter drift over an hour or so.
+ * There is deliberately no busy-state time constant. Charging holds terminal
+ * voltage up on the constant-voltage plateau where it says nothing about
+ * charge, and load drags it down by an IR term this pack's profile gets badly
+ * wrong (312 mOhm measured against ~20 in the vendor table). In both cases the
+ * honest weight to give the profile is zero.
  *
  * Measured on this device 2026-08-27, four cores of load applied at t=69 s:
  * terminal voltage went 4.174 -> 4.025 V and back, wandering 150 mV, while the
@@ -209,7 +210,6 @@
  * that. The coulomb counter moved smoothly and monotonically throughout.
  */
 #define TAU_REST		120
-#define TAU_BUSY		1800
 #define REST_CURRENT_UA		30000
 /*
  * A single update may never close more than half the gap to the OCV estimate,
@@ -694,11 +694,30 @@ static int read_state_locked(struct fg_state *st)
 			  (abs(st->cur_ua) < REST_CURRENT_UA);
 
 		if (!tracking || !st->car_valid ||
-		    abs(tracked_q_uah - q_ocv) > div_s64(Q_MAX_UAH, 4)) {
+		    (at_rest &&
+		     abs(tracked_q_uah - q_ocv) > div_s64(Q_MAX_UAH, 4))) {
 			/*
-			 * First reading, or the counter and the profile have
-			 * diverged past any plausible drift -- re-seed rather
-			 * than defend a number that is already wrong.
+			 * First reading, or -- AT REST ONLY -- the counter and
+			 * the profile have diverged past any plausible drift,
+			 * so re-seed rather than defend a number that is
+			 * already wrong.
+			 *
+			 * THE at_rest GATE IS LOAD-BEARING AND WAS MISSING.
+			 *
+			 * Without it this fires under load, and under load the
+			 * OCV estimate is exactly what cannot be trusted. On
+			 * battery on 2026-08-27 the pack sagged, OCV = V + I*R
+			 * under-compensated (the vendor R profile is far too
+			 * small for this cell at ~1 A), the profile said
+			 * something like 15% for a pack near 90%, the
+			 * divergence sailed past a quarter of Q_MAX, and the
+			 * estimate re-seeded ONTO THE BAD NUMBER. Reported
+			 * charge then walked down 26%, 16%, 0% while the cell
+			 * was fine -- the guard never saw a low voltage at all.
+			 *
+			 * A divergence under load is precisely the case where
+			 * the coulomb counter should be believed and the
+			 * profile ignored. That is what the counter is for.
 			 */
 			tracked_q_uah = q_ocv;
 			car_ref_uah = st->car_uah;
@@ -741,8 +760,35 @@ static int read_state_locked(struct fg_state *st)
 			if (abs(d) < div_s64(Q_MAX_UAH, 2))
 				tracked_q_uah += d;
 
-			dt = jiffies_to_msecs(now - tracked_at) / 1000;
-			tau = at_rest ? TAU_REST : TAU_BUSY;
+			/*
+			 * CORRECT ONLY AT REST. Not "weakly otherwise" -- at
+			 * all.
+			 *
+			 * The OCV estimate is V + I*R, and on this pack R is
+			 * not what the vendor profile says. Measured on
+			 * 2026-08-27 across 105 samples of a real discharge:
+			 * 660 mA at 3867 mV against 1221 mA at 3691 mV, which
+			 * is dV/dI = 312 mOhm. The vendor r_profile puts it
+			 * near 20. So at 1 A the compensation adds ~20 mV when
+			 * it owes ~310, and the profile lookup lands far down
+			 * the curve from where the pack really is.
+			 *
+			 * A weak pull toward a number that wrong is still a
+			 * pull toward a number that wrong; it just takes
+			 * longer to get there. It was visibly dragging the
+			 * reported charge down during the discharge that
+			 * produced those samples.
+			 *
+			 * The coulomb counter has no such problem: it
+			 * integrates in hardware and does not care what the
+			 * resistance is. So under load, coast on it, and let
+			 * the profile speak only when nothing is flowing --
+			 * which on this machine is most of the time, because
+			 * it lives on a charger and rests at every
+			 * termination.
+			 */
+			dt = at_rest ? jiffies_to_msecs(now - tracked_at) / 1000 : 0;
+			tau = TAU_REST;
 			if (dt > tau / MAX_CORRECTION_FRAC)
 				dt = tau / MAX_CORRECTION_FRAC;
 			if (dt)
