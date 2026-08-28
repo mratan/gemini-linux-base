@@ -2141,7 +2141,37 @@ is the battery or the case, not the table.
 
 ---
 
-## 🟡 B-48 — the A72 cluster has no cpufreq governor: fixed clock, no idle-clocking
+## ✅ B-48 — the A72 cluster has no cpufreq governor: fixed clock, no idle-clocking
+
+**CLOSED 2026-08-28, build #100** (issue #55, kernel `f217e0f`). The cluster has
+`policy8` under `mtk-cpufreq` and schedutil, eleven operating points from
+793 MHz to 1989 MHz, with VPROC2 scaling from 880 mV to 1140 mV alongside it.
+
+What the entry below did not anticipate is where the work went. It is not a
+cpufreq driver — Linux allows one `cpufreq_driver` system-wide and
+`mtk-cpufreq` already owns it. It is a *description*: the cluster's mux
+(`ARMPLLDIV_MUXSEL[1:0]`, in MCUMIXED alongside the A53 clusters' fields) and a
+clock whose `->set_rate` is the firmware SIP call, both registered by
+`clk-mt6797-mcumixed.c`. With those, `mediatek-cpufreq` drives the
+park/retune/unpark sequence itself and `mt6797-a72.c` stops owning the
+frequency entirely.
+
+Measured, all eleven points up and down: every one lands on its vendor voltage.
+2450 transitions, no lockups. Throughput unchanged (1128 vs 1135 Mops/s); what
+changed is the bottom — the cluster idles at 793 MHz on 880 mV where it used to
+hold 1989 MHz on 1140 mV for the life of the boot, and `time_in_state` says it
+spends ~88% of its life there. That is roughly 76% less dynamic core power at
+idle, which is the "cost: battery" below, paid back.
+
+Two bugs fell out of doing it properly: the old retune was disabling the
+`armpll_div_pll1` gate the A53 policies hold enabled (so both A53 clusters have
+been parking on a gated clock on every transition since the first build that
+onlined an A72), and `ARMPLLDIV_MUXSEL` had two unsynchronised writers. Both
+gone.
+
+The original entry follows.
+
+### Original entry
 
 **Opened 2026-08-24, from the A72 bring-up (worklog §9).** The big cluster runs
 at a fixed 2002 MHz (raised by `drivers/soc/mediatek/mt6797-a72.c` after the
