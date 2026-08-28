@@ -1,0 +1,659 @@
+From: Gemini PDA Linux bring-up
+Subject: [PATCH] arm64: detect the rest of a late CPU's errata during boot, not just Spectre-v2
+
+arm64/0003 detects Spectre-v2 during boot when the device tree declares a
+Cortex-A72 that will only be hotplugged at ~240 s, so that the alternatives are
+patched before it arrives and its cpu_enable() does something real. Its own
+commit message then says the technique stops there, because v3a, v4 and BHB
+"choose their mitigation per CPU" and so hit issue #60's option 2, "teach the
+mitigation code to late-patch a per-CPU vector table".
+
+That is wrong. All five remaining capabilities go the same way as v2, and this
+patch does them. Three things had to be understood first.
+
+1. THE BHB VECTOR TABLES ARE PRE-BUILT AND SHARED, NOT PER-CPU.
+
+entry.S generates four complete tables at ASSEMBLY time -- BHB_MITIGATION_NONE,
+LOOP, FW, INSN -- with assembler .if, not runtime alternatives.
+this_cpu_set_vectors() only points VBAR_EL1 at one of them, and a late CPU does
+that itself, correctly. Nothing is per-CPU except the choice.
+
+2. WHAT IS PATCHED AT BOOT IS AN IMMEDIATE COMPUTED FROM THE BOOT CPUS.
+
+Inside the shared LOOP table, spectre_bhb_patch_loop_iter() writes the loop
+count from spectre_bhb_loop_affected(SCOPE_SYSTEM) -- and that is a static
+accumulator, not a survey:
+
+	if (scope == SCOPE_LOCAL_CPU) {
+		...			/* MIDR_CORTEX_A72 is in the k=8 list */
+		max_bhb_k = max(max_bhb_k, k);
+	} else {
+		k = max_bhb_k;		/* only what the boot CPUs contributed */
+	}
+
+With no A72 at boot that immediate is patched to zero, and the loop it feeds is
+
+	mov	x30, #0
+     1:	b	. + 4
+	subs	x30, x30, #1
+	b.ne	1b
+
+i.e. 2^64 iterations. THAT is why issue #60 records an A72 dying "within ~280 ms
+of the scheduler placing the first userspace task on it": its enable had pointed
+VBAR_EL1 at that table and the first exception from EL0 never came back. The
+diagnosis in #60 and in arm64/0001 -- "the alternatives are still NOPs" -- named
+the wrong instruction. It is one alternative, patched with a number derived from
+a set of CPUs that did not include the only CPU that would ever execute it.
+
+3. THE PER-CPU GUARDS ARE THE MECHANISM, NOT THE OBSTACLE.
+
+spectre_bhb_enable_mitigation() opens with
+
+	if (!is_spectre_bhb_affected(entry, SCOPE_LOCAL_CPU))
+		return;
+
+and arm64/0003's message reads that as fatal: force the detection and the A53s
+"detect it and then decline to install anything". They do decline -- and that is
+exactly what we want. It is why this costs the eight A53s nothing. The bug is
+only that the same function is both the capability's .matches and the enable's
+guard, so forcing one forces the other. Split them, and an unaffected boot CPU
+detects the capability on the A72's behalf, arranges what the A72 will need, and
+stays on the BHB_MITIGATION_NONE vectors itself.
+
+WHAT THIS PATCH DOES
+
+* Exports arm64_will_have_late_a72() (was static system_will_have_late_a72) so
+  cpu_errata.c can use it too, and documents where it is safe to call: the
+  device-tree walk happens during capability detection and everything later,
+  including alternative callbacks running under stop_machine, reads the cache.
+
+* Splits an honest local-CPU check out of has_spectre_v3a() and
+  is_spectre_bhb_affected(), and uses it in the two enable paths.
+  spectre_v3a_enable_mitigation()'s this_cpu_has_cap(ARM64_SPECTRE_V3A) meant
+  precisely "is the CPU I am on affected" and stops meaning it the moment the
+  capability can be forced; cpu_has_spectre_v3a() means it again.
+
+* Folds the declared A72's k = 8 into spectre_bhb_loop_affected(SCOPE_SYSTEM),
+  which is the fix for (2).
+
+* Sets BHB_LOOP in system_bhb_mitigations at boot. The EL1 tables do not need
+  it -- their loop is unconditional -- but KVM's hyp vectors do, and nothing
+  re-patches those at 240 s.
+
+* Seeds spectre_v2_state, spectre_v4_state and spectre_bhb_state at boot with
+  what the A72 will report -- INCLUDING when that answer is SPECTRE_VULNERABLE,
+  which is the case here. update_mitigation_state() WARNs rather than advance
+  the state after finalisation, so a late CPU that is the FIRST affected CPU can
+  never record its own verdict; it would leave sysfs saying "Not affected" for a
+  machine that had just stopped being that, which is the exact failure
+  arm64/0002 was written to stop. Measured: without the VULNERABLE half of this,
+  build #109 took that WARN on both A72s at 243 s.
+
+* Adds is_affected_midr_range_list_or_late_a72() for the two errata, whose whole
+  effect IS the capability being set (neither has a .cpu_enable). 1742098 is not
+  a speculation mitigation at all but a correctness bug: a 32-bit task is being
+  told the aarch32 AES instructions work, and the scheduler is free to put it on
+  an A72 where they do not.
+
+WHAT IT MEASURES, WHICH IS NOT WHAT #60 EXPECTED
+
+Build #109 is the first kernel on this device to enable all six, and the first
+therefore to report what the machine actually is:
+
+	spectre_v2:        Vulnerable
+	spec_store_bypass: Vulnerable
+
+not the "Not affected" of every kernel before arm64/0002, nor the "late CPU
+permitted without mitigation" of #101..#106. THE FIRMWARE HAS NO SPECTRE
+WORKAROUNDS AT ALL:
+
+	psci: PSCIv0.2 detected in firmware.
+
+psci_probe() only calls psci_init_smccc() for PSCI >= 1.0, so SMCCC 1.1 is never
+negotiated, arm_smccc_1_1_get_conduit() is SMCCC_CONDUIT_NONE, and every
+ARM_SMCCC_ARCH_WORKAROUND_1/_2/_3 discovery returns NOT_SUPPORTED. A Cortex-A72
+has no CSV2 and no SSBS, so on this device:
+
+	Spectre-v2   unmitigable -- no hardware, no firmware
+	Spectre-v4   unmitigable -- no SSBS, no firmware
+	Spectre-BHB  the k=8 loop needs no firmware, but upstream declines it
+		     while v2 is vulnerable ("No point mitigating Spectre-BHB
+		     alone") and that judgement is not ours to overturn
+	Spectre-v3a  ENABLED (KVM hyp vector slot)
+	1742098      ENABLED (aarch32 AES hwcap withdrawn)
+	1165522/1319367/1530923   ENABLED (KVM hyp ISBs)
+
+So #60's stated goal -- mitigate the late A72s -- is reached for three of six,
+and the other three are blocked by firmware that predates the mitigations, which
+is not something any amount of late-CPU work in the kernel can reach. The
+handoff's "you are not blocked on firmware" was inferred from has_spectre_v2()
+returning true on cpu8; that function returns true for NOT_SUPPORTED as well as
+for SUCCESS, so it never said what it was read as saying.
+
+There is a second, independent benefit to getting v2 detected even though it
+cannot be mitigated: spectre_v2_state is now VULNERABLE at boot, so upstream's
+own guard refuses the BHB vectors to the A72, and the 2^64-iteration loop of (2)
+can no longer be reached even if the k fold were removed.
+
+WHAT IT COSTS
+
+  ARM64_SPECTRE_V2	 arm64_apply_bp_hardening(), which is on the EL0 fault
+			 paths AND on the switch_mm fast path -- i.e. every
+			 context switch between address spaces, not just an ASID
+			 rollover. The A53s are in the v2 safe list, so
+			 spectre_v2_enable_mitigation() installs no callback on
+			 them and the added work is a per-CPU load and a NULL
+			 test; but it is on a hot path and is the only cost here
+			 that is.
+  ARM64_SPECTRE_V4	 nothing outside cpu_errata.c. The entry-time SMC is
+			 gated on the per-CPU arm64_ssbd_callback_required, set
+			 only on a CPU that really is affected.
+  ARM64_SPECTRE_V3A	 KVM only.
+  ARM64_SPECTRE_BHB	 the A53s stay on the BHB_MITIGATION_NONE vectors, so
+			 nothing at EL1. If BHB_LOOP is set (it is not on this
+			 device, see above) the hyp vectors are SHARED, so every
+			 core would run the k=8 loop on guest exception entry --
+			 unavoidable, what upstream does anyway, and free unless
+			 a guest is running.
+  ARM64_WORKAROUND_SPECULATIVE_AT   KVM only.
+  ARM64_WORKAROUND_1742098          withdraws COMPAT_HWCAP2_AES.
+
+arm64/0003's message claims "the eight A53s pay ... an SMCCC_ARCH_WORKAROUND_1
+call on exception entry from EL0". They do not, and never did: MIDR_CORTEX_A53
+is in spectre_v2_safe_list, so spectre_v2_enable_mitigation() takes the
+hw-state-UNAFFECTED path and never reaches install_bp_hardening_cb(). Its -6.4%
+for A53-L was DVFS noise across two boots -- #103's policy4 sat at 962 MHz and
+#104's at 1209 MHz, and the SLOWER clock scored HIGHER.
+
+MEASURED, #110 against #106, three bench runs each on one boot per build
+(scripts/gemini-bench.sh; 04-docs/bench/*-baseline-106-r[1-3].txt against
+*-mitigated-110-r[1-6].txt):
+
+  metric                        #106 (off)    #110 (all six on)    delta
+  cpu0 stint ms           1474 [1464-1479] n=3      1478 [1474-1481] n=6    +0.26%
+  cpu4 stint ms           1453 [1453-1453] n=3      1456 [1455-1458] n=6    +0.17%
+  cpu8 stint ms            903 [902-904]   n=3       900 [891-904]   n=6    -0.31%
+  unpinned stint ms        903 [888-909]  n=15       904 [889-909]  n=30    +0.02%
+  spawn us                2652 [2590-2690] n=6      2636 [2541-2700] n=12   -0.61%
+  pingpong us               50 [44-57]     n=6        56 [43-64]     n=12  +12.97%
+  A53 memcpy MB/s         1327 [1311-1355] n=3      1311 [1246-1362] n=6    -1.16%
+  A72 memcpy MB/s         3641 [3602-3683] n=3      3586 [3354-3711] n=6    -1.52%
+  4-way wall ms           1247 [1246-1249] n=3      1250 [1243-1258] n=6    +0.20%
+
+Single-thread compute is the tightest metric this harness has -- cpu4 gave
+1453/1453/1453 ms on three consecutive baseline runs -- and it moves +0.17%.
+Spawn, 4-way and memcpy are inside their own spread. So: no measurable cost, as
+the grep above predicts, and nothing like the -6.4% in the record.
+
+ONE METRIC IS NOT EXPLAINED. Unpinned pingpong's mean moves +13%, on ranges that
+overlap (43.5-57.1 against 43.2-64.0) and with the widest run-to-run spread in
+the suite. It is the only unpinned latency measure, so it is also the one most
+exposed to scheduler placement. The only new per-context-switch work is the
+per-CPU load and NULL test above, which cannot be 7 us. Recorded rather than
+explained away; re-measure with more runs if it ever matters.
+
+Still default n. #60 records the unmitigated state as accepted, and reversing an
+accepted trade is the owner's call, not a default.
+
+--- a/arch/arm64/Kconfig
++++ b/arch/arm64/Kconfig
+@@ -608,8 +608,31 @@
+ 	  process spawn +3%, A72 unchanged. That is a straight trade of
+ 	  throughput on eight cores for correctness on two.
+ 
+-	  Currently covers Spectre-v2 only; Spectre-v3a/v4/BHB and errata
+-	  1742098 and 1319367 follow the same pattern and are not yet done.
++	  Covers every capability the MT6797's Cortex-A72s bring that its
++	  Cortex-A53s do not: Spectre-v2, -v3a, -v4 and -BHB, and errata 1742098
++	  and 1165522/1319367/1530923.
++
++	  MEASURED COST, build #110 against #106 on ten cores (three runs each,
++	  04-docs/bench/): single-thread compute +0.17%, process spawn -0.6%,
++	  4-way throughput +0.2%, memcpy inside its own spread. No measurable
++	  cost. The A53s install no Spectre-v2 callback -- they are safelisted --
++	  so what they gain is a per-CPU load and a NULL test in
++	  arm64_apply_bp_hardening(), which is on the switch_mm fast path. The
++	  other five capabilities arrange work that only the late CPU performs.
++	  One metric, unpinned pipe round-trip, moves +13% on overlapping ranges
++	  with no mechanism that could account for it; see the commit message.
++
++	  Erratum 1742098 is the one visible change to userspace: the aarch32
++	  AES hwcap is withdrawn, because a 32-bit task can be scheduled onto
++	  the A72 where those instructions are wrong. 32-bit userspace falls
++	  back to software AES.
++
++	  MEASURED, MT6797: this device's firmware reports PSCI v0.2, so SMCCC
++	  1.1 is never negotiated and ARM_SMCCC_ARCH_WORKAROUND_1/_2/_3 do not
++	  exist. Spectre-v2 and -v4 are therefore unmitigable on its Cortex-A72s
++	  whatever this option is set to, and turning it on makes the machine
++	  say so instead of reporting "Not affected". What it actually enables
++	  here is Spectre-v3a and the two errata.
+ 
+ 	  If unsure, say N.
+ 
+--- a/arch/arm64/include/asm/cpufeature.h
++++ b/arch/arm64/include/asm/cpufeature.h
+@@ -435,6 +435,15 @@
+ unsigned long cpu_get_elf_hwcap(void);
+ unsigned long cpu_get_elf_hwcap2(void);
+ 
++/*
++ * True when CONFIG_ARM64_MITIGATE_LATE_CPUS is set and the device tree declares
++ * a Cortex-A72 that is not one of the boot CPUs. Defined in proton-pack.c, and
++ * read from there and from cpu_errata.c to detect that CPU's errata during boot
++ * so that its mitigations are patched in before it arrives. See the comment on
++ * the definition.
++ */
++bool arm64_will_have_late_a72(void);
++
+ #define cpu_set_named_feature(name) cpu_set_feature(cpu_feature(name))
+ #define cpu_have_named_feature(name) cpu_have_feature(cpu_feature(name))
+ 
+--- a/arch/arm64/kernel/proton-pack.c
++++ b/arch/arm64/kernel/proton-pack.c
+@@ -244,8 +244,14 @@
+  *
+  * Gated on the DT rather than on a machine compatible because that is what it
+  * actually means: mitigate for a CPU this system is going to have.
++ *
++ * WHERE IT IS SAFE TO CALL. The result is cached on the first call, and the
++ * first call happens while the capabilities are being detected -- every one of
++ * the five .matches below asks. Everything later (the alternative callbacks,
++ * which run from stop_machine with interrupts off) therefore only reads the
++ * cache and never walks the device tree.
+  */
+-static bool system_will_have_late_a72(void)
++bool arm64_will_have_late_a72(void)
+ {
+ 	static int cached = -1;
+ 	struct device_node *np;
+@@ -267,7 +273,7 @@
+ 	WARN_ON(scope != SCOPE_LOCAL_CPU || preemptible());
+ 
+ 	if (spectre_v2_get_cpu_hw_mitigation_state() == SPECTRE_UNAFFECTED &&
+-	    !system_will_have_late_a72())
++	    !arm64_will_have_late_a72())
+ 		return false;
+ 
+ 	if (spectre_v2_get_cpu_fw_mitigation_state() == SPECTRE_UNAFFECTED)
+@@ -366,6 +372,50 @@
+ 	return SPECTRE_MITIGATED;
+ }
+ 
++/*
++ * What the declared-but-absent Cortex-A72 will report when it finally enables.
++ *
++ * update_mitigation_state() refuses -- with a WARN -- to advance the state
++ * after the capabilities are finalised, because userspace has already been told
++ * what the machine is. A late CPU that is the FIRST affected CPU therefore
++ * cannot record its own mitigation: the eight Cortex-A53s here are all in the
++ * Spectre-v2 safe list, so they leave spectre_v2_state at SPECTRE_UNAFFECTED,
++ * and cpu8 hits the WARN at ~240 s and leaves the sysfs file saying
++ * "Not affected" for a machine that has just stopped being that.
++ *
++ * So say at boot what the A72 is going to say. Its hardware state is not in
++ * doubt -- SPECTRE_VULNERABLE, being in neither safe list and having no CSV2 --
++ * so its answer is entirely the firmware's, and a boot CPU asks the firmware
++ * the same question with the same call.
++ *
++ * BE CAREFUL WITH THAT LAST STEP. SMCCC defines ARCH_FEATURES discovery for
++ * ARCH_WORKAROUND_1/_2 PER CALLING PE, and TF-A answers it out of the calling
++ * core's cpu_ops, so in general an A53 is NOT entitled to answer for an A72:
++ * a firmware that returned NOT_REQUIRED here would leave the capability
++ * undetected and the A72 permitted-but-unmitigated, which is the pre-#60
++ * behaviour and is reported as such by arm64/0002. It is not a new failure
++ * mode, but it is not a theoretical distinction either, so it is measured
++ * rather than assumed:
++ *
++ *   MT6797, build #109: the firmware reports PSCI v0.2. psci_init_smccc() is
++ *   only reached for PSCI >= 1.0, so SMCCC 1.1 is never negotiated,
++ *   arm_smccc_1_1_invoke() returns SMCCC_RET_NOT_SUPPORTED for every call from
++ *   every core, and this returns SPECTRE_VULNERABLE uniformly. There is no
++ *   firmware Spectre-v2 mitigation on this device to get wrong.
++ *
++ * The state is then correct from the moment the A72 arrives and pessimistic
++ * before it -- the A53s alone are UNAFFECTED. That is the direction to be wrong
++ * in for a file that answers "is this machine hardened", and on this SoC the
++ * A72s are onlined on every boot by gemini-a72-online.service anyway.
++ */
++static enum mitigation_state spectre_v2_late_a72_state(void)
++{
++	if (spectre_v2_mitigations_off())
++		return SPECTRE_VULNERABLE;
++
++	return spectre_v2_get_cpu_fw_mitigation_state();
++}
++
+ void spectre_v2_enable_mitigation(const struct arm64_cpu_capabilities *__unused)
+ {
+ 	enum mitigation_state state;
+@@ -376,6 +426,9 @@
+ 	if (state == SPECTRE_VULNERABLE)
+ 		state = spectre_v2_enable_fw_mitigation();
+ 
++	if (state == SPECTRE_UNAFFECTED && arm64_will_have_late_a72())
++		state = spectre_v2_late_a72_state();
++
+ 	update_mitigation_state(&spectre_v2_state, state);
+ }
+ 
+@@ -386,7 +439,14 @@
+  * an indirect trampoline for the hyp vectors so that guests can't read
+  * VBAR_EL2 to defeat randomisation of the hypervisor VA layout.
+  */
+-bool has_spectre_v3a(const struct arm64_cpu_capabilities *entry, int scope)
++/*
++ * Is the CPU we are running on affected? Split out from has_spectre_v3a() so
++ * that the enable path can ask honestly even when the capability was detected
++ * on behalf of a Cortex-A72 that has not arrived yet -- see
++ * arm64_will_have_late_a72(). It replaces a this_cpu_has_cap() that meant
++ * exactly this and stopped meaning it once the capability could be forced.
++ */
++static bool cpu_has_spectre_v3a(void)
+ {
+ 	static const struct midr_range spectre_v3a_unsafe_list[] = {
+ 		MIDR_ALL_VERSIONS(MIDR_CORTEX_A57),
+@@ -394,15 +454,20 @@
+ 		{},
+ 	};
+ 
+-	WARN_ON(scope != SCOPE_LOCAL_CPU || preemptible());
+ 	return is_midr_in_range_list(read_cpuid_id(), spectre_v3a_unsafe_list);
+ }
+ 
++bool has_spectre_v3a(const struct arm64_cpu_capabilities *entry, int scope)
++{
++	WARN_ON(scope != SCOPE_LOCAL_CPU || preemptible());
++	return cpu_has_spectre_v3a() || arm64_will_have_late_a72();
++}
++
+ void spectre_v3a_enable_mitigation(const struct arm64_cpu_capabilities *__unused)
+ {
+ 	struct bp_hardening_data *data = this_cpu_ptr(&bp_hardening_data);
+ 
+-	if (this_cpu_has_cap(ARM64_SPECTRE_V3A))
++	if (cpu_has_spectre_v3a())
+ 		data->slot += HYP_VECTOR_INDIRECT;
+ }
+ 
+@@ -576,6 +641,26 @@
+ 	}
+ }
+ 
++/*
++ * What the declared-but-absent Cortex-A72 will report -- see
++ * spectre_v2_late_a72_state() for why a boot CPU has to answer for it.
++ *
++ * The A72's hardware state is SPECTRE_VULNERABLE: it is not in the v4 safe list
++ * and, being ARMv8.0, has no SSBS. So its answer is entirely the firmware's --
++ * with the same per-PE caveat, and the same measurement, as
++ * spectre_v2_late_a72_state(). (The comment above spectre_v4_state says the
++ * firmware mitigation "is present for all CPUs" if it is present at all. That
++ * is about the MITIGATION, not about what ARCH_FEATURES discovery returns to a
++ * given core, which is what is being asked here.)
++ */
++static enum mitigation_state spectre_v4_late_a72_state(void)
++{
++	if (spectre_v4_mitigations_off())
++		return SPECTRE_VULNERABLE;
++
++	return spectre_v4_get_cpu_fw_mitigation_state();
++}
++
+ bool has_spectre_v4(const struct arm64_cpu_capabilities *cap, int scope)
+ {
+ 	enum mitigation_state state;
+@@ -586,6 +671,9 @@
+ 	if (state == SPECTRE_VULNERABLE)
+ 		state = spectre_v4_get_cpu_fw_mitigation_state();
+ 
++	if (state == SPECTRE_UNAFFECTED && arm64_will_have_late_a72())
++		state = spectre_v4_late_a72_state();
++
+ 	return state != SPECTRE_UNAFFECTED;
+ }
+ 
+@@ -706,6 +794,20 @@
+ 	if (state == SPECTRE_VULNERABLE)
+ 		state = spectre_v4_enable_fw_mitigation();
+ 
++	/*
++	 * Nothing was installed on this CPU because it is safelisted, but a
++	 * Cortex-A72 is coming that is not. Record its answer now, while the
++	 * capabilities are still unfinalised and update_mitigation_state() will
++	 * still accept one.
++	 *
++	 * Note this costs the safelisted CPUs nothing: spectre_v4's entry-time
++	 * work is gated on the per-CPU arm64_ssbd_callback_required, which is
++	 * only ever set by spectre_v4_enable_fw_mitigation() on a CPU that
++	 * really is affected.
++	 */
++	if (state == SPECTRE_UNAFFECTED && arm64_will_have_late_a72())
++		state = spectre_v4_late_a72_state();
++
+ 	update_mitigation_state(&spectre_v4_state, state);
+ }
+ 
+@@ -946,6 +1048,35 @@
+ 		max_bhb_k = max(max_bhb_k, k);
+ 	} else {
+ 		k = max_bhb_k;
++
++		/*
++		 * max_bhb_k is an accumulator over the CPUs that have run the
++		 * SCOPE_LOCAL_CPU branch above, so a Cortex-A72 that has not
++		 * been onlined yet contributes nothing to it -- and this is the
++		 * value spectre_bhb_patch_loop_iter() writes into the shared
++		 * BHB_MITIGATION_LOOP vector table, at boot, once.
++		 *
++		 * With no A72 present that immediate is patched to zero, and
++		 * the loop it feeds is
++		 *
++		 *	mov	x30, #0
++		 *   1:	b	. + 4
++		 *	subs	x30, x30, #1
++		 *	b.ne	1b
++		 *
++		 * i.e. 2^64 iterations. That is why issue #60 records an A72
++		 * dying "within ~280 ms of the first userspace task": its
++		 * enable pointed VBAR_EL1 at that table and the first exception
++		 * from EL0 never came back. It is not that the alternatives
++		 * were left as NOPs; it is that one of them was patched with a
++		 * number computed from a set of CPUs that did not include the
++		 * only CPU that would use it.
++		 *
++		 * So fold the declared A72's k in here, where "system" is asked
++		 * what the system needs rather than what has checked in.
++		 */
++		if (arm64_will_have_late_a72())
++			k = max_t(u8, k, 8);
+ 	}
+ 
+ 	return k;
+@@ -1010,11 +1141,16 @@
+ 						    ID_AA64MMFR1_EL1_ECBHB_SHIFT);
+ }
+ 
+-bool is_spectre_bhb_affected(const struct arm64_cpu_capabilities *entry,
+-			     int scope)
++/*
++ * Is the CPU we are running on affected? Split out from
++ * is_spectre_bhb_affected() so that the enable path can ask honestly even when
++ * the capability was detected on behalf of a Cortex-A72 that has not arrived
++ * yet -- see arm64_will_have_late_a72(). Keeping this honest is what makes the
++ * A72's BHB mitigation free for the eight A53s: they detect the capability,
++ * decline to install anything, and stay on the BHB_MITIGATION_NONE vectors.
++ */
++static bool cpu_is_spectre_bhb_affected(int scope)
+ {
+-	WARN_ON(scope != SCOPE_LOCAL_CPU || preemptible());
+-
+ 	if (supports_csv2p3(scope))
+ 		return false;
+ 
+@@ -1030,6 +1166,14 @@
+ 	return false;
+ }
+ 
++bool is_spectre_bhb_affected(const struct arm64_cpu_capabilities *entry,
++			     int scope)
++{
++	WARN_ON(scope != SCOPE_LOCAL_CPU || preemptible());
++
++	return cpu_is_spectre_bhb_affected(scope) || arm64_will_have_late_a72();
++}
++
+ static void this_cpu_set_vectors(enum arm64_bp_harden_el1_vectors slot)
+ {
+ 	const char *v = arm64_get_bp_hardening_vector(slot);
+@@ -1055,13 +1199,83 @@
+ }
+ early_param("nospectre_bhb", parse_spectre_bhb_param);
+ 
++/*
++ * Record, during boot, what a device-tree-declared Cortex-A72 will need when it
++ * is onlined at ~240 s. Called from every CPU's enable, affected or not, and
++ * idempotent -- set_bit() and update_mitigation_state() both are -- so the
++ * eight A53s each run it and nothing depends on which of them got there first.
++ *
++ * Two things have to be true before the alternatives are patched, and only one
++ * of them is the loop count that spectre_bhb_loop_affected(SCOPE_SYSTEM) now
++ * supplies:
++ *
++ *  - BHB_LOOP has to be in system_bhb_mitigations, or
++ *    spectre_bhb_patch_loop_mitigation_enable() leaves the skip-branch standing
++ *    in KVM's hyp vectors. The EL1 vector tables in entry.S are generated four
++ *    times over at assembly time and their loop is unconditional, so THEY do
++ *    not need this -- but nothing re-patches the hyp vectors at ~240 s, so a
++ *    guest would run BHB-unmitigated on the A72 for the life of the boot.
++ *
++ *    THIS IS THE ONE PLACE THE A53s ARE CHARGED FOR THE A72's BHB. The hyp
++ *    vectors are shared, so once BHB_LOOP is set every core runs the k=8 loop
++ *    on guest exception entry -- not just the A72. It is unavoidable while the
++ *    vectors are shared, it is what upstream does on a machine whose A72 boots
++ *    normally, and it costs nothing at all unless a guest is running.
++ *
++ *  - spectre_bhb_state has to already say MITIGATED, for the same reason
++ *    spectre_v2_late_a72_state() exists: update_mitigation_state() WARNs
++ *    rather than advance the state after finalisation.
++ *
++ * A Cortex-A72 has no ECBHB and no ClearBHB and sits in spectre_bhb_k8_list, so
++ * there is no ambiguity about which branch of the chain below it will take: the
++ * loop, with k = 8.
++ */
++static void spectre_bhb_declare_late_a72(void)
++{
++	if (!arm64_will_have_late_a72())
++		return;
++
++	/*
++	 * The same four refusals the chain below applies, in the same order --
++	 * and the refusals matter as much as the mitigation. This SoC hits the
++	 * first one: its firmware reports PSCI v0.2, so SMCCC 1.1 is never
++	 * negotiated, ARM_SMCCC_ARCH_WORKAROUND_1 does not exist, and a
++	 * Cortex-A72 (no CSV2) is therefore Spectre-v2 vulnerable with nothing
++	 * the kernel can do about it. Upstream then declines BHB as well --
++	 * "no point mitigating Spectre-BHB alone" -- and the A72 will leave
++	 * spectre_bhb_state at SPECTRE_VULNERABLE.
++	 *
++	 * Record THAT, for exactly the reason the mitigated case is recorded:
++	 * update_mitigation_state() WARNs rather than change the state at
++	 * 240 s, so whichever answer the A72 is going to give has to be given
++	 * here.
++	 */
++	if (arm64_get_spectre_v2_state() == SPECTRE_VULNERABLE ||
++	    !IS_ENABLED(CONFIG_MITIGATE_SPECTRE_BRANCH_HISTORY) ||
++	    cpu_mitigations_off() || __nospectre_bhb) {
++		update_mitigation_state(&spectre_bhb_state, SPECTRE_VULNERABLE);
++		return;
++	}
++
++	set_bit(BHB_LOOP, &system_bhb_mitigations);
++	update_mitigation_state(&spectre_bhb_state, SPECTRE_MITIGATED);
++}
++
+ void spectre_bhb_enable_mitigation(const struct arm64_cpu_capabilities *entry)
+ {
+ 	bp_hardening_cb_t cpu_cb;
+ 	enum mitigation_state fw_state, state = SPECTRE_VULNERABLE;
+ 	struct bp_hardening_data *data = this_cpu_ptr(&bp_hardening_data);
+ 
+-	if (!is_spectre_bhb_affected(entry, SCOPE_LOCAL_CPU))
++	spectre_bhb_declare_late_a72();
++
++	/*
++	 * Deliberately the honest check and not is_spectre_bhb_affected(): a
++	 * boot CPU that only detected the capability on the A72's behalf must
++	 * NOT install BHB vectors for itself. It has just arranged what the A72
++	 * will need; now it leaves.
++	 */
++	if (!cpu_is_spectre_bhb_affected(SCOPE_LOCAL_CPU))
+ 		return;
+ 
+ 	if (arm64_get_spectre_v2_state() == SPECTRE_VULNERABLE) {
+--- a/arch/arm64/kernel/cpu_errata.c
++++ b/arch/arm64/kernel/cpu_errata.c
+@@ -41,6 +41,42 @@
+ 	return is_midr_in_range_list(read_cpuid_id(), entry->midr_range_list);
+ }
+ 
++/*
++ * As above, but also true when the device tree declares a Cortex-A72 that will
++ * be onlined after the capabilities are finalised and that MIDR is in this
++ * erratum's list. See arm64_will_have_late_a72(): on MT6797 the two A72s are
++ * hotplugged at ~240 s, so an erratum only they have is never detected, and
++ * arm64/0001 then permits them to join carrying it and unmitigated.
++ *
++ * Used only for the two errata whose entire effect IS the capability being set
++ * -- neither has a .cpu_enable -- so detecting it during boot is the whole fix:
++ *
++ *   1742098    withdraws the aarch32 AES hwcap, which is not a mitigation but a
++ *              correctness bug. A 32-bit task on this device is told AES is
++ *              usable, and the scheduler is free to run it on an A72 where it
++ *              is not. (The LXC Android container is the 32-bit userspace here;
++ *              it will fall back to software AES.)
++ *   1165522/1319367/1530923  inserts ISBs in KVM's hyp paths, so it costs
++ *              nothing at all unless a guest is running.
++ *
++ * The MIDR used for the absent CPU carries variant 0 revision 0, which matches
++ * a MIDR_ALL_VERSIONS() entry -- what both lists use for the A72 -- and would
++ * not match a revision-limited one. Nothing here needs that, and guessing a
++ * revision for a CPU that is not present would be worse than not matching.
++ */
++static bool __maybe_unused
++is_affected_midr_range_list_or_late_a72(const struct arm64_cpu_capabilities *entry,
++					int scope)
++{
++	if (is_affected_midr_range_list(entry, scope))
++		return true;
++
++	if (!arm64_will_have_late_a72())
++		return false;
++
++	return is_midr_in_range_list(MIDR_CORTEX_A72, entry->midr_range_list);
++}
++
+ static bool __maybe_unused
+ is_kryo_midr(const struct arm64_cpu_capabilities *entry, int scope)
+ {
+@@ -580,7 +616,9 @@
+ 	{
+ 		.desc = "ARM errata 1165522, 1319367, or 1530923",
+ 		.capability = ARM64_WORKAROUND_SPECULATIVE_AT,
+-		ERRATA_MIDR_RANGE_LIST(erratum_speculative_at_list),
++		.type = ARM64_CPUCAP_LOCAL_CPU_ERRATUM,
++		.matches = is_affected_midr_range_list_or_late_a72,
++		.midr_range_list = erratum_speculative_at_list,
+ 	},
+ #endif
+ #ifdef CONFIG_ARM64_ERRATUM_1463225
+@@ -716,7 +754,8 @@
+ 	{
+ 		.desc = "ARM erratum 1742098",
+ 		.capability = ARM64_WORKAROUND_1742098,
+-		CAP_MIDR_RANGE_LIST(broken_aarch32_aes),
++		.matches = is_affected_midr_range_list_or_late_a72,
++		.midr_range_list = broken_aarch32_aes,
+ 		.type = ARM64_CPUCAP_LOCAL_CPU_ERRATUM,
+ 	},
+ #endif

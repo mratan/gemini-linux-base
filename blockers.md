@@ -2191,27 +2191,42 @@ sustained-power exposure.
 
 ---
 
-## 🟡 B-49 — late-onlined A72s run without their Spectre mitigations
+## ✅ B-49 — late-onlined A72s run without their Spectre mitigations — CLOSED 2026-08-28
 
 **Opened 2026-08-24, from the A72 bring-up (worklog §8, build #56).** The A72s
 are hotplugged after boot (i2c is not up during early SMP bring-up, so
 `maxcpus=8` stays), which makes them *late* CPUs. arm64 finalises system
-capabilities and patches alternatives from the A53 boot set; a late CPU's
+capabilities and patches alternatives from the A53 boot set, so a late CPU's
 `LOCAL_CPU_ERRATUM` capabilities (Spectre-v2/v3a/v4/BHB, errata 1742098,
-1319367) can no longer be enabled — calling `cpu_enable()` that late installs
-half a mitigation and kills the core at its first EL0 exception (measured).
-Our `verify_local_cpu_caps()` patch (patches/v6.6/arm64/0001) therefore
-*permits without enabling*: cpu8/9 run unmitigated, exactly as `nospectre_v2`
-would leave them.
+1319367) were never detected at all, and `patches/v6.6/arm64/0001` *permitted
+without enabling*: cpu8/9 ran unmitigated.
 
-**Cost**: Spectre-class speculation attacks are possible against/on the big
-cores. Acceptable for a personal pocket terminal; not for multi-user use.
-**What unblocks it**: bringing the A72s up before
-`setup_system_capabilities()` — which needs VPROC2 available during early SMP
-boot (pre-i2c: pin-mux the DA9214 onto a bit-banged path, or teach the
-preloader/LK to leave the rail on), or teaching the mitigation code to
-late-patch a per-CPU vector table. Both are real projects; document, don't
-drift into them casually.
+**Closed by `patches/v6.6/arm64/0003` + `0004`** (build #110,
+`CONFIG_ARM64_MITIGATE_LATE_CPUS`, default n). All six are now detected during
+boot from the device tree's `arm,cortex-a72` node, so the alternatives are
+patched before the A72s exist. Measured on #110: the permit list is empty, no
+`update_mitigation_state()` WARN, both cores run userspace, and the cost against
+#106 is +0.17% single-thread. See issue #60.
+
+**Two things this entry got wrong, both now measured.**
+
+*The "kills the core at its first EL0 exception" mechanism was an infinite
+loop*, not "half a mitigation". `spectre_bhb_patch_loop_iter()` writes the LOOP
+vector table's iteration count from `spectre_bhb_loop_affected(SCOPE_SYSTEM)`, a
+static accumulator over CPUs that have checked in. With no A72 at boot it is
+zero, and `mov x30,#0 / subs x30,x30,#1 / b.ne` is 2^64 iterations.
+
+*"Both are real projects" was true of the two routes this entry names, and
+neither was needed.* A third route — detect on the boot CPUs, from the DT — is
+about a hundred lines.
+
+**What is NOT closed, and cannot be from the kernel.** This device's firmware
+reports **PSCI v0.2**, so `psci_init_smccc()` is never called, SMCCC 1.1 is
+never negotiated, and `ARM_SMCCC_ARCH_WORKAROUND_1/_2/_3` do not exist. A
+Cortex-A72 has no CSV2 and no SSBS, so Spectre-v2 and -v4 are **unmitigable on
+this hardware**, and upstream declines Spectre-BHB while v2 is vulnerable. What
+#60 actually enables is Spectre-v3a and the two errata — plus honest reporting:
+`spectre_v2` now reads `Vulnerable` rather than `Not affected`.
 
 ---
 
