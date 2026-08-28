@@ -1,0 +1,138 @@
+From: Gemini PDA Linux bring-up
+Subject: [PATCH] arm64: do not report "Not affected" on behalf of a late CPU that is
+
+arm64/0001 lets an A72 join late carrying a LOCAL_CPU_ERRATUM the system does
+not have, without enabling it. That is a deliberate trade and its cost is
+recorded: those cores run unmitigated, exactly as `nospectre_v2` would leave
+them.
+
+What was not noticed is that the machine then says otherwise. Measured on build
+#101, one boot, two facts:
+
+  $ dmesg | grep permitting
+  CPU features: CPU8: permitting capability 58 (Spectre-v2) on a late CPU
+                without enabling it
+
+  $ cat /sys/devices/system/cpu/vulnerabilities/spectre_v2
+  Not affected
+  $ cat /sys/devices/system/cpu/vulnerabilities/spec_store_bypass
+  Not affected
+
+Both files are computed from state finalised over the boot CPUs, and on this
+SoC those are Cortex-A53s -- which genuinely are unaffected by Spectre-v2 and
+v4. The two Cortex-A72s that arrive at ~240 s are affected, are unmitigated,
+and cannot change the verdict. So anything reading those files to decide
+whether hardening is needed -- a container runtime, a hardening audit, a
+person -- is told the machine is safe while a fifth of its cores are not.
+
+Running unmitigated is a trade this port makes on purpose. Concealing it is not
+part of that trade.
+
+verify_local_cpu_caps() now records the fact in a flag, and the two arm64
+reporters consult it before their normal switch. Measured on #102, same boot:
+
+  cpu8/9 offline : spectre_v2 = "Not affected"        (true: A53s only)
+  cpu8/9 online  : spectre_v2 = "Vulnerable: late CPU permitted without
+                                 mitigation"
+                   spec_store_bypass = same
+
+Note the flag is only set when a capability is actually permitted this way, so
+a kernel that never onlines a late CPU -- or any other arm64 board using this
+tree -- reports exactly what it did before.
+
+This does not fix #60; the cores are still unmitigated and the two ways to
+change that are still the two large projects that issue names. It removes the
+part of #60 nobody had noticed, which is that you could not tell.
+
+--- a/arch/arm64/kernel/cpufeature.c
++++ b/arch/arm64/kernel/cpufeature.c
+@@ -123,6 +123,14 @@
+ static bool __read_mostly allow_mismatched_32bit_el0;
+ 
+ /*
++ * Set when a late CPU was allowed to carry a LOCAL_CPU_ERRATUM the system does
++ * not have, without enabling it. Read by the arm64 vulnerabilities sysfs
++ * reporters so they do not claim "Not affected" on behalf of cores that are.
++ * Never cleared: such a CPU stays unmitigated for the life of the boot.
++ */
++bool __read_mostly arm64_late_cpu_unmitigated;
++
++/*
+  * Static branch enabled only if allow_mismatched_32bit_el0 is set and we have
+  * seen at least one CPU capable of 32-bit EL0.
+  */
+@@ -3171,6 +3179,30 @@
+ 				pr_info_once("CPU%d: permitting capability %d (%s) on a late CPU without enabling it\n",
+ 					     smp_processor_id(), caps->capability,
+ 					     caps->desc ? caps->desc : "unnamed");
++
++				/*
++				 * And say so where userspace can see it.
++				 *
++				 * Without this the machine tells a flat lie.
++				 * the files under
++				 * /sys/devices/system/cpu/vulnerabilities are
++				 * computed from the boot CPUs, and on this SoC
++				 * those are Cortex-A53s, which genuinely are
++				 * not affected by Spectre-v2 or v4. So with two
++				 * unmitigated Cortex-A72s online, spectre_v2
++				 * and spec_store_bypass both read
++				 * "Not affected" -- measured on build #101, in
++				 * the same boot whose dmesg carries "CPU8:
++				 * permitting capability 58 (Spectre-v2) on a
++				 * late CPU without enabling it".
++				 *
++				 * Anything reading those files to decide
++				 * whether hardening is needed is told the
++				 * machine is safe. Running unmitigated is a
++				 * trade this port makes deliberately (#60);
++				 * concealing it is not part of that trade.
++				 */
++				arm64_late_cpu_unmitigated = true;
+ 			}
+ 		}
+ 	}
+--- a/arch/arm64/kernel/proton-pack.c
++++ b/arch/arm64/kernel/proton-pack.c
+@@ -121,6 +121,19 @@
+ #endif
+ }
+ 
++/*
++ * Set by verify_local_cpu_caps() when a late CPU was permitted a
++ * LOCAL_CPU_ERRATUM the system does not have, without enabling it.
++ *
++ * On MT6797 the boot CPUs are Cortex-A53s, which are genuinely unaffected by
++ * Spectre-v2 and v4, and the two Cortex-A72s arrive late and unmitigated. The
++ * state variables below are finalised from the A53s, so without this check
++ * these files report "Not affected" for a machine two of whose ten cores are.
++ * Reporting the mitigation this port chose not to apply is one thing;
++ * reporting the vulnerability away is another.
++ */
++extern bool arm64_late_cpu_unmitigated;
++
+ ssize_t cpu_show_spectre_v2(struct device *dev, struct device_attribute *attr,
+ 			    char *buf)
+ {
+@@ -128,6 +141,10 @@
+ 	const char *bhb_str = get_bhb_affected_string(bhb_state);
+ 	const char *v2_str = "Branch predictor hardening";
+ 
++	if (arm64_late_cpu_unmitigated)
++		return sprintf(buf,
++			       "Vulnerable: late CPU permitted without mitigation\n");
++
+ 	switch (spectre_v2_state) {
+ 	case SPECTRE_UNAFFECTED:
+ 		if (bhb_state == SPECTRE_UNAFFECTED)
+@@ -446,6 +463,10 @@
+ ssize_t cpu_show_spec_store_bypass(struct device *dev,
+ 				   struct device_attribute *attr, char *buf)
+ {
++	if (arm64_late_cpu_unmitigated)
++		return sprintf(buf,
++			       "Vulnerable: late CPU permitted without mitigation\n");
++
+ 	switch (spectre_v4_state) {
+ 	case SPECTRE_UNAFFECTED:
+ 		return sprintf(buf, "Not affected\n");

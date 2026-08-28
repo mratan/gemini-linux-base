@@ -1,0 +1,37 @@
+# The next instrument for #72, NOT merged by default.
+#
+# gemini-kbuild.sh globs configs/*.config, so the ".optional" suffix keeps this
+# out of every build. To use it:
+#
+#     cp configs/gemini-pagealloc.config.optional configs/gemini-pagealloc.config
+#     scripts/gemini-kbuild.sh <n>     # then pack and flash as usual
+#
+# WHY IT IS NOT ON BY DEFAULT
+#
+# DEBUG_PAGEALLOC unmaps every freed page, so each alloc/free does page-table
+# work and a TLB flush. On this SoC that is a large, always-on cost, and this
+# machine is somebody's desktop -- #55 just spent a session making it idle
+# cheaper, and turning it 2-5x slower is not a change to make on its owner's
+# behalf without asking.
+#
+# WHY IT IS THE RIGHT NEXT INSTRUMENT ANYWAY
+#
+# #72 is a wild pointer whose *writer* has never been identified; every capture
+# is of the next reader tripping over the damage, minutes or hours later.
+# DEBUG_PAGEALLOC faults the writer, at the instant of the write, with a call
+# trace naming it.
+#
+# The standing objection was that a fault it caught would still have to be read
+# somewhere. That objection is now gone twice over: pstore was never broken
+# (2026-08-27), and the printing path is measured good -- the identical fault
+# taken deliberately from process, workqueue and softirq context prints its
+# report in full (2026-08-28, tools/oopsgen/).
+#
+# HOW TO USE IT ONCE FLASHED
+#
+# The detector for the corruption is any cache walk, so pair this with a SLOW
+# periodic one -- one `sync; echo 3 > /proc/sys/vm/drop_caches` every few
+# minutes, for hours, on an otherwise normal machine. Not 60 in four minutes:
+# that was tried and a fresh boot has nothing planted yet to trip over.
+CONFIG_DEBUG_PAGEALLOC=y
+CONFIG_DEBUG_PAGEALLOC_ENABLE_DEFAULT=y
