@@ -1,0 +1,326 @@
+soc: mediatek: mt6797-a72: give the cluster a cpufreq policy
+
+The two A72s came up and stayed at one clock and one voltage for the rest of
+the boot: 2002 MHz at 1180 mV. That is the worst of both worlds. 1180 mV is
+the vendor's voltage for 2145 MHz, two operating points ABOVE the clock
+actually in use, and it was held whether the cores were working or idle -- so
+the two cores with no governor were also the two drawing the most power at
+rest.
+
+It matters more than tidiness. This pack measures 312 mOhm internal resistance
+(105 discharge samples on 2026-08-27: 660 mA at 3867 mV against 1221 mA at
+3691 mV), so every extra amp costs 310 mV of headroom. With cpu8/cpu9 pinned at
+maximum voltage the device browned out 71 seconds after being unplugged, twice,
+hard, with no shutdown sequence; with them offline it ran for minutes. This is
+the same observation as #59.
+
+The OPP table is the vendor's own for cluster B, transcribed in
+04-docs/A72-OPP-TABLE-2026-08-24.md from ubports-3.18
+drivers/misc/mediatek/base/power/mt6797/mt_cpufreq.c. It is the FY1221 /
+CPU_LEVEL_0 bin -- the lowest-clocked of the six the vendor selects between on
+two efuse fields -- because mainline mt6797 has no nvmem node and the efuse
+cannot be read. On a faster-binned die that under-clocks and can never
+over-volt.
+
+The table is deliberately cut at 1989 MHz rather than the vendor's 2145.
+1989 MHz at 1140 mV is 0.65% slower than the 2002 MHz this driver has been
+using and 40 mV below it, so every point is at or better than the status quo on
+both axes. Raising the ceiling is a separate decision with a separate risk and
+should not ride along with this.
+
+Voltage ordering is asymmetric and deliberate: the rail rises before the clock
+and falls after it. Getting that backwards hangs the cluster, which on this
+board is a watchdog reset. The DA9214 encoding is confirmed against mainline
+drivers/regulator/da9211-regulator.{c,h} (MIN_MV 300, STEP_MV 10, VBUCK_MASK
+0x7F, BUCK_SL 0x80), matching what the existing bring-up path already writes.
+
+The fixed raise in a72_raise_fn now stands down when cpufreq is live, so the
+governor and the driver do not both write ARMCAXPLL2.
+---
+--- a/drivers/soc/mediatek/mt6797-a72.c
++++ b/drivers/soc/mediatek/mt6797-a72.c
+@@ -57,6 +57,7 @@
+ #include <linux/module.h>
+ #include <linux/of.h>
+ #include <linux/sysfs.h>
++#include <linux/cpufreq.h>
+ #include <linux/kobject.h>
+ 
+ /* System Power Manager: the SoC-internal power switches. */
+@@ -185,6 +186,9 @@
+ static void __iomem *topckgen_base;
+ static bool a72_ready;
+ static bool vproc2_on;
++/* set once cpufreq_register_driver() succeeds; read by a72_raise_fn above the
++ * cpufreq block, which is why it is declared here rather than beside it. */
++static bool a72_cpufreq_live;
+ 
+ static int da9214_write(struct i2c_adapter *ad, u8 reg, u8 val)
+ {
+@@ -460,6 +464,14 @@
+ 
+ static void a72_raise_fn(struct work_struct *w)
+ {
++	/*
++	 * With a governor attached this is the governor's job, and doing it
++	 * here as well would mean two writers racing on the same PLL. The
++	 * fixed raise remains only as the fallback for a kernel where the
++	 * cpufreq driver failed to register.
++	 */
++	if (a72_cpufreq_live)
++		return;
+ 	mt6797_a72_retune(A72_RUN_MHZ_DEFAULT);
+ }
+ 
+@@ -482,6 +494,224 @@
+ 
+ static struct kobj_attribute a72_freq_attr = __ATTR_RW(freq_mhz);
+ 
++/* ---- cpufreq ------------------------------------------------------------
++ *
++ * Until now this cluster came up and sat at one clock and one voltage for the
++ * rest of the boot: A72_RUN_MHZ_DEFAULT at VPROC2_MV, 2002 MHz at 1180 mV.
++ * That is the worst of both worlds. 1180 mV is the vendor's voltage for
++ * 2145 MHz, two operating points ABOVE the clock actually being used, and it
++ * is held whether the cores are working or idle -- so the two cores with no
++ * governor were also the two drawing the most power at rest.
++ *
++ * It matters more than tidiness. Measured 2026-08-27, this pack has an
++ * internal resistance of 312 mOhm (105 discharge samples, 660 mA at 3867 mV
++ * against 1221 mA at 3691 mV). At that resistance every extra amp costs
++ * 310 mV of headroom, and with these two cores pinned at maximum voltage the
++ * device browned out 71 seconds after being unplugged -- twice, hard, with no
++ * shutdown sequence. With cpu8/cpu9 offline it ran for minutes. Giving the
++ * cluster a governor is what makes the machine usable on battery, and #59's
++ * "eight cores at maximum takes the machine down" is the same observation.
++ *
++ * OPP TABLE SOURCE: the vendor's own, cluster B, transcribed in
++ * 04-docs/A72-OPP-TABLE-2026-08-24.md from
++ * ubports-3.18 drivers/misc/mediatek/base/power/mt6797/mt_cpufreq.c. The
++ * vendor's frequencies are kHz and its voltages are in units of 10 uV despite
++ * a "/ * 10MV * /" comment in that file: 118000 x 10 uV = 1.18 V, which is the
++ * rail this driver already brings up. So opp-kHz = vendor, mV = vendor / 100.
++ *
++ * WHICH BIN: the vendor selects one of six tables from two efuse fields
++ * (FUNC_CODE / DATE_CODE). We cannot read the efuse -- mainline mt6797 has no
++ * nvmem node and /sys/bus/nvmem/devices is empty -- so this is FY1221,
++ * CPU_LEVEL_0, the LOWEST-clocked of the six. On a faster-binned die that
++ * under-clocks; it can never over-volt. FIXME: read the efuse once an
++ * mtk-efuse node exists and pick the real bin.
++ *
++ * CEILING: the table is deliberately cut at 1989 MHz rather than the vendor's
++ * 2145. 1989 MHz at 1140 mV is 0.65% slower than the 2002 MHz this driver has
++ * been running and 40 mV BELOW it, so every point here is at or better than
++ * the status quo on both axes. Raising the ceiling is a separate decision with
++ * a separate risk, and #59 is still open; this change should not smuggle it in.
++ */
++struct a72_opp {
++	unsigned int khz;
++	unsigned int mv;
++};
++
++static const struct a72_opp a72_opps[] = {
++	{ 1989000, 1140 },
++	{ 1963000, 1130 },
++	{ 1872000, 1110 },
++	{ 1690000, 1070 },
++	{ 1599000, 1050 },
++	{ 1404000, 1000 },
++	{ 1287000,  980 },
++	{ 1170000,  950 },
++	{ 1053000,  930 },
++	{  936000,  900 },
++	{  793000,  880 },
++	{  650000,  850 },
++	{  338000,  800 },
++};
++
++static struct cpufreq_frequency_table a72_freq_table[ARRAY_SIZE(a72_opps) + 1];
++static unsigned int a72_cur_mv = VPROC2_MV;
++
++/*
++ * Set VPROC2 (DA9214 BUCKB, the A72 core rail) to an exact millivolt.
++ *
++ * Encoding confirmed against mainline drivers/regulator/da9211-regulator.{c,h}
++ * for this part: DA9211_MIN_MV 300, DA9211_STEP_MV 10, DA9211_VBUCK_MASK 0x7F,
++ * DA9211_BUCK_SL 0x80. So code = (mV - 300) / 10, and bit 7 is the slew-select
++ * the existing bring-up path already sets. Callers pass only voltages that
++ * appear in a72_opps[], so no clamping table is invented here.
++ */
++static int a72_set_vproc2_mv(unsigned int mv)
++{
++	struct i2c_adapter *ad;
++	struct device_node *np;
++	u8 code;
++	int r;
++
++	if (mv < 300 || mv > 1570)		/* da9211-regulator.c MIN/MAX_MV */
++		return -EINVAL;
++	code = (mv - 300) / 10;
++
++	np = of_find_node_by_path(DA9214_I2C_ALIAS);
++	if (!np) {
++		pr_err("no \"%s\" alias; cannot set VPROC2\n", DA9214_I2C_ALIAS);
++		return -ENODEV;
++	}
++	ad = of_get_i2c_adapter_by_node(np);
++	of_node_put(np);
++	if (!ad) {
++		pr_err("i2c6 adapter unavailable; cannot set VPROC2\n");
++		return -ENODEV;
++	}
++
++	r = da9214_write(ad, DA9214_PAGE_CON, 0);
++	if (!r)
++		r = da9214_write(ad, DA9214_VBUCKB_A, code | 0x80);
++	i2c_put_adapter(ad);
++
++	if (r) {
++		pr_err("VPROC2 set to %u mV failed (%d)\n", mv, r);
++		return r;
++	}
++
++	/*
++	 * The rail needs time to settle before the cores are asked to run
++	 * faster on it. The bring-up path above waits 20 ms after enabling the
++	 * buck; a step between adjacent OPPs is far smaller, but this is the
++	 * one delay in the sequence that protects against raising the clock
++	 * onto a rail that has not arrived. FIXME: no DA9214 slew figure is
++	 * cited anywhere in this tree, so 2 ms is a conservative guess rather
++	 * than a datasheet number -- verify and replace.
++	 */
++	usleep_range(2000, 2500);
++	a72_cur_mv = mv;
++	pr_debug("VPROC2 now %u mV\n", mv);
++	return 0;
++}
++
++static int a72_cpufreq_target(struct cpufreq_policy *policy, unsigned int index)
++{
++	unsigned int khz = a72_freq_table[index].frequency;
++	unsigned int mv = a72_opps[index].mv;
++	unsigned int old_mv = a72_cur_mv;
++	int ret;
++
++	/*
++	 * ORDER MATTERS AND IS NOT SYMMETRIC. Going up, the rail must arrive
++	 * before the clock does or the cores run faster than their voltage
++	 * supports. Coming down, the clock must drop first for the same reason
++	 * in reverse. Getting this backwards does not misbehave gracefully --
++	 * it hangs the cluster, and on this board a hung cluster is a watchdog
++	 * reset.
++	 */
++	if (mv > old_mv) {
++		ret = a72_set_vproc2_mv(mv);
++		if (ret)
++			return ret;
++		ret = mt6797_a72_retune(khz / 1000);
++		if (ret) {
++			pr_err("retune to %u kHz failed (%d); backing the rail out to %u mV\n",
++			       khz, ret, old_mv);
++			a72_set_vproc2_mv(old_mv);
++			return ret;
++		}
++	} else {
++		ret = mt6797_a72_retune(khz / 1000);
++		if (ret) {
++			pr_err("retune to %u kHz failed (%d); leaving the rail at %u mV\n",
++			       khz, ret, old_mv);
++			return ret;
++		}
++		if (mv < old_mv) {
++			ret = a72_set_vproc2_mv(mv);
++			if (ret)	/* clock is already low; high rail is safe */
++				pr_warn("clock is at %u kHz but the rail is still %u mV (%d)\n",
++					khz, old_mv, ret);
++		}
++	}
++	return 0;
++}
++
++static unsigned int a72_cpufreq_get(unsigned int cpu)
++{
++	return a72_cur_mhz * 1000;
++}
++
++static int a72_cpufreq_init(struct cpufreq_policy *policy)
++{
++	int cpu, i;
++
++	if (MPIDR_AFFINITY_LEVEL(cpu_logical_map(policy->cpu), 1) !=
++	    MPIDR_CLUSTER_A72)
++		return -ENODEV;
++
++	/*
++	 * Both A72s share ARMCAXPLL2 and the VPROC2 rail, so they are one
++	 * policy. Deriving the mask from MPIDR rather than hardcoding 8 and 9
++	 * keeps this correct if the topology is ever renumbered.
++	 */
++	for_each_possible_cpu(cpu)
++		if (MPIDR_AFFINITY_LEVEL(cpu_logical_map(cpu), 1) ==
++		    MPIDR_CLUSTER_A72)
++			cpumask_set_cpu(cpu, policy->cpus);
++
++	for (i = 0; i < ARRAY_SIZE(a72_opps); i++) {
++		a72_freq_table[i].driver_data = i;
++		a72_freq_table[i].frequency = a72_opps[i].khz;
++	}
++	a72_freq_table[i].frequency = CPUFREQ_TABLE_END;
++	policy->freq_table = a72_freq_table;
++
++	/*
++	 * The firmware's power-on gate brings the cluster up at A72_CLK_KHZ,
++	 * which is not a table entry, so the driver's idea of the current
++	 * frequency would not match any OPP. Land on the lowest point
++	 * explicitly and let the governor take it from there.
++	 */
++	policy->cur = a72_cur_mhz * 1000;
++	policy->cpuinfo.transition_latency = 300 * NSEC_PER_USEC;
++
++	pr_info("cpufreq: policy for cpu%*pbl, %zu OPPs, %u-%u MHz\n",
++		cpumask_pr_args(policy->cpus), ARRAY_SIZE(a72_opps),
++		a72_opps[ARRAY_SIZE(a72_opps) - 1].khz / 1000,
++		a72_opps[0].khz / 1000);
++	return 0;
++}
++
++static struct cpufreq_driver a72_cpufreq_driver = {
++	.name		= "mt6797-a72",
++	.flags		= CPUFREQ_NEED_INITIAL_FREQ_CHECK,
++	.verify		= cpufreq_generic_frequency_table_verify,
++	.target_index	= a72_cpufreq_target,
++	.get		= a72_cpufreq_get,
++	.init		= a72_cpufreq_init,
++	.attr		= cpufreq_generic_attr,
++};
++
+ /* Runs on the controlling CPU, immediately before the target is brought up. */
+ static int mt6797_a72_prepare(unsigned int cpu)
+ {
+@@ -611,7 +841,25 @@
+ 		pr_warn("no sysfs knob; the cluster is fixed at its default clock\n");
+ 
+ 	a72_ready = true;
+-	pr_info("registered; cpu8/cpu9 can be onlined (the rail comes up on demand)\n");
++
++	/*
++	 * Registering here creates no policy: cpu8/cpu9 are still offline and
++	 * cpufreq only builds a policy for an online CPU. The policy appears
++	 * when the cluster is onlined, which is also when the rail exists.
++	 * A failure is not fatal -- the cluster still runs, at the fixed clock
++	 * a72_raise_fn falls back to -- but it must be loud, because a silently
++	 * ungoverned pair of A72s at maximum voltage is what this change exists
++	 * to end.
++	 */
++	ret = cpufreq_register_driver(&a72_cpufreq_driver);
++	if (ret)
++		pr_err("cpufreq driver did not register (%d); the cluster will run at a fixed %u MHz and %u mV\n",
++		       ret, A72_RUN_MHZ_DEFAULT, VPROC2_MV);
++	else
++		a72_cpufreq_live = true;
++
++	pr_info("registered; cpu8/cpu9 can be onlined (the rail comes up on demand)%s\n",
++		a72_cpufreq_live ? ", cpufreq active" : "");
+ 	return 0;
+ 
+ err:
