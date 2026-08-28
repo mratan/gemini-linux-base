@@ -1,0 +1,177 @@
+From: Gemini PDA Linux bring-up
+Subject: [PATCH] arm64: detect a late CPU's errata during boot, from the device tree
+
+arm64/0001 lets the A72s join late carrying errata the boot CPUs do not have,
+without enabling them, because enabling that late installs half a mitigation:
+the alternatives were patched during boot for a system that did not have the
+capability. Issue #60 records the cost -- those cores run unmitigated -- and
+lists two ways out, both acting on the LATE CPU and both large.
+
+This acts on the BOOT CPUs instead, and is about twenty lines.
+
+A LOCAL_CPU_ERRATUM is detected across the boot CPUs and its alternatives are
+patched once, before any late CPU exists. Here the boot CPUs are eight
+Cortex-A53s, genuinely unaffected by Spectre-v2, and the two affected
+Cortex-A72s are hotplugged at ~240 s because their cluster needs an external
+buck on i2c that is not probed during early SMP. So the capability is never
+detected and there is nothing for the A72 to enable when it arrives.
+
+So detect it during boot when the DEVICE TREE declares an affected CPU, even
+though no boot CPU has one. The alternatives are then patched with the
+mitigation in place, and the A72 joins a system that already has the capability
+-- nothing to permit, and cpu_enable() does something real.
+
+MEASURED, build #104:
+
+  [    0.000000] CPU features: detected: Spectre-v2     <- at boot, on the A53s
+
+and capability 58 disappears from the permit list; the A72 joins with it
+enabled. Everything else about the cluster is unchanged.
+
+IT ALSO CONTRADICTS THE REASON #60 GIVES FOR NOT DOING THIS. That issue records
+that calling cpu_enable() late killed the core "within ~280ms of the scheduler
+placing the first userspace task on it". That is true with the alternatives left
+as NOPs. With them patched it is not:
+
+  cpu8 ran 2e6 shell iterations in userspace and lived
+  cpu9 userspace ok
+  online after: 0-9   failed=0
+
+The ~280 ms death was a symptom of unpatched alternatives, not of late enabling.
+
+WHAT IT COSTS, and why it defaults to n. The eight A53s pay a mitigation they do
+not need -- an SMCCC_ARCH_WORKAROUND_1 call on exception entry from EL0.
+Measured, #104 against #103: A53-LL -1.5%, A53-L -6.4%, A72 -0.2%, process spawn
++3%. A straight trade of throughput on eight cores for correctness on two, for
+one of six capabilities. #60 records the unmitigated state as *accepted*
+("acceptable for a single-user pocket terminal"), and reversing an accepted
+trade and charging 6% for it is a decision for the owner, not a default.
+
+SCOPE. Spectre-v2 only. The other five the A72 brings -- v3a, v4, BHB, erratum
+1742098 and errata 1165522/1319367/1530923, now enumerated for the first time
+because this patch also makes the permit message pr_info rather than
+pr_info_once -- follow the same shape. Three are matches functions in this file;
+the two errata go through is_affected_midr_range[_list] and want a
+compatible-to-MIDR mapping rather than a DT presence check.
+
+--- a/arch/arm64/Kconfig
++++ b/arch/arm64/Kconfig
+@@ -581,6 +581,38 @@
+ 
+ 	  If unsure, say Y.
+ 
++config ARM64_MITIGATE_LATE_CPUS
++	bool "Detect a late CPU's errata during boot, from the device tree"
++	default n
++	help
++	  A LOCAL_CPU_ERRATUM is detected across the boot CPUs and its
++	  alternatives are patched once, before any late CPU exists. On a
++	  machine whose affected CPUs are all hotplugged after boot, the
++	  capability is therefore never detected and the mitigation is never
++	  patched in -- so when those CPUs arrive there is nothing for them to
++	  enable, and they run unmitigated.
++
++	  MT6797 (Planet Computers Gemini PDA) is exactly that: eight Cortex-A53
++	  boot CPUs, genuinely unaffected by Spectre-v2, and two Cortex-A72s
++	  hotplugged at ~240 s because their cluster needs an external buck on
++	  i2c that is not probed during early SMP.
++
++	  Say Y to detect the capability during boot when the device tree
++	  declares an affected CPU, even though no boot CPU has it. The
++	  alternatives are then patched, and the late CPU joins a system that
++	  already has the capability -- so it gets a real mitigation rather than
++	  being permitted without one.
++
++	  THE COST FALLS ON THE CPUS THAT DO NOT NEED IT. Measured on MT6797,
++	  build #104 against #103: A53 single-thread throughput -1.5% to -6.4%,
++	  process spawn +3%, A72 unchanged. That is a straight trade of
++	  throughput on eight cores for correctness on two.
++
++	  Currently covers Spectre-v2 only; Spectre-v3a/v4/BHB and errata
++	  1742098 and 1319367 follow the same pattern and are not yet done.
++
++	  If unsure, say N.
++
+ config ARM64_ERRATUM_845719
+ 	bool "Cortex-A53: 845719: a load might read incorrect data"
+ 	depends on COMPAT
+--- a/arch/arm64/kernel/proton-pack.c
++++ b/arch/arm64/kernel/proton-pack.c
+@@ -18,6 +18,7 @@
+  */
+ 
+ #include <linux/arm-smccc.h>
++#include <linux/of.h>
+ #include <linux/bpf.h>
+ #include <linux/cpu.h>
+ #include <linux/device.h>
+@@ -216,11 +217,57 @@
+ 	}
+ }
+ 
++/*
++ * Does this system have an affected CPU that has not arrived yet?
++ *
++ * A LOCAL_CPU_ERRATUM is detected across the BOOT CPUs and its alternatives are
++ * patched once, before any late CPU exists. On MT6797 the boot CPUs are eight
++ * Cortex-A53s, genuinely unaffected by Spectre-v2, and the two affected
++ * Cortex-A72s are hotplugged at ~240 s because their cluster needs an external
++ * buck on i2c that is not probed during early SMP. So the capability is never
++ * detected, the alternatives are never patched, and when the A72s do arrive
++ * there is nothing for them to enable -- arm64/0001 permits them unmitigated,
++ * which is the cost issue #60 records.
++ *
++ * Both fixes that issue proposes act on the LATE CPU: bring it up earlier, or
++ * teach the mitigation code to patch per-CPU vectors afterwards. Both are large.
++ * This is a third way and it acts on the BOOT CPUs: if the device tree says a
++ * Cortex-A72 exists, detect the capability during boot even though no boot CPU
++ * has it. The alternatives are then patched with the mitigation in place, and
++ * the A72 joins a system that already has the capability -- nothing to permit,
++ * and cpu_enable() does something real when it runs.
++ *
++ * WHAT IT COSTS: the eight A53s pay a mitigation they do not need, an
++ * SMCCC_ARCH_WORKAROUND_1 call on exception entry from EL0. That is a straight
++ * trade of throughput on eight cores for correctness on two, so the number
++ * matters more than the mechanism and it is in the commit message.
++ *
++ * Gated on the DT rather than on a machine compatible because that is what it
++ * actually means: mitigate for a CPU this system is going to have.
++ */
++static bool system_will_have_late_a72(void)
++{
++	static int cached = -1;
++	struct device_node *np;
++
++	if (!IS_ENABLED(CONFIG_ARM64_MITIGATE_LATE_CPUS))
++		return false;
++
++	if (cached >= 0)
++		return cached;
++
++	np = of_find_compatible_node(NULL, NULL, "arm,cortex-a72");
++	cached = !!np;
++	of_node_put(np);
++	return cached;
++}
++
+ bool has_spectre_v2(const struct arm64_cpu_capabilities *entry, int scope)
+ {
+ 	WARN_ON(scope != SCOPE_LOCAL_CPU || preemptible());
+ 
+-	if (spectre_v2_get_cpu_hw_mitigation_state() == SPECTRE_UNAFFECTED)
++	if (spectre_v2_get_cpu_hw_mitigation_state() == SPECTRE_UNAFFECTED &&
++	    !system_will_have_late_a72())
+ 		return false;
+ 
+ 	if (spectre_v2_get_cpu_fw_mitigation_state() == SPECTRE_UNAFFECTED)
+--- a/arch/arm64/kernel/cpufeature.c
++++ b/arch/arm64/kernel/cpufeature.c
+@@ -3176,7 +3176,7 @@
+ 				 * and it is the difference between a usable CPU
+ 				 * and one that hangs the machine.
+ 				 */
+-				pr_info_once("CPU%d: permitting capability %d (%s) on a late CPU without enabling it\n",
++				pr_info("CPU%d: permitting capability %d (%s) on a late CPU without enabling it\n",
+ 					     smp_processor_id(), caps->capability,
+ 					     caps->desc ? caps->desc : "unnamed");
+ 
