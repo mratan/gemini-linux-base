@@ -22,6 +22,13 @@ two efuse fields -- because mainline mt6797 has no nvmem node and the efuse
 cannot be read. On a faster-binned die that under-clocks and can never
 over-volt.
 
+The table stops at 793 MHz at the bottom, not the vendor's 338. Found by
+reading the code rather than by running it: mt6797_a72_retune() refuses
+anything below 750 MHz, so a governor asking for 650 or 338 would have taken
+-EINVAL on every idle transition. 793 MHz at 880 mV is still 300 mV and
+1.2 GHz below where this cluster used to idle. Going lower means first
+establishing what the PLL and the firmware call accept below 750.
+
 The table is deliberately cut at 1989 MHz rather than the vendor's 2145.
 1989 MHz at 1140 mV is 0.65% slower than the 2002 MHz this driver has been
 using and 40 mV below it, so every point is at or better than the status quo on
@@ -72,7 +79,7 @@ governor and the driver do not both write ARMCAXPLL2.
  	mt6797_a72_retune(A72_RUN_MHZ_DEFAULT);
  }
  
-@@ -482,6 +494,224 @@
+@@ -482,6 +494,235 @@
  
  static struct kobj_attribute a72_freq_attr = __ATTR_RW(freq_mhz);
  
@@ -131,8 +138,19 @@ governor and the driver do not both write ARMCAXPLL2.
 +	{ 1053000,  930 },
 +	{  936000,  900 },
 +	{  793000,  880 },
-+	{  650000,  850 },
-+	{  338000,  800 },
++	/*
++	 * The vendor's table continues to 650 MHz at 850 mV and 338 MHz at
++	 * 800 mV. Both are omitted because mt6797_a72_retune() refuses
++	 * anything below 750 MHz -- the firmware's power-on gate wants ~750
++	 * and that floor has never been tested from the other direction. A
++	 * governor asking for 338 MHz would simply get -EINVAL on every idle
++	 * transition, so the table stops where the code can actually go.
++	 *
++	 * 793 MHz at 880 mV is still 300 mV and 1.2 GHz below where this
++	 * cluster used to idle, which is the whole point. Extending downward
++	 * means establishing what the PLL and the firmware call will accept
++	 * below 750 MHz first.
++	 */
 +};
 +
 +static struct cpufreq_frequency_table a72_freq_table[ARRAY_SIZE(a72_opps) + 1];
@@ -297,7 +315,7 @@ governor and the driver do not both write ARMCAXPLL2.
  /* Runs on the controlling CPU, immediately before the target is brought up. */
  static int mt6797_a72_prepare(unsigned int cpu)
  {
-@@ -611,7 +841,25 @@
+@@ -611,7 +852,25 @@
  		pr_warn("no sysfs knob; the cluster is fixed at its default clock\n");
  
  	a72_ready = true;
