@@ -1,0 +1,157 @@
+From: Gemini PDA Linux bring-up
+Subject: [PATCH] ASoC: mt6797: claim the audio PLL mux group, or the boot wedges
+
+THIS IS THE FIX FOR #85. It is a boot-reliability fix that happens to live in
+the audio driver.
+
+MT6797 loses roughly half its reboots to a 5-20 minute loop. A failing boot,
+captured through the ramoops console zone (which survives this SoC's reset, so
+a dead boot is readable on the next live one), dies here:
+
+  [    1.010716] clk-unused: gating mm_dsi1_interface_clock
+  [    1.011373] clk-unused: gating mm_dsi0_interface_clock
+  [    1.012031] clk-unused: gating audio_h_sel
+  [    1.012557] clk-unused: gating aud_2_sel
+  [    1.013062] clk-unused: gating aud_1_sel
+  [   24.025716] watchdog: Watchdog detected hard LOCKUP on cpu 3
+
+Five clocks of 111. A healthy boot prints its next line one millisecond after
+"clk: Disabling unused clocks"; this one printed nothing for twenty-three
+seconds and then lost two CPUs. Gate a clock a block silently depends on and the
+next MMIO to it never returns -- a hard lockup on whichever CPU touches it,
+which is why the locked pair varies between failures. /init never runs, systemd
+never claims /dev/watchdog, and watchdog.open_timeout=120 reclaims the machine:
+measured at 119, 120, 119, 120 and 118 seconds across five failures.
+
+WHY THEY WERE GATED: NOBODY ASKED FOR THEM.
+
+  aud_1_sel   = CLK_TOP_MUX_AUD_1     (clk-mt6797.c:386)
+  aud_2_sel   = CLK_TOP_MUX_AUD_2     (clk-mt6797.c:388)
+  audio_h_sel = CLK_TOP_MUX_AUDIO_H   (clk-mt6797.c:396)
+
+Grepping every device tree in the tree for those IDs returns mt8183 -- and
+nothing else. mt8183's audio node claims exactly this group, alongside
+APLL1_CK/APLL2_CK, and so does mt7622's. MT6797's claimed none of them, and
+mt6797-afe-clk.c asks for "top_mux_audio" and "top_mux_aud_intbus", which are
+CLK_TOP_MUX_AUDIO and CLK_TOP_MUX_AUD_INTBUS -- different muxes. So the audio
+PLL path had enable_count 0 and the sweep took it.
+
+WHY IT WAS INTERMITTENT. The AFE takes all its clocks with devm_clk_get() -- get
+only, no enable -- and enables four of them from mt6797_afe_runtime_resume().
+Its probe defers ("snd_soc_register_card fail -517" appears in every boot log),
+so whether it is runtime-resumed when clk_disable_unused() runs varies from boot
+to boot. A clock a driver merely *gets* is still a clock the sweep will gate.
+
+This is the same defect, in the same shape, as the one closed on 2026-07-06:
+8250_mtk never enabled the UART's own baud clock, the sweep gated it, and the
+boot went silent at exactly this line. That was repaired with
+devm_clk_get_enabled(). Same repair here, for the three that nothing else holds.
+
+AND IT EXPLAINS WHY netconsole= ON THE COMMAND LINE "FIXED" THE LOOP. Measured:
+#110 with it, 24/24 clean reboot cycles; #111, the same tree with only that
+parameter deleted, looped on its first reboot. netpoll_setup() runs at
+late_initcall -- one level before late_initcall_sync -- and dev_open()s usb0,
+which both takes clock references and delays the sweep. It was never a cure. It
+moved a race, and it has been load-bearing ever since.
+
+MEASURED: build #115 (netconsole removed, clk_ignore_unused added) gave 12/12
+clean cycles where #113 looped on its first reboot, which is what established
+the sweep as the mechanism before this fix existed.
+
+Note mm_dsi0/1_interface_clock are gated immediately before, in the same
+unclaimed position. They are not addressed here and are worth the same look.
+
+--- a/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
++++ b/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
+@@ -1841,6 +1841,14 @@
+ 		reg = <0 0x11220000 0 0x10000>;
+ 		interrupts = <GIC_SPI 151 IRQ_TYPE_LEVEL_LOW>;
+ 		power-domains = <&scpsys MT6797_POWER_DOMAIN_AUDIO>;
++		/*
++		 * #85: aud_1_sel / aud_2_sel / audio_h_sel (CLK_TOP_MUX_AUD_1,
++		 * _AUD_2, _AUDIO_H) were claimed by NOTHING in this tree, so
++		 * clk_disable_unused() gated them and the boot wedged -- a
++		 * captured failing boot dies at exactly "gating aud_1_sel".
++		 * mt8183 and mt7622 both claim this group from their audio
++		 * nodes; MT6797 did not. See 04-docs/captures/85-boot-loop-20260828/.
++		 */
+ 		clocks = <&infrasys CLK_INFRA_AUDIO>,
+ 			 <&infrasys CLK_INFRA_AUDIO_26M>,
+ 			 <&infrasys CLK_INFRA_AUDIO_26M_PAD_TOP>,
+@@ -1848,7 +1856,10 @@
+ 			 <&topckgen CLK_TOP_MUX_AUD_INTBUS>,
+ 			 <&topckgen CLK_TOP_SYSPLL3_D4>,
+ 			 <&topckgen CLK_TOP_SYSPLL1_D4>,
+-			 <&clk26m>;
++			 <&clk26m>,
++			 <&topckgen CLK_TOP_MUX_AUD_1>,
++			 <&topckgen CLK_TOP_MUX_AUD_2>,
++			 <&topckgen CLK_TOP_MUX_AUDIO_H>;
+ 		clock-names = "infra_sys_audio_clk",
+ 			      "infra_sys_audio_26m",
+ 			      "mtkaif_26m_clk",
+@@ -1856,7 +1867,10 @@
+ 			      "top_mux_aud_intbus",
+ 			      "top_sys_pll3_d4",
+ 			      "top_sys_pll1_d4",
+-			      "top_clk26m_clk";
++			      "top_clk26m_clk",
++			      "top_mux_aud_1",
++			      "top_mux_aud_2",
++			      "top_mux_audio_h";
+ 	};
+ 
+ 	sound {
+--- a/sound/soc/mediatek/mt6797/mt6797-afe-clk.c
++++ b/sound/soc/mediatek/mt6797/mt6797-afe-clk.c
+@@ -18,6 +18,9 @@
+ 	CLK_TOP_SYSPLL3_D4,
+ 	CLK_TOP_SYSPLL1_D4,
+ 	CLK_CLK26M,
++	CLK_TOP_MUX_AUD_1,	/* #85 -- see aud_clks[] */
++	CLK_TOP_MUX_AUD_2,
++	CLK_TOP_MUX_AUDIO_H,
+ 	CLK_NUM
+ };
+ 
+@@ -29,6 +32,21 @@
+ 	[CLK_TOP_SYSPLL3_D4] = "top_sys_pll3_d4",
+ 	[CLK_TOP_SYSPLL1_D4] = "top_sys_pll1_d4",
+ 	[CLK_CLK26M] = "top_clk26m_clk",
++	/*
++	 * #85. These three were requested by nothing at all, so
++	 * clk_disable_unused() gated them at late_initcall_sync and the boot
++	 * wedged -- a captured failing boot dies at exactly
++	 * "clk-unused: gating aud_1_sel". mt8183 and mt7622 both claim this
++	 * group from their audio nodes.
++	 *
++	 * They are taken with devm_clk_get_enabled() below rather than plain
++	 * devm_clk_get(), which is the same fix 8250_mtk needed on 2026-07-06
++	 * for the UART's baud clock and for the identical symptom. A clock this
++	 * driver merely *gets* is still a clock the sweep will gate.
++	 */
++	[CLK_TOP_MUX_AUD_1] = "top_mux_aud_1",
++	[CLK_TOP_MUX_AUD_2] = "top_mux_aud_2",
++	[CLK_TOP_MUX_AUDIO_H] = "top_mux_audio_h",
+ };
+ 
+ int mt6797_init_clock(struct mtk_base_afe *afe)
+@@ -42,7 +60,17 @@
+ 		return -ENOMEM;
+ 
+ 	for (i = 0; i < CLK_NUM; i++) {
+-		afe_priv->clk[i] = devm_clk_get(afe->dev, aud_clks[i]);
++		/*
++		 * #85: the last three are taken ENABLED and never released, so
++		 * clk_disable_unused() cannot gate them. The rest keep the
++		 * original get-only behaviour; this driver enables those it
++		 * needs from runtime_resume.
++		 */
++		if (i >= CLK_TOP_MUX_AUD_1)
++			afe_priv->clk[i] = devm_clk_get_enabled(afe->dev,
++							        aud_clks[i]);
++		else
++			afe_priv->clk[i] = devm_clk_get(afe->dev, aud_clks[i]);
+ 		if (IS_ERR(afe_priv->clk[i])) {
+ 			dev_err(afe->dev, "%s(), devm_clk_get %s fail, ret %ld\n",
+ 				__func__, aud_clks[i],
