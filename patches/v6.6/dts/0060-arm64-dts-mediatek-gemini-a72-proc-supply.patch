@@ -1,0 +1,68 @@
+arm64: dts: mediatek: gemini: claim the A72 core rail
+
+BUCKB (VPROC2) is declared and, until now, claimed by nobody. mt6797-a72.c
+brought it up by writing the DA9214 over raw i2c, behind the regulator
+framework's back, so the framework saw a regulator with no consumers and the
+core's unused-supply sweep switched it off underneath a running cluster:
+
+  [ 18.153957] mt6797-a72: A72 cluster at 1989 MHz on 1140 mV
+  [ 31.712748] da9214_vproc2: disabling
+
+and the machine hung, with no oops, because there was nothing left to oops
+with. Capture in 04-docs/captures/netconsole-20260827-a72-vproc2-disable.log.
+
+Naming the supply on the CPU nodes fixes it by construction -- a regulator
+with a consumer is not unused -- and "proc" is the exact property
+mediatek-cpufreq looks for when deciding whether it can manage a cluster,
+so this is also the first half of what #55 needs.
+
+The stale reasoning above the node is corrected in the same change: it
+claimed CONFIG_REGULATOR_DA9211 stays =m so nothing would bind before the
+sweep. It is =y, and the sweep is regulator_init_complete_work on a thirty
+second delay, which would have caught a late bind anyway.
+--- a/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
++++ b/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
+@@ -899,9 +899,21 @@
+ 	 * B-40 has now shown that turning it on does not bring the A72s up —
+ 	 * ATF stalls in the MP2 power sequence regardless.
+ 	 *
+-	 * CONFIG_REGULATOR_DA9211 stays =m (configs/gemini-cpu-regulator.config)
+-	 * so nothing binds until `modprobe da9211`, after the disable-unused
+-	 * sweep has already run.
++	 * CORRECTED 2026-08-27: the note that used to sit here said
++	 * CONFIG_REGULATOR_DA9211 stays =m "so nothing binds until
++	 * `modprobe da9211`, after the disable-unused sweep has already run".
++	 * Both halves are wrong. It is =y (configs/gemini-cpu-regulator.config
++	 * line 31), so da9211 binds at boot; and the sweep is not an init-time
++	 * one-shot but regulator_init_complete_work, queued with a THIRTY
++	 * SECOND delay, so it would catch a late-loading regulator anyway.
++	 *
++	 * With BUCKB declared and nothing claiming it, that sweep switched the
++	 * A72 core rail off underneath a running cluster and hung the machine
++	 * (netconsole, build #98: "A72 cluster at 1989 MHz on 1140 mV" at
++	 * 18.1 s, "da9214_vproc2: disabling" at 31.7 s, silence after). It was
++	 * survivable only because gemini-a72-online fires at ~240 s, well clear
++	 * of the window. mt6797-a72.c now holds a real reference through
++	 * proc-supply below, which is what makes the rail not-unused.
+ 	 */
+ 	da9214: regulator@68 {
+ 		compatible = "dlg,da9214";
+@@ -3025,3 +3037,18 @@
+ 		status = "okay";
+ 	};
+ };
++
++/*
++ * The A72 core rail, claimed by name. mt6797-a72.c does
++ * regulator_get_optional(cpu_dev, "proc") against these, which (a) gives the
++ * regulator a consumer so the core's unused-supply sweep leaves it alone, and
++ * (b) is the exact property mediatek-cpufreq looks for when deciding whether
++ * it can manage a cluster -- see #55.
++ */
++&cpu8 {
++	proc-supply = <&da9214_vproc2>;
++};
++
++&cpu9 {
++	proc-supply = <&da9214_vproc2>;
++};

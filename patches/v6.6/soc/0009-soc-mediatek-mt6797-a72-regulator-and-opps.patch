@@ -1,0 +1,412 @@
+soc: mediatek: mt6797-a72: take the core rail through the regulator, and pick real OPPs
+
+Two changes to the same rail, because they are the same mistake seen from
+two sides.
+
+1. VPROC2 IS NOW A REGULATOR, NOT AN i2c POKE.
+
+The rail is declared in the DT and CONFIG_REGULATOR_DA9211=y, so mainline's
+da9211 driver binds it at boot. This driver brought it up by writing the
+DA9214 directly, behind the framework's back, so the framework saw a
+regulator with no consumers -- and the core's unused-supply sweep switched
+it off underneath a running cluster:
+
+  [ 18.153957] mt6797-a72: A72 cluster at 1989 MHz on 1140 mV
+  [ 31.712748] da9214_vproc2: disabling
+
+The machine hung with no oops, because there was nothing left to oops with.
+That sweep is regulator_init_complete_work, queued with a THIRTY SECOND
+delay, so ANY A72 brought online inside that window died -- on every build
+this project has ever made. It went unnoticed only because
+gemini-a72-online fires at ~240 s, well clear of it. It surfaced the first
+time a core was onlined by hand at 17 s.
+
+regulator_get_optional() deliberately, not regulator_get(): the latter hands
+back a dummy when the supply is missing, and a dummy accepts set_voltage and
+enable without doing anything, so the rail would never come up and nothing
+would say so. The matching proc-supply is added in dts/0060.
+
+2. THE CLUSTER NOW RUNS AT A POINT THE VENDOR ACTUALLY SPECIFIES.
+
+It ran at 2002 MHz on 1180 mV. 2002 MHz is in no vendor table, and 1180 mV
+is the voltage for 2145 MHz -- two operating points above. So the cluster
+held maximum voltage for a clock that never needed it, busy or idle, and
+these are the two cores no frequency cap governs.
+
+The default is now 1989 MHz on 1140 mV: 0.65% less clock for 40 mV less
+rail, which is about 7% less core power since dynamic power goes as V^2.
+Every point in the new table is at or better than the old fixed pair on both
+axes.
+
+That matters beyond tidiness. This pack measures 312 mOhm internal
+resistance (105 discharge samples, 2026-08-27), so every extra amp costs
+310 mV of headroom, and the device browned out 71 seconds after being
+unplugged with these cores at maximum voltage.
+
+The table is the vendor's own for cluster B (04-docs/A72-OPP-TABLE, from
+ubports-3.18 mt_cpufreq.c), FY1221 / CPU_LEVEL_0 -- the lowest-clocked of
+the six bins and so the highest voltage for any clock, which under-clocks a
+faster die but can never over-volt. It stops at 793 MHz because
+mt6797_a72_retune() refuses anything below 750.
+
+The sysfs knob now moves the rail with the clock instead of leaving it
+wherever it was. Requests above the top OPP still work, on the top voltage,
+because the documented 2496 MHz burst depends on it -- flagged FIXME, since
+the vendor publishes no voltage up there and none is invented here.
+
+WHAT THIS IS NOT: a cpufreq driver. Linux allows exactly one
+cpufreq_driver system-wide and mtk-cpufreq already owns it, so registering
+a second returns -EEXIST (measured, build #97). The way in is the driver
+already there, which declines these cores for one reason:
+
+  mtk-cpufreq: cpu8: no operating-points-v2, not managing it
+
+so governing this cluster is a matter of describing it. It wants clocks
+named "cpu" and "intermediate", a "proc" supply, and operating-points-v2.
+This change and dts/0060 supply the second of the three.
+--- a/drivers/soc/mediatek/mt6797-a72.c
++++ b/drivers/soc/mediatek/mt6797-a72.c
+@@ -57,6 +57,8 @@
+ #include <linux/module.h>
+ #include <linux/of.h>
+ #include <linux/sysfs.h>
++#include <linux/regulator/consumer.h>
++#include <linux/cpu.h>
+ #include <linux/kobject.h>
+ 
+ /* System Power Manager: the SoC-internal power switches. */
+@@ -97,7 +99,7 @@
+ #define DA9214_PAGE_CON		0x00
+ #define DA9214_BUCKB_CONT	0x5e
+ #define DA9214_VBUCKB_A		0xd9
+-#define VPROC2_MV		1180
++#define VPROC2_MV		1140
+ 
+ /*
+  * CSPM. The firmware takes this hardware semaphore around its own accesses to
+@@ -168,7 +170,7 @@
+  *
+  * Vsram goes to Android's upper-bin 1.20 V before any raise past 1 GHz.
+  */
+-#define A72_RUN_MHZ_DEFAULT	2002
++#define A72_RUN_MHZ_DEFAULT	1989
+ #define A72_VSRAM_X100MV	120000
+ 
+ /*
+@@ -185,79 +187,122 @@
+ static void __iomem *topckgen_base;
+ static bool a72_ready;
+ static bool vproc2_on;
++static struct regulator *vproc2_reg;
++static unsigned int a72_cur_mv = VPROC2_MV;
++static int a72_set_vproc2_mv(unsigned int mv);
++static int mt6797_a72_set_opp(unsigned int mhz);
+ 
+-static int da9214_write(struct i2c_adapter *ad, u8 reg, u8 val)
++/*
++ * VPROC2 (DA9214 BUCKB) is the A72 core rail, and it is reached through the
++ * REGULATOR FRAMEWORK, not by writing the DA9214 over i2c.
++ *
++ * It used to be the latter, and that cost the machine on 2026-08-27. The rail
++ * is declared in the DT and CONFIG_REGULATOR_DA9211=y, so mainline's da9211
++ * driver binds it at boot -- but nothing claimed it as a consumer, because
++ * this file brought it up behind the framework's back. The regulator core's
++ * unused-supply sweep therefore switched it off underneath a running cluster:
++ *
++ *   [ 18.153957] mt6797-a72: A72 cluster at 1989 MHz on 1140 mV
++ *   [ 31.712748] da9214_vproc2: disabling
++ *
++ * and the machine hung with no oops, because there was nothing left to oops
++ * with. That sweep is regulator_init_complete_work, queued with a THIRTY
++ * SECOND delay, so it catches regulators that bind late as well -- which is
++ * why the DTS comment claiming "=m ... after the disable-unused sweep has
++ * already run" was never true, and why CONFIG_REGULATOR_DA9211=y makes it
++ * moot anyway. Any A72 brought online inside that window died. It went
++ * unnoticed only because gemini-a72-online fires at ~240 s, well clear of it.
++ *
++ * Holding a real reference fixes this by construction: a regulator with a
++ * consumer is not unused. It also replaces hand-rolled i2c with
++ * regulator_set_voltage(), and a "proc" supply on the CPU node is exactly what
++ * mediatek-cpufreq looks for -- so this is the prerequisite for #55 as much as
++ * it is the fix for the hang.
++ *
++ * Acquired lazily on first bring-up rather than at init: the cluster is
++ * powered on demand, and by then i2c6 and da9211 have long since probed, so
++ * there is no -EPROBE_DEFER dance to lose.
++ */
++static int a72_vproc2_acquire(void)
+ {
+-	union i2c_smbus_data d = { .byte = val };
++	struct device *cpu_dev;
++	int ret;
+ 
+-	return i2c_smbus_xfer(ad, DA9214_ADDR, 0, I2C_SMBUS_WRITE, reg,
+-			      I2C_SMBUS_BYTE_DATA, &d);
+-}
++	if (vproc2_reg)
++		return 0;
+ 
+-static int da9214_read(struct i2c_adapter *ad, u8 reg)
+-{
+-	union i2c_smbus_data d;
+-	int r = i2c_smbus_xfer(ad, DA9214_ADDR, 0, I2C_SMBUS_READ, reg,
+-			       I2C_SMBUS_BYTE_DATA, &d);
++	cpu_dev = get_cpu_device(8);
++	if (!cpu_dev) {
++		pr_err("no cpu8 device; cannot claim VPROC2\n");
++		return -ENODEV;
++	}
+ 
+-	return r ? r : d.byte;
++	/* "proc" matches proc-supply on the cpu node -- the same name
++	 * mediatek-cpufreq uses for a cluster's core rail. */
++	/*
++	 * _optional, deliberately. Plain regulator_get() hands back a DUMMY
++	 * regulator when the supply is missing, and a dummy accepts
++	 * regulator_set_voltage() and regulator_enable() without doing
++	 * anything -- the rail would never come up and nothing would say so.
++	 * _optional returns -ENODEV instead, which is loud.
++	 */
++	vproc2_reg = regulator_get_optional(cpu_dev, "proc");
++	if (IS_ERR(vproc2_reg)) {
++		ret = PTR_ERR(vproc2_reg);
++		vproc2_reg = NULL;
++		pr_err("no \"proc\" supply for cpu8 (%d); is proc-supply set in the DT?\n",
++		       ret);
++		return ret;
++	}
++	return 0;
+ }
+ 
+-/*
+- * Bring up VPROC2, the A72 cluster's external supply, and verify it by reading
+- * the chip back. The regulator framework caches what it last asked for and will
+- * report that even when the part disagreed, so the readback matters.
+- */
+-static int mt6797_a72_enable_vproc2(void)
++static int a72_set_vproc2_mv(unsigned int mv)
+ {
+-	u8 code = (VPROC2_MV - 300) / 10;
+-	struct i2c_adapter *ad;
+-	struct device_node *np;
+-	int r, cont;
+-
+-	np = of_find_node_by_path(DA9214_I2C_ALIAS);
+-	if (!np) {
+-		pr_err("no \"%s\" alias in the device tree; cannot reach the DA9214\n",
+-		       DA9214_I2C_ALIAS);
+-		return -ENODEV;
++	int ret;
++
++	ret = a72_vproc2_acquire();
++	if (ret)
++		return ret;
++
++	ret = regulator_set_voltage(vproc2_reg, mv * 1000, mv * 1000);
++	if (ret) {
++		pr_err("VPROC2 set to %u mV failed (%d)\n", mv, ret);
++		return ret;
+ 	}
+ 
+ 	/*
+-	 * of_get_, not of_find_: the _get_ variant takes a reference on the
+-	 * adapter's module as well as on its device, which is the pairing
+-	 * i2c_put_adapter() below undoes. of_find_ takes only the device
+-	 * reference, so pairing it with i2c_put_adapter() underflows
+-	 * i2c-mt65xx's module refcount (silent today only because that driver
+-	 * is built in and its ->owner is NULL).
++	 * The rail must have arrived before the cores are asked to run faster
++	 * on it. FIXME: no DA9214 slew figure is cited anywhere in this tree,
++	 * so 2 ms is a conservative guess, not a datasheet number.
+ 	 */
+-	ad = of_get_i2c_adapter_by_node(np);
+-	of_node_put(np);
+-	if (!ad) {
+-		pr_err("i2c6 adapter not available; cannot enable VPROC2\n");
+-		return -ENODEV;
+-	}
++	usleep_range(2000, 2500);
++	a72_cur_mv = mv;
++	pr_debug("VPROC2 now %u mV\n", mv);
++	return 0;
++}
++
++static int mt6797_a72_enable_vproc2(void)
++{
++	int ret;
+ 
+-	r = da9214_write(ad, DA9214_PAGE_CON, 0);
+-	if (!r)
+-		r = da9214_write(ad, DA9214_VBUCKB_A, code | 0x80);
+-	if (!r)
+-		r = da9214_write(ad, DA9214_BUCKB_CONT, 0x1);
+-	if (r) {
+-		pr_err("DA9214 access failed (%d); cannot enable VPROC2\n", r);
+-		i2c_put_adapter(ad);
+-		return r;
+-	}
+-
+-	msleep(20);
+-	cont = da9214_read(ad, DA9214_BUCKB_CONT);
+-	i2c_put_adapter(ad);
+-
+-	if (cont < 0 || !(cont & 1)) {
+-		pr_err("VPROC2 did not come up (BUCKB_CONT=0x%02x)\n", cont);
+-		return -EIO;
++	ret = a72_set_vproc2_mv(VPROC2_MV);
++	if (ret)
++		return ret;
++
++	ret = regulator_enable(vproc2_reg);
++	if (ret) {
++		pr_err("VPROC2 did not enable (%d)\n", ret);
++		return ret;
+ 	}
+ 
+-	pr_info("VPROC2 enabled at %d mV\n", VPROC2_MV);
++	/*
++	 * Never disabled. The cluster is powered on demand and stays up for
++	 * the life of the boot; there is no offline path that would make
++	 * dropping the rail safe, and the reference is what keeps the core's
++	 * unused-supply sweep away from it.
++	 */
++	pr_info("VPROC2 enabled at %d mV via the regulator framework\n", VPROC2_MV);
+ 	return 0;
+ }
+ 
+@@ -448,6 +493,117 @@
+ 	return ret;
+ }
+ 
++/*
++ * The vendor's operating points for cluster B, transcribed in
++ * 04-docs/A72-OPP-TABLE-2026-08-24.md from ubports-3.18
++ * drivers/misc/mediatek/base/power/mt6797/mt_cpufreq.c. The vendor's
++ * frequencies are kHz and its voltages are in units of 10 uV despite a
++ * "10MV" comment in that file: 118000 x 10 uV = 1.18 V, the rail this driver
++ * already brought up. So kHz = vendor, mV = vendor / 100.
++ *
++ * WHICH BIN: the vendor picks one of six tables from two efuse fields
++ * (FUNC_CODE / DATE_CODE). We cannot read the efuse -- mainline mt6797 has no
++ * nvmem node and /sys/bus/nvmem/devices is empty -- so this is FY1221,
++ * CPU_LEVEL_0, the LOWEST-clocked of the six and therefore the one with the
++ * highest voltage for any given clock. On a faster-binned die that
++ * under-clocks; it can never over-volt. FIXME: read the efuse and pick the
++ * real bin once an mtk-efuse node exists.
++ *
++ * The table stops at 793 MHz. The vendor continues to 650 and 338, but
++ * mt6797_a72_retune() refuses anything below 750 MHz -- the firmware's
++ * power-on gate wants ~750 and that floor has never been tested from the
++ * other direction -- so a caller asking for 338 would only ever get -EINVAL.
++ */
++struct a72_opp {
++	unsigned int khz;
++	unsigned int mv;
++};
++
++static const struct a72_opp a72_opps[] = {
++	{ 2145000, 1180 },
++	{ 2093000, 1170 },
++	{ 2054000, 1160 },
++	{ 1989000, 1140 },
++	{ 1963000, 1130 },
++	{ 1872000, 1110 },
++	{ 1690000, 1070 },
++	{ 1599000, 1050 },
++	{ 1404000, 1000 },
++	{ 1287000,  980 },
++	{ 1170000,  950 },
++	{ 1053000,  930 },
++	{  936000,  900 },
++	{  793000,  880 },
++};
++
++/*
++ * Move the cluster to the highest operating point not exceeding `mhz`, rail
++ * and clock in the order that is safe for the direction of travel.
++ *
++ * ORDER MATTERS AND IS NOT SYMMETRIC. Going up, the rail must arrive before
++ * the clock, or the cores run faster than their voltage supports. Coming down,
++ * the clock must drop first, for the same reason in reverse. Backwards does
++ * not degrade gracefully: it hangs the cluster, and on this board a hung
++ * cluster is a watchdog reset.
++ *
++ * A request above the top of the table is honoured on the top voltage rather
++ * than refused, because that is what this driver did before and the 2496 MHz
++ * burst named at A72_RUN_MHZ_DEFAULT depends on it. That is unspecified
++ * territory: the vendor publishes no voltage above 2145 MHz. FIXME: no
++ * evidence-based voltage exists for those points, which is why none is
++ * invented here.
++ */
++static int mt6797_a72_set_opp(unsigned int mhz)
++{
++	unsigned int mv, old_mv = a72_cur_mv;
++	int i, sel = ARRAY_SIZE(a72_opps) - 1;
++	int ret;
++
++	for (i = 0; i < ARRAY_SIZE(a72_opps); i++) {
++		if (a72_opps[i].khz / 1000 <= mhz) {
++			sel = i;
++			break;
++		}
++	}
++	mv = a72_opps[sel].mv;
++
++	if (mhz > a72_opps[0].khz / 1000) {
++		pr_warn("%u MHz is above the vendor's top OPP (%u MHz); running it on the %u mV rail\n",
++			mhz, a72_opps[0].khz / 1000, a72_opps[0].mv);
++		mv = a72_opps[0].mv;
++	} else {
++		mhz = a72_opps[sel].khz / 1000;
++	}
++
++	if (mv > old_mv) {
++		ret = a72_set_vproc2_mv(mv);
++		if (ret)
++			return ret;
++		ret = mt6797_a72_retune(mhz);
++		if (ret) {
++			pr_err("retune to %u MHz failed (%d); backing the rail out to %u mV\n",
++			       mhz, ret, old_mv);
++			a72_set_vproc2_mv(old_mv);
++			return ret;
++		}
++	} else {
++		ret = mt6797_a72_retune(mhz);
++		if (ret) {
++			pr_err("retune to %u MHz failed (%d); leaving the rail at %u mV\n",
++			       mhz, ret, old_mv);
++			return ret;
++		}
++		if (mv < old_mv) {
++			ret = a72_set_vproc2_mv(mv);
++			if (ret)	/* clock is already low; a high rail is safe */
++				pr_warn("clock is %u MHz but the rail is still %u mV (%d)\n",
++					mhz, old_mv, ret);
++		}
++	}
++	pr_info("A72 cluster at %u MHz on %u mV\n", mhz, mv);
++	return 0;
++}
++
+ /* Runs ON the A72, at the tail of its own bring-up. */
+ static int mt6797_a72_online(unsigned int cpu)
+ {
+@@ -460,7 +616,7 @@
+ 
+ static void a72_raise_fn(struct work_struct *w)
+ {
+-	mt6797_a72_retune(A72_RUN_MHZ_DEFAULT);
++	mt6797_a72_set_opp(A72_RUN_MHZ_DEFAULT);
+ }
+ 
+ static ssize_t freq_mhz_show(struct kobject *k, struct kobj_attribute *a, char *b)
+@@ -476,7 +632,7 @@
+ 
+ 	if (kstrtouint(b, 0, &mhz))
+ 		return -EINVAL;
+-	ret = mt6797_a72_retune(mhz);
++	ret = mt6797_a72_set_opp(mhz);
+ 	return ret ? ret : n;
+ }
+ 
