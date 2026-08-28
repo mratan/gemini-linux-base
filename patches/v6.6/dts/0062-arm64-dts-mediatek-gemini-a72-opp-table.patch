@@ -1,0 +1,268 @@
+arm64: dts: mediatek: gemini: the A72 cluster's OPP table
+
+The last thing mediatek-cpufreq wants, and the one that decides what the
+cluster is allowed to do.
+
+Source: the vendor's own table for cluster B, transcribed in
+04-docs/A72-OPP-TABLE-2026-08-24.md from ubports-3.18 mt_cpufreq.c. Its
+frequencies are kHz and its voltages are steps of 10 uV despite the "10MV"
+comment in that file (118000 x 10 uV = 1.18 V, the rail the driver brings up),
+so opp-hz = vendor x 1000 and opp-microvolt = vendor x 10.
+
+WHICH BIN, and why the answer differs from the A53 tables three screens above.
+The vendor picks one of six from two efuse fields, which we cannot read --
+mainline mt6797 has no nvmem node. The A53 tables are the SB bin, chosen
+because Android on this phone reports LL topping out at 1547 MHz and all
+sixteen LL_SB entries match that capture, so this die is SB. This table is
+FY1221, the lowest-clocked of the six, which is a deliberate under-claim and
+safe in the only direction that matters: checked entry by entry, FY1221 asks
+for at least as much voltage as SB1221 at every frequency the two share
+(1963 MHz: 1130 vs 1110 mV; 1599: 1050 vs 1040; 1404, 1287, 1053, 936 and 793
+equal). It under-clocks a fast die; it cannot over-volt one.
+
+THREE NARROWINGS.
+
+The top is 1989 MHz, not the vendor's 2145. That is where the cluster already
+runs and where it was measured (build #99). Raising the ceiling is #59's
+decision, with its own risk, and must not ride along on a change about
+governing the cluster.
+
+The bottom is 793 MHz. The vendor continues to 650 and 338, but
+BIGIDVFSPLLSETFREQ has never been driven below ~750 MHz from the running side
+and the cluster's power-on gate wants ~750, so mcu_b_idvfs refuses anything
+lower. An OPP the clock will always refuse is worse than no OPP.
+
+And nothing below 880 mV appears, which is the floor mt6797-a72.c holds on
+VPROC2 for as long as the cluster is powered.
+
+MEASURED, all eleven points, build #100 (2026-08-28), userspace governor,
+requested -> reported -> VPROC2:
+
+    793 -> 793 -> 880 mV      1404 -> 1404 -> 1000 mV
+    936 -> 936 -> 900 mV      1599 -> 1599 -> 1050 mV
+   1053 -> 1053 -> 930 mV     1690 -> 1690 -> 1070 mV
+   1170 -> 1170 -> 950 mV     1872 -> 1872 -> 1110 mV
+   1287 -> 1287 -> 980 mV     1963 -> 1963 -> 1130 mV
+                              1989 -> 1989 -> 1140 mV
+
+Every point lands on its table voltage, up and down, and the cluster returns
+to MUXSEL[1:0]=1 afterwards.
+
+That also settles a worry this patch used to carry. mediatek-cpufreq derives an
+"intermediate voltage" from the OPP at or above the rate of the clock the
+cluster parks on -- armpll_div_pll1 at 1092 MHz, so the 1170 MHz entry and
+950 mV -- and it looked as though that would floor the four points below it.
+It does not: the floor applies DURING a transition, and the last step of
+mtk_cpufreq_set_target() scales back down whenever vproc is below inter_vproc.
+880 mV at the bottom, as the table asks.
+
+## The capacities, which this table is what breaks
+
+Adding OPP tables to cpu8/cpu9 completes the set: every possible CPU now has a
+cpufreq policy, so init_cpu_capacity_callback() finally sees cpus_to_visit
+empty and calls topology_normalize_cpu_scale(), which multiplies each
+capacity-dmips-mhz by that policy's cpuinfo_max_freq. It has never run with
+real frequencies on this machine before, because the A72s had no policy.
+
+Left alone, the dtsi's 608/617/1024 would have become 472/620/1024 -- the
+little cluster down-weighted by a quarter as a side effect of a change about
+governing the big one. So the same measurement is restated per MHz, here,
+where the OPP tables that trigger the renormalisation are:
+
+    raw = wanted / cpuinfo_max_freq_MHz
+    LL  608 / 1547 -> 782     L  617 / 2002 -> 613     B  1024 / 1989 -> 1024
+
+and 782x1547 : 613x2002 : 1024x1989 normalises back to 608 : 617 : 1024.
+Identical capacities, arrived at through the arithmetic the kernel is about to
+do anyway. It is done as a board-level override rather than in the dtsi
+because the premise -- that renormalisation runs at all -- is a property of
+this board's OPP tables and is false on mt6797-evb and mt6797-x20-dev.
+
+The caveat is in the DTS comment and is real: renormalisation waits for cpu8's
+policy, cpu8 is onlined at ~240 s, and until then the scheduler uses 782/613
+verbatim -- LL rated above L instead of just below it. Two Cortex-A53 clusters
+1.5% apart in truth, so the misplacement is between near-identical clusters
+rather than across the big/little boundary, and SD_ASYM_CPUCAPACITY is set
+either way. Shortening it means onlining the A72s earlier, not changing the
+numbers back.
+
+--- a/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
++++ b/arch/arm64/boot/dts/mediatek/mt6797-gemini-pda.dts
+@@ -2708,6 +2708,122 @@
+ 			opp-microvolt = <1000000>;
+ 		};
+ 	};
++
++	/*
++	 * cpu8-9, Cortex-A72 "B" — VPROC2, and the reason this table is not the
++	 * shape of the two above.
++	 *
++	 * Source: the vendor's own table for cluster B, transcribed in
++	 * 04-docs/A72-OPP-TABLE-2026-08-24.md from ubports-3.18
++	 * mt_cpufreq.c. The vendor's frequencies are kHz and its voltages are
++	 * in steps of 10 uV despite the "10MV" comment in that file
++	 * (118000 x 10 uV = 1.18 V, the rail the driver brings up), so
++	 * opp-hz = vendor x 1000 and opp-microvolt = vendor x 10.
++	 *
++	 * WHICH BIN. The vendor picks one of six tables from two efuse fields.
++	 * We cannot read the efuse — mainline mt6797 has no nvmem node and
++	 * /sys/bus/nvmem/devices is empty — so this is FY1221, CPU_LEVEL_0,
++	 * the lowest-clocked of the six. The A53 tables above are the SB bin,
++	 * because Android on this phone reports LL topping out at 1547 MHz and
++	 * all sixteen LL_SB entries match that capture; the same die is
++	 * therefore SB here too, and FY1221 is a deliberate under-claim. It is
++	 * safe in the only direction that matters: checked entry by entry,
++	 * FY1221 asks for at least as much voltage as SB1221 at every
++	 * frequency the two share (1963: 1130 vs 1110; 1599: 1050 vs 1040;
++	 * 1404, 1287, 1053, 936, 793: equal). It under-clocks a fast die; it
++	 * cannot over-volt one. FIXME: read the efuse and pick the real bin
++	 * once an mtk-efuse node exists.
++	 *
++	 * THREE NARROWINGS, all deliberate:
++	 *
++	 * 1. The top is 1989 MHz, not the vendor's 2145. This is where the
++	 *    cluster already runs and where it was measured (build #99,
++	 *    2026-08-27): 0.65% less clock than 2054 for 20 mV less rail.
++	 *    Raising the ceiling is issue #59's decision and has its own risk;
++	 *    it must not ride along on a change about governing the cluster.
++	 *    The three points above 1989 are simply not offered.
++	 *
++	 * 2. The bottom is 793 MHz. The vendor continues to 650 and 338, but
++	 *    the firmware's BIGIDVFSPLLSETFREQ has never been driven below
++	 *    ~750 MHz from the running side and its power-on gate wants ~750,
++	 *    so mcu_b_idvfs refuses anything lower. An OPP the clock will
++	 *    always refuse is worse than no OPP.
++	 *
++	 * 3. No voltage below 880 mV appears, which is simply the bottom of
++	 *    the retained range; mt6797-a72.c holds the rail at that floor for
++	 *    as long as the cluster is powered.
++	 *
++	 * ONE THING WORTH KNOWING, AND ONE THING IT TURNS OUT NOT TO COST.
++	 * mediatek-cpufreq derives an "intermediate voltage" from the OPP at or
++	 * above the rate of the clock the cluster parks on, and that clock is
++	 * armpll_div_pll1 at 1092 MHz, so the ceil is the 1170 MHz entry and
++	 * 950 mV. That is a floor DURING a transition — the rail is raised to
++	 * max(inter, target) before the mux moves — but not after: the last step
++	 * of mtk_cpufreq_set_target() scales back down whenever vproc is below
++	 * inter_vproc. Measured across all eleven points on build #100, the rail
++	 * settles on exactly the table voltage every time, 880 mV at the bottom
++	 * included. The four points below 1170 MHz save voltage as well as
++	 * clock.
++	 */
++	cpu_opp_b: opp-table-b {
++		compatible = "operating-points-v2";
++		opp-shared;
++
++		opp-1989000000 {
++			opp-hz = /bits/ 64 <1989000000>;
++			opp-microvolt = <1140000>;
++		};
++
++		opp-1963000000 {
++			opp-hz = /bits/ 64 <1963000000>;
++			opp-microvolt = <1130000>;
++		};
++
++		opp-1872000000 {
++			opp-hz = /bits/ 64 <1872000000>;
++			opp-microvolt = <1110000>;
++		};
++
++		opp-1690000000 {
++			opp-hz = /bits/ 64 <1690000000>;
++			opp-microvolt = <1070000>;
++		};
++
++		opp-1599000000 {
++			opp-hz = /bits/ 64 <1599000000>;
++			opp-microvolt = <1050000>;
++		};
++
++		opp-1404000000 {
++			opp-hz = /bits/ 64 <1404000000>;
++			opp-microvolt = <1000000>;
++		};
++
++		opp-1287000000 {
++			opp-hz = /bits/ 64 <1287000000>;
++			opp-microvolt = <980000>;
++		};
++
++		opp-1170000000 {
++			opp-hz = /bits/ 64 <1170000000>;
++			opp-microvolt = <950000>;
++		};
++
++		opp-1053000000 {
++			opp-hz = /bits/ 64 <1053000000>;
++			opp-microvolt = <930000>;
++		};
++
++		opp-936000000 {
++			opp-hz = /bits/ 64 <936000000>;
++			opp-microvolt = <900000>;
++		};
++
++		opp-793000000 {
++			opp-hz = /bits/ 64 <793000000>;
++			opp-microvolt = <880000>;
++		};
++	};
+ };
+ 
+ /*
+@@ -3046,9 +3162,54 @@
+  * it can manage a cluster -- see #55.
+  */
+ &cpu8 {
++	operating-points-v2 = <&cpu_opp_b>;
+ 	proc-supply = <&da9214_vproc2>;
+ };
+ 
+ &cpu9 {
++	operating-points-v2 = <&cpu_opp_b>;
+ 	proc-supply = <&da9214_vproc2>;
+ };
++
++/*
++ * capacity-dmips-mhz, restated per MHz because THIS board renormalises.
++ *
++ * mt6797.dtsi carries 608 : 617 : 1024, which is the measurement (single-thread
++ * gbench stint with the frequency pinned, 2026-08-28: A53-LL 676 Mops/s at
++ * 1222 MHz, A53-L 686 at 1209, A72 1135 at 1989) expressed as a ratio, and on a
++ * board with no OPP tables those numbers reach the scheduler unchanged.
++ *
++ * This board has OPP tables on all ten cores, so init_cpu_capacity_callback()
++ * eventually sees cpus_to_visit empty and calls topology_normalize_cpu_scale(),
++ * which multiplies each raw value by that policy's cpuinfo_max_freq. Left alone,
++ * 608/617/1024 would become 472/620/1024 — the little cluster quietly
++ * down-weighted by a quarter. So encode the measurement the way the property is
++ * actually defined:
++ *
++ *   raw = wanted_capacity / cpuinfo_max_freq_MHz, scaled to keep the A72 at 1024
++ *   LL  608 / 1547 -> 782      L  617 / 2002 -> 613      B  1024 / 1989 -> 1024
++ *
++ * and 782x1547 : 613x2002 : 1024x1989 normalises back to 608 : 617 : 1024.
++ *
++ * ONE HONEST CAVEAT. Renormalisation only happens once cpu8 has a policy, and
++ * cpu8 is onlined by gemini-a72-online at ~240 s. Until then — and for the whole
++ * boot if the A72s are never brought up — the scheduler uses these raw values
++ * verbatim, which rates the LL cluster 28% above the L cluster instead of 1.5%
++ * below it. Both are Cortex-A53 and the misplacement is between two nearly
++ * identical clusters rather than across the big/little boundary, and
++ * SD_ASYM_CPUCAPACITY is set either way because 1024 differs from both; but it
++ * is wrong, and the way to shorten it is to online the A72s earlier, not to
++ * change these numbers back.
++ *
++ * cpuinfo_max_freq is each table's top, NOT the ceiling gemini-cpufreq-cap holds
++ * the clusters at, so the target ratios describe the machine as it actually runs
++ * rather than one allowed to reach its tables.
++ */
++&cpu0 { capacity-dmips-mhz = <782>; };
++&cpu1 { capacity-dmips-mhz = <782>; };
++&cpu2 { capacity-dmips-mhz = <782>; };
++&cpu3 { capacity-dmips-mhz = <782>; };
++&cpu4 { capacity-dmips-mhz = <613>; };
++&cpu5 { capacity-dmips-mhz = <613>; };
++&cpu6 { capacity-dmips-mhz = <613>; };
++&cpu7 { capacity-dmips-mhz = <613>; };

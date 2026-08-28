@@ -1,0 +1,683 @@
+soc: mediatek: mt6797-a72: hand the cluster's frequency to cpufreq
+
+This driver has owned the A72 clock since the cluster first came up, because
+nothing else could. clk/0003 gives the clock a real provider and dts/0061-0062
+describe the cluster to mediatek-cpufreq, so it does not have to any more --
+and must not, because two writers on one clock and one rail is how this
+cluster gets hung.
+
+WHAT MOVES. mt6797_a72_retune() keeps its name and its sequence -- park on the
+mainpll backup, ask the firmware to move the PLL, come back -- but every step
+is now issued through the clock framework instead of by hand. The
+BIGIDVFSPLLSETFREQ call, the CSPM semaphore around it and the Vsram raise that
+has to precede any clock above 1 GHz all live in clk-mt6797-mcumixed.c now,
+which is where the mux register is and where the A53 clusters' half of it is
+already written under a lock. What is left here is bring-up: power, the
+prerequisites, PSCI, and the rail.
+
+WHAT STANDS ASIDE. a72_cpufreq_managed is read from the same property
+mediatek-cpufreq reads -- operating-points-v2 on the cpu8 node -- so the two
+can never disagree about who is in charge. When it is set, the
+raise-to-default work does not raise anything and the freq_mhz sysfs knob is
+read-only, pointing at policy8. The knob's old "requests above the table run
+on the top voltage" behaviour goes with it; the ceiling is now the OPP table's
+and raising it is issue #59's decision, not a sysfs write's.
+
+THE RAIL, AND WHY THE SHAPE OF A REGULATOR REQUEST MATTERS. The regulator core
+aggregates consumers by INTERSECTION -- highest min_uV, lowest max_uV, -EINVAL
+if what is left is empty -- so a consumer pinning [1140000, 1140000] does not
+"ask for 1140 mV", it forbids everyone else from asking for anything else.
+mediatek-cpufreq asks for [vproc, proc_max_volt], open at the top, which is
+what makes a floor from this driver compose with it.
+
+So: bring up at the proven 1140 mV as a range open at the top, and once CPU_ON
+has succeeded drop the floor to 880 mV -- the bottom of this cluster's own OPP
+table -- and leave it there. cpufreq can then reach every point in its table,
+and the rail still cannot go below the lowest voltage the vendor specifies for
+these cores, whatever a governor decides. Both orderings are safe if cpufreq's
+policy appears before the work runs: the aggregate is max(880000, whatever
+cpufreq asked for), and cpufreq raises voltage before it raises the clock.
+
+Also recorded here, because chasing it is what turned up issue #84: step 5 of
+the bring-up programs ARMCAXPLL2, and ARMCAXPLL2 is the CCI's PLL, not this
+cluster's. The vendor maps LL/L/B/CCI to ARMCAXPLL0/1/NULL/2, and it is
+measurable -- with the A72s at 1989 MHz, ARMCAXPLL2_CON1 still decodes to
+750 MHz. Unchanged here; only written down.
+
+THREE THINGS THE FRAMEWORK DOES NOT DO FOR US, ADDED AFTER REVIEW.
+
+The intermediate clock is now clk_prepare_enable()d and held. armpll_div_pll1
+is a real gate (CLK_MISC_CFG_0 bit 4) and the open-coded retune used to set it
+by hand before parking. Driving the mux through the framework means the
+framework has to be told the gate is needed, by a consumer that is going to
+park on it -- relying on an A53 policy happening to hold it is not a reference,
+and it is exactly absent on the path this file still drives itself.
+
+a72_clks_acquire() publishes a72_cpu_clk last, under a mutex, because
+a72_cpu_clk is the flag as well as the handle and a72_cur_mhz() reads it from
+sysfs with nothing else held. Seeing it set while a72_inter_clk was still NULL
+would put clk_set_parent(cpu_clk, NULL) into the next retune, and the clock
+core turns a NULL parent into index 0 -- which on this mux is the 26 MHz
+oscillator, under two running A72s.
+
+mt6797_a72_prepare() now reads the cluster clock's rate while the cluster is
+still down, which is what makes the clock driver forget a rate cached from
+before a power cycle. The firmware re-parks the PLL at 750 MHz on every
+power-up; without this, clk_set_rate() back to the old value short-circuits on
+the cache and does nothing, leaving the cores at 750 MHz while cpufreq, the
+scheduler capacity and freq_mhz all report the old figure on the voltage that
+figure implies.
+
+AND ONE THING THAT IS NOW WEAKER, DELIBERATELY. The CSPM semaphore covers the
+firmware call but no longer spans the mux park and unpark either side of it,
+because those are two separate clock-framework operations now. The exposure
+that buys is a CPU_ON racing a governor transition: the firmware moves
+MUXSEL[1:0] as part of powering the cluster, and doing that mid-PLL-change is
+the hang the park exists to prevent. It does not arise on this board's
+sequence -- the firmware only touches the cluster clock when it raises the
+CLUSTER, i.e. for the first core, and there is no policy to transition until
+that core is online; the second core's CPU_ON goes straight to the core, as
+mt6797_a72_prepare() already documents. Written down because it is a real
+narrowing of a guarantee, not because it is reachable here.
+
+--- a/drivers/soc/mediatek/mt6797-a72.c
++++ b/drivers/soc/mediatek/mt6797-a72.c
+@@ -20,20 +20,31 @@
+  *
+  *   1. MP2_CPUSYS_PWR_CON |= PWR_RST_B, and a dummy read of the iDVFS block.
+  *      Both are the vendor's, in that order.
+- *   2. Enable VPROC2 (DA9214 BUCKB) at 1180 mV. This is the A72 cluster's
+- *      supply; without it the cluster cannot be powered at all. Done once at
+- *      probe rather than per-hotplug so the rail has already settled.
++ *   2. Enable VPROC2 (DA9214 BUCKB), through the regulator framework, at the
++ *      bring-up voltage. This is the A72 cluster's supply; without it the
++ *      cluster cannot be powered at all. Done once, on the first hotplug, so
++ *      the rail has already settled by the time PSCI is asked for a core.
++ *      Once the cluster is up the rail is handed to cpufreq and only a floor
++ *      is retained — see a72_raise_fn().
+  *   3. Hold the PMIC wrapper's SPI controller in reset across the external-buck
+  *      isolation change (WDT_SWSYSRST bit 11, key 0x88), then release it. The
+  *      vendor brackets the isolation change this way; it is an interlock, not a
+  *      cluster reset — WDT_SWSYSRST has no big-cluster reset bit.
+  *   4. Clear CPU_EXT_BUCK_ISO, then set the big cluster's SRAM LDO to 1.10 V
+  *      through the firmware's own SIP call.
+- *   5. Program ARMCAXPLL2 to 750 MHz. The firmware measures the cluster clock
+- *      with its own frequency meter and spins forever unless it reads
++ *   5. Program ARMCAXPLL2 to 750 MHz. The firmware measures a clock with its
++ *      own frequency meter and spins forever unless it reads
+  *      742500..757500 kHz. This is a real clock change, not a trick: the meter
+  *      reads 749988 kHz afterwards.
+  *
++ *      ARMCAXPLL2 IS NOT THIS CLUSTER'S PLL. It is the CCI's -- the vendor
++ *      maps LL to ARMCAXPLL0, L to ARMCAXPLL1, B to NULL and CCI to
++ *      ARMCAXPLL2 (mt_cpufreq.c), and it is measurable here: with the A72s
++ *      running at 1989 MHz, ARMCAXPLL2_CON1 still decodes to 750 MHz. So this
++ *      step raises the interconnect from the 630 MHz the bootloader chose to
++ *      750 MHz and leaves it there, on a rail whose floor was chosen assuming
++ *      630. That is issue #84, and it is not fixed here.
++ *
+  * Deliberately NOT done: powering the MP2 CPUTOP ourselves. Doing so makes the
+  * firmware's own PWR_ON a no-op, so the cluster's power controller never runs
+  * its power-up *transition* — and the interconnect handshake that withdraws
+@@ -48,7 +59,9 @@
+ #define pr_fmt(fmt) "mt6797-a72: " fmt
+ 
+ #include <linux/arm-smccc.h>
++#include <linux/clk.h>
+ #include <linux/cpu.h>
++#include <linux/cpufreq.h>
+ #include <linux/cpuhotplug.h>
+ #include <linux/delay.h>
+ #include <linux/i2c.h>
+@@ -102,6 +115,17 @@
+ #define VPROC2_MV		1140
+ 
+ /*
++ * The band VPROC2 is allowed in while the cluster is powered, in uV: the
++ * bottom and top of this cluster's own OPP table (793 MHz / 880 mV and
++ * 2145 MHz / 1180 mV). Held as a floor once cpufreq owns the rail, so that no
++ * governor decision can take the cores below the lowest voltage the vendor
++ * specifies for them, and so that this driver never restricts the range
++ * cpufreq needs above it.
++ */
++#define A72_VPROC2_MIN_UV	880000
++#define A72_VPROC2_MAX_UV	1180000
++
++/*
+  * CSPM. The firmware takes this hardware semaphore around its own accesses to
+  * the cluster clock dividers, and polls for it WITHOUT A BOUND. If anything
+  * left it held, PSCI CPU_ON never returns and the calling CPU is stuck at EL3
+@@ -143,12 +167,15 @@
+  */
+ #define ABIST_SRC_ARMCAXPLL2	36
+ 
+-/* Firmware SIP calls into the iDVFS block. */
++/*
++ * Firmware SIP calls into the iDVFS block.
++ *
++ * Only the SRAM LDO one is here now. BIGIDVFSPLLSETFREQ, and the
++ * ARMPLLDIV_MUXSEL park that has to bracket it, moved to
++ * clk-mt6797-mcumixed.c, which is where the mux register lives and where the
++ * A53 clusters' half of it is already written under a lock.
++ */
+ #define SIP_IDVFS_SRAMLDOSET	0xC20003BFU
+-#define SIP_IDVFS_PLLSETFREQ	0xC20003B8U
+-
+-/* TOPCKGEN's backup-mux exposure bits, used while the big PLL is retuned. */
+-#define ARMPLLDIV_MUXSEL	0x270
+ #define SIP_MCUSYS_READ		0xC200035FU
+ #define SPMC_CPUTOP		0x102222a0
+ 
+@@ -171,7 +198,6 @@
+  * Vsram goes to Android's upper-bin 1.20 V before any raise past 1 GHz.
+  */
+ #define A72_RUN_MHZ_DEFAULT	1989
+-#define A72_VSRAM_X100MV	120000
+ 
+ /*
+  * Scheduler capacities, from the gbench scorecards (04-docs/bench/): serial
+@@ -189,8 +215,12 @@
+ static bool vproc2_on;
+ static struct regulator *vproc2_reg;
+ static unsigned int a72_cur_mv = VPROC2_MV;
++static bool a72_cpufreq_managed;
+ static int a72_set_vproc2_mv(unsigned int mv);
++static int a72_hold_vproc2_range(unsigned int min_uV, unsigned int max_uV);
+ static int mt6797_a72_set_opp(unsigned int mhz);
++static int a72_clks_acquire(void);
++static unsigned int a72_cur_mhz(void);
+ 
+ /*
+  * VPROC2 (DA9214 BUCKB) is the A72 core rail, and it is reached through the
+@@ -257,6 +287,40 @@
+ 	return 0;
+ }
+ 
++/*
++ * Ask for a RANGE on VPROC2, not a point.
++ *
++ * The regulator core aggregates consumers by INTERSECTION, not by maximum: it
++ * takes the highest min_uV and the lowest max_uV across everyone holding the
++ * rail, and returns -EINVAL if what is left is empty. So the shape of this
++ * request decides whether another consumer can coexist. mediatek-cpufreq asks
++ * for [vproc, proc_max_volt] -- open at the top -- which is why a floor from
++ * this driver composes with it and a pinned point would not.
++ */
++static int a72_hold_vproc2_range(unsigned int min_uV, unsigned int max_uV)
++{
++	int ret;
++
++	ret = a72_vproc2_acquire();
++	if (ret)
++		return ret;
++
++	ret = regulator_set_voltage(vproc2_reg, min_uV, max_uV);
++	if (ret) {
++		pr_err("VPROC2 range [%u, %u] uV refused (%d)\n",
++		       min_uV, max_uV, ret);
++		return ret;
++	}
++
++	/*
++	 * The rail must have arrived before the cores are asked to run faster
++	 * on it. FIXME: no DA9214 slew figure is cited anywhere in this tree,
++	 * so 2 ms is a conservative guess, not a datasheet number.
++	 */
++	usleep_range(2000, 2500);
++	return 0;
++}
++
+ static int a72_set_vproc2_mv(unsigned int mv)
+ {
+ 	int ret;
+@@ -286,7 +350,17 @@
+ {
+ 	int ret;
+ 
+-	ret = a72_set_vproc2_mv(VPROC2_MV);
++	/*
++	 * Bring up at the proven voltage, but as a range open at the top rather
++	 * than a pin, so that a cpufreq policy created before the raise work
++	 * gets a chance to run can still raise the rail above it. The floor is
++	 * dropped to the cluster's lowest operating point once CPU_ON has
++	 * succeeded -- see a72_raise_fn().
++	 */
++	if (a72_cpufreq_managed)
++		ret = a72_hold_vproc2_range(VPROC2_MV * 1000, A72_VPROC2_MAX_UV);
++	else
++		ret = a72_set_vproc2_mv(VPROC2_MV);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -412,29 +486,143 @@
+ static DECLARE_WORK(a72_raise_work, a72_raise_fn);
+ 
+ static DEFINE_MUTEX(a72_freq_lock);
+-static unsigned int a72_cur_mhz = A72_CLK_KHZ / 1000;
+-static bool a72_vsram_high;
+ 
+ /*
+- * Retune the running cluster's PLL the vendor's way. The MCUMIXED CON1/shadow
+- * interface goes dead once the cluster is up (writes stick in the register,
+- * the PLL ignores them — measured, the abist meter disagreed with the
+- * readback), so this uses the firmware's BIGIDVFSPLLSETFREQ call, whose EL3
+- * implementation disables the PLL mid-change. The cluster must therefore sit
+- * on the backup mux while it happens — the same MAINPLL-backup dance the
+- * vendor's adjust_armpll_dds() does, under the CSPM hardware semaphore that
+- * ATF itself takes around ARMPLLDIV.
++ * The cluster's clocks, from the cpu8 node: "cpu" is the mux at
++ * ARMPLLDIV_MUXSEL[1:0], "intermediate" is the mainpll feed it parks on.
++ * Both are resolved lazily, because clk-mt6797-mcumixed is a platform driver
++ * and this file is a late_initcall with no device of its own to defer.
++ */
++static struct clk *a72_cpu_clk, *a72_inter_clk;
++
++/*
++ * Resolve the cluster's clocks. Returns 0 once they are in hand.
++ *
++ * -EPROBE_DEFER here means the mcumixed provider has not registered yet, which
++ * on this board it always has by the time anyone asks: the clock driver is a
++ * builtin platform driver and the first caller is a CPU hotplug callback.
++ */
++static DEFINE_MUTEX(a72_clk_lock);
++
++static int a72_clks_acquire(void)
++{
++	struct clk *cpu_clk, *inter_clk;
++	struct device *cpu_dev;
++	int ret;
++
++	/*
++	 * a72_cpu_clk is the flag as well as the handle, and it is published
++	 * LAST and under a mutex. Both matter: a72_cur_mhz() runs from a sysfs
++	 * read with no other lock held, and if it could see a72_cpu_clk set
++	 * while a72_inter_clk was still NULL, the very next retune would call
++	 * clk_set_parent(a72_cpu_clk, NULL) -- which the clock core turns into
++	 * parent index 0, and index 0 on this mux is the 26 MHz oscillator.
++	 * Parking two running A72s on 26 MHz is not a failure mode worth
++	 * leaving open for a race window.
++	 */
++	if (READ_ONCE(a72_cpu_clk))
++		return 0;
++
++	mutex_lock(&a72_clk_lock);
++	if (a72_cpu_clk) {
++		ret = 0;
++		goto out;
++	}
++
++	cpu_dev = get_cpu_device(8);
++	if (!cpu_dev) {
++		ret = -ENODEV;
++		goto out;
++	}
++
++	cpu_clk = clk_get(cpu_dev, "cpu");
++	if (IS_ERR(cpu_clk)) {
++		ret = PTR_ERR(cpu_clk);
++		pr_err("no \"cpu\" clock for cpu8 (%d); is clocks/clock-names set in the DT?\n",
++		       ret);
++		goto out;
++	}
++
++	inter_clk = clk_get(cpu_dev, "intermediate");
++	if (IS_ERR(inter_clk)) {
++		ret = PTR_ERR(inter_clk);
++		pr_err("no \"intermediate\" clock for cpu8 (%d)\n", ret);
++		clk_put(cpu_clk);
++		goto out;
++	}
++
++	/*
++	 * Enable the intermediate, and hold it enabled.
++	 *
++	 * This is not bookkeeping. armpll_div_pll1 is a real gate --
++	 * CLK_MISC_CFG_0 bit 4 in topckgen -- and clk-mt6797.c records that it
++	 * "reads back 0 out of the bootloader, so a clk_set_parent onto mainpll
++	 * without enabling the gate first takes the clock away from a running
++	 * cluster". The old open-coded retune set that bit by hand before it
++	 * parked; driving the mux through the framework means the framework has
++	 * to be told the gate is needed, by a consumer that is going to park on
++	 * it. Relying on an A53 cpufreq policy happening to hold it is not a
++	 * reference, and it is exactly absent on the path this file still
++	 * drives itself: a DTB without the A72 OPP table, or a kernel without
++	 * CONFIG_ARM_MEDIATEK_CPUFREQ.
++	 */
++	ret = clk_prepare_enable(inter_clk);
++	if (ret) {
++		pr_err("cannot enable the backup mux feed (%d); refusing to park on a gated clock\n",
++		       ret);
++		clk_put(inter_clk);
++		clk_put(cpu_clk);
++		goto out;
++	}
++
++	a72_inter_clk = inter_clk;
++	smp_wmb();		/* pairs with READ_ONCE(a72_cpu_clk) above */
++	WRITE_ONCE(a72_cpu_clk, cpu_clk);
++	ret = 0;
++out:
++	mutex_unlock(&a72_clk_lock);
++	return ret;
++}
++
++/*
++ * Retune the running cluster, through the clock framework.
++ *
++ * The sequence is the vendor's and has not changed: park the cluster on the
++ * mainpll backup, ask the firmware's BIGIDVFSPLLSETFREQ to move the PLL (its
++ * EL3 implementation disables the PLL mid-change, which is why the park is not
++ * optional), then come back. What HAS changed is who issues each step. The
++ * park is now clk_set_parent() on a mux this driver shares with the two A53
++ * clusters, and the firmware call is clk_set_rate() on the clock that owns it
++ * -- see clk-mt6797-mcumixed.c. Before this, both were open-coded here:
++ *
++ *   * ARMPLLDIV_MUXSEL was read-modify-written with no lock, while
++ *     mediatek-cpufreq wrote the A53 fields of the same register under the
++ *     mcumixed spinlock; and
++ *   * the armpll_div_pll1/pll2 gates were enabled and then DISABLED by hand,
++ *     behind the back of the A53 policies that hold them enabled, leaving
++ *     armpll_div_pll1 at enable_count 2 with its hardware bit clear.
++ *
++ * This is also what makes the cluster describable to mediatek-cpufreq at all,
++ * which is the whole of #55: that driver drives exactly this sequence itself,
++ * so once the clocks exist it needs nothing from this file.
++ *
++ * Callers must not hold cpu_hotplug_lock for write. cpus_read_lock() is taken
++ * here rather than inside the clock op, so that the ordering is always
++ * cpu_hotplug_lock -> clk prepare_lock and never the reverse.
+  */
+ static int mt6797_a72_retune(unsigned int mhz)
+ {
+-	struct arm_smccc_res res;
+-	u32 mux, misc;
+-	bool sema = false;
+-	int i, ret = 0;
++	unsigned long armpll_hz = (unsigned long)mhz * 1000000;
++	struct clk *armpll;
++	int ret;
+ 
+ 	if (mhz < 750 || mhz > 2600)
+ 		return -EINVAL;
+ 
++	ret = a72_clks_acquire();
++	if (ret)
++		return ret;
++
+ 	mutex_lock(&a72_freq_lock);
+ 	cpus_read_lock();
+ 	if (!cpu_online(8) && !cpu_online(9)) {
+@@ -442,57 +630,65 @@
+ 		goto out;
+ 	}
+ 
+-	if (mhz > 1001 && !a72_vsram_high) {
+-		arm_smccc_smc(SIP_IDVFS_SRAMLDOSET, A72_VSRAM_X100MV,
+-			      0, 0, 0, 0, 0, 0, &res);
+-		udelay(240);
+-		a72_vsram_high = true;
++	armpll = clk_get_parent(a72_cpu_clk);
++	if (IS_ERR_OR_NULL(armpll)) {
++		pr_err("the cluster mux has no parent; cannot retune\n");
++		ret = -ENODEV;
++		goto out;
+ 	}
+ 
+-	writel(CSPM_KEY, cspm_base + CSPM_POWERON_CONFIG);
+-	for (i = 0; i < 200; i++) {
+-		writel(1, cspm_base + CSPM_SEMA);
+-		if (readl(cspm_base + CSPM_SEMA) & 1) {
+-			sema = true;
+-			break;
+-		}
+-		udelay(10);
+-	}
+-	if (!sema) {
+-		pr_err("CSPM semaphore not granted; leaving the clock alone\n");
+-		ret = -EBUSY;
++	/*
++	 * If the mux is already sitting on the backup, an earlier attempt died
++	 * between the park and the unpark and "the PLL to retune" is the mainpll
++	 * feed. Retuning that would be reaching for the clock the whole die runs
++	 * on. Refuse and say so, rather than park-on-self and quietly do nothing.
++	 *
++	 * clk_is_match(), not ==: clk_get_parent() hands back the provider's own
++	 * struct clk and a72_inter_clk is this consumer's, so the two are
++	 * different pointers to the same clock.
++	 */
++	if (clk_is_match(armpll, a72_inter_clk)) {
++		pr_err("the cluster is parked on the backup mux; not retuning from there\n");
++		ret = -EIO;
+ 		goto out;
+ 	}
+ 
+-	misc = readl(topckgen_base + CLK_MISC_CFG_0);
+-	mux = readl(mcumixed_base + ARMPLLDIV_MUXSEL);
+-
+-	writel(misc | (3u << 4), topckgen_base + CLK_MISC_CFG_0);
+-	writel((mux & ~3u) | 2u, mcumixed_base + ARMPLLDIV_MUXSEL);
+-	udelay(2);
+-
+-	arm_smccc_smc(SIP_IDVFS_PLLSETFREQ, mhz, 0, 0, 0, 0, 0, 0, &res);
+-
+-	writel((readl(mcumixed_base + ARMPLLDIV_MUXSEL) & ~3u) | 1u,
+-	       mcumixed_base + ARMPLLDIV_MUXSEL);
+-	writel(readl(topckgen_base + CLK_MISC_CFG_0) & ~(3u << 4),
+-	       topckgen_base + CLK_MISC_CFG_0);
++	ret = clk_set_parent(a72_cpu_clk, a72_inter_clk);
++	if (ret) {
++		pr_err("cannot park the cluster on the backup mux (%d)\n", ret);
++		goto out;
++	}
+ 
+-	writel(1, cspm_base + CSPM_SEMA);
++	ret = clk_set_rate(armpll, armpll_hz);
++	if (ret) {
++		pr_err("retune to %u MHz failed (%d)\n", mhz, ret);
++		clk_set_parent(a72_cpu_clk, armpll);
++		goto out;
++	}
+ 
+-	if (res.a0) {
+-		pr_err("BIGIDVFSPLLSETFREQ(%u) failed (%ld)\n", mhz, (long)res.a0);
+-		ret = -EIO;
+-	} else {
+-		a72_cur_mhz = mhz;
+-		pr_info("A72 cluster now %u MHz\n", mhz);
++	ret = clk_set_parent(a72_cpu_clk, armpll);
++	if (ret) {
++		pr_err("cannot bring the cluster back off the backup mux (%d)\n",
++		       ret);
++		goto out;
+ 	}
++
++	pr_info("A72 cluster now %u MHz\n", mhz);
+ out:
+ 	cpus_read_unlock();
+ 	mutex_unlock(&a72_freq_lock);
+ 	return ret;
+ }
+ 
++/* What the cluster is actually running at, asked of the clock that owns it. */
++static unsigned int a72_cur_mhz(void)
++{
++	if (a72_clks_acquire())
++		return A72_CLK_KHZ / 1000;
++
++	return clk_get_rate(a72_cpu_clk) / 1000000;
++}
++
+ /*
+  * The vendor's operating points for cluster B, transcribed in
+  * 04-docs/A72-OPP-TABLE-2026-08-24.md from ubports-3.18
+@@ -609,19 +805,53 @@
+ {
+ 	if (MPIDR_AFFINITY_LEVEL(cpu_logical_map(cpu), 1) != MPIDR_CLUSTER_A72)
+ 		return 0;
+-	if (a72_cur_mhz < A72_RUN_MHZ_DEFAULT)
+-		schedule_work(&a72_raise_work);
++
++	/*
++	 * The clock framework's view of the cluster mux needs no correction
++	 * here: clk-mt6797-mcumixed reports selector 0 ("cluster off") as the
++	 * cluster's own PLL, which is where the firmware puts it during CPU_ON.
++	 * See mt6797_b_mux_get_parent() for why that has to be solved there and
++	 * cannot be solved from this side.
++	 */
++	schedule_work(&a72_raise_work);
+ 	return 0;
+ }
+ 
+ static void a72_raise_fn(struct work_struct *w)
+ {
+-	mt6797_a72_set_opp(A72_RUN_MHZ_DEFAULT);
++	if (a72_cpufreq_managed) {
++		/*
++		 * Hand the rail over. Until now VPROC2 has been pinned at the
++		 * bring-up voltage, which is right for CPU_ON and wrong for
++		 * DVFS: mediatek-cpufreq asks for [vproc, proc_max_volt] and
++		 * the regulator core INTERSECTS consumer requests, so a
++		 * consumer still holding a 1140 mV floor would keep the rail
++		 * there for ever and every OPP below it would be a no-op.
++		 *
++		 * What is left behind is the useful half of the constraint:
++		 * the rail may not go below this cluster's lowest operating
++		 * point for as long as the cluster is powered, whatever
++		 * cpufreq asks for.
++		 */
++		int ret = a72_hold_vproc2_range(A72_VPROC2_MIN_UV,
++						A72_VPROC2_MAX_UV);
++
++		if (ret)
++			pr_err("cannot release the rail to cpufreq (%d); the cluster will not scale down\n",
++			       ret);
++		else
++			pr_info("VPROC2 handed to cpufreq, floored at %u uV\n",
++				A72_VPROC2_MIN_UV);
++		return;
++	}
++
++	if (a72_cur_mhz() < A72_RUN_MHZ_DEFAULT)
++		mt6797_a72_set_opp(A72_RUN_MHZ_DEFAULT);
+ }
+ 
+ static ssize_t freq_mhz_show(struct kobject *k, struct kobj_attribute *a, char *b)
+ {
+-	return sysfs_emit(b, "%u\n", a72_cur_mhz);
++	return sysfs_emit(b, "%u\n", a72_cur_mhz());
+ }
+ 
+ static ssize_t freq_mhz_store(struct kobject *k, struct kobj_attribute *a,
+@@ -630,6 +860,32 @@
+ 	unsigned int mhz;
+ 	int ret;
+ 
++	/*
++	 * Read-only once cpufreq owns the cluster. Writing here would move the
++	 * clock behind the governor's back and, worse, pin VPROC2 at a voltage
++	 * cpufreq's next request would then fail to intersect. The knob that
++	 * works is policy8's, and the ceiling is the OPP table's -- raising it
++	 * is #59's decision, not a sysfs write's.
++	 */
++	/*
++	 * Refuse only while a policy ACTUALLY exists, not merely because the DT
++	 * says one should. If mediatek-cpufreq never binds -- it is not built,
++	 * or its probe failed, which now takes cpu8 with it -- then standing
++	 * down has already left the cluster at the firmware's 750 MHz, and a
++	 * knob that refuses on the strength of a device-tree property would be
++	 * the only way back saying no. Ask the thing itself.
++	 */
++	if (a72_cpufreq_managed) {
++		struct cpufreq_policy *policy = cpufreq_cpu_get(8);
++
++		if (policy) {
++			cpufreq_cpu_put(policy);
++			pr_warn_once("freq_mhz is read-only: cpufreq owns this cluster (see policy8)\n");
++			return -EBUSY;
++		}
++		pr_warn_once("cpu8 has operating-points-v2 but no cpufreq policy; this knob is live after all\n");
++	}
++
+ 	if (kstrtouint(b, 0, &mhz))
+ 		return -EINVAL;
+ 	ret = mt6797_a72_set_opp(mhz);
+@@ -681,7 +937,28 @@
+ 	}
+ 
+ 	khz = mt6797_a72_apply_prereqs();
+-	a72_cur_mhz = A72_CLK_KHZ / 1000;	/* the prereqs park the PLL at 750 */
++
++	/*
++	 * Forget any cached frequency, while the cluster is still down and the
++	 * clock driver can still see that it is.
++	 *
++	 * The firmware parks the PLL at 750 MHz on every power-up, but nothing
++	 * tells the clock framework, so after an offline/online cycle its cached
++	 * rate is whatever the cluster was last set to. clk_set_rate() back to
++	 * that value would then short-circuit on the cache and do nothing at
++	 * all, leaving the cores at 750 MHz while cpufreq and the sysfs knob both
++	 * report the old figure -- and the rail at the voltage that figure
++	 * implies. mcu_b_idvfs is CLK_GET_RATE_NOCACHE and its ->recalc_rate
++	 * checks MUXSEL for "cluster unpowered", so this one read is what makes
++	 * the correction happen. It has to be here, before CPU_ON: a moment
++	 * later the selector no longer says the cluster is down.
++	 */
++	if (!a72_clks_acquire()) {
++		struct clk *armpll = clk_get_parent(a72_cpu_clk);
++
++		if (!IS_ERR_OR_NULL(armpll))
++			clk_get_rate(armpll);
++	}
+ 
+ 	/*
+ 	 * The cluster power controller's state before anything asks it to run —
+@@ -712,6 +989,29 @@
+ 	return 0;
+ }
+ 
++/*
++ * Does mediatek-cpufreq own this cluster's frequency?
++ *
++ * Answered with the same question that driver asks, so the two can never
++ * disagree: a CPU node with operating-points-v2 is one it manages, a node
++ * without is one it prints "cpu8: no operating-points-v2, not managing it"
++ * about and walks past. When the answer is yes, this file stands aside — the
++ * raise-to-default work does not run and the sysfs knob is read-only —
++ * because two writers on one clock and one rail is how this cluster gets hung.
++ */
++static bool __init a72_cpufreq_will_manage(void)
++{
++	struct device_node *np = of_get_cpu_node(8, NULL);
++	bool managed;
++
++	if (!np)
++		return false;
++
++	managed = of_property_present(np, "operating-points-v2");
++	of_node_put(np);
++	return managed;
++}
++
+ static int __init mt6797_a72_init(void)
+ {
+ 	int ret;
+@@ -719,6 +1019,8 @@
+ 	if (!of_machine_is_compatible("mediatek,mt6797"))
+ 		return 0;
+ 
++	a72_cpufreq_managed = a72_cpufreq_will_manage();
++
+ 	spm_base = ioremap(SPM_PHYS, SPM_SIZE);
+ 	mcumixed_base = ioremap(MCUMIXED_PHYS, MCUMIXED_SIZE);
+ 	rgu_base = ioremap(RGU_PHYS, RGU_SIZE);
+@@ -767,7 +1069,9 @@
+ 		pr_warn("no sysfs knob; the cluster is fixed at its default clock\n");
+ 
+ 	a72_ready = true;
+-	pr_info("registered; cpu8/cpu9 can be onlined (the rail comes up on demand)\n");
++	pr_info("registered; cpu8/cpu9 can be onlined (the rail comes up on demand); frequency %s\n",
++		a72_cpufreq_managed ? "belongs to cpufreq" :
++				      "is this driver's, fixed at its default");
+ 	return 0;
+ 
+ err:

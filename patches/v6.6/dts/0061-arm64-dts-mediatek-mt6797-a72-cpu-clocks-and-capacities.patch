@@ -1,0 +1,82 @@
+arm64: dts: mediatek: mt6797: give the A72 cluster a clock
+
+cpu8/cpu9 get clocks and clock-names, naming the mux clk/0003 adds and the
+same armpll_div_pll1 the eight A53s park on. With proc-supply (dts/0060) and
+an OPP table (dts/0062) that is everything mediatek-cpufreq asks for, and
+"mtk-cpufreq: cpu8: no operating-points-v2, not managing it" stops being the
+end of the story.
+
+The capacity comment is rewritten but the NUMBERS ARE UNCHANGED, and that is
+the point. An earlier draft of this patch restated them as work per MHz here,
+which is right for a board that renormalises and wrong for every board that
+does not: the kernel only multiplies capacity-dmips-mhz by cpuinfo_max_freq
+once every possible CPU has a cpufreq policy, and mt6797-evb and
+mt6797-x20-dev include this dtsi with no OPP tables anywhere, so on those two
+the raw values are final. Restating them here would have shipped a silent
+quarter-weight change to boards this work never touches, straight into the
+upstreaming path. The per-MHz restatement belongs with the OPP tables that
+make it necessary, and it is in mt6797-gemini-pda.dts (dts/0062).
+
+What the comment now says instead is which of the two situations a reader is
+in, and where the other one is handled.
+
+--- a/arch/arm64/boot/dts/mediatek/mt6797.dtsi
++++ b/arch/arm64/boot/dts/mediatek/mt6797.dtsi
+@@ -27,15 +27,28 @@
+ 		#size-cells = <0>;
+ 
+ 		/*
+-		 * Measured single-thread throughput at each cluster's ceiling
+-		 * (gbench stint, Gemini PDA 2026-08-24): A53-LL 642 Mops/s at
+-		 * 1222 MHz, A53-L 689 at 1209, A72 1143 at 2002. Encoded as
+-		 * the at-ceiling ratio because the big cluster has no cpufreq
+-		 * policy, so the kernel's frequency renormalisation never runs
+-		 * and these raw values become the scheduler capacities as-is.
+-		 * They are what makes asym_cpu_capacity_scan() see a
+-		 * big.LITTLE machine at boot — set later (e.g. from a driver),
+-		 * the scan has already run symmetric and never reruns.
++		 * Measured single-thread throughput per cluster, normalised to the
++		 * A72 (gbench stint with the frequency pinned, Gemini PDA
++		 * 2026-08-28): A53-LL 676 Mops/s at 1222 MHz, A53-L 686 at 1209,
++		 * A72 1135 at 1989 -> 608 : 617 : 1024.
++		 *
++		 * These are the values a board with no cpufreq gets, and they are
++		 * final for such a board: the kernel only renormalises
++		 * capacity-dmips-mhz by cpuinfo_max_freq once EVERY possible CPU has
++		 * a cpufreq policy (init_cpu_capacity_callback() waits for
++		 * cpus_to_visit to empty), and with no OPP tables here that never
++		 * happens. mt6797-evb and mt6797-x20-dev are both in that position.
++		 *
++		 * A board that DOES describe its OPPs makes renormalisation run, and
++		 * then these raw numbers are the wrong ones -- so such a board has to
++		 * restate them per MHz. mt6797-gemini-pda.dts does exactly that, and
++		 * carries the arithmetic.
++		 *
++		 * Either way they must be in the device tree: asym_cpu_capacity_scan()
++		 * runs at sched_init_domains() and again only when
++		 * arch_update_cpu_topology() reports a change, which plain hotplug
++		 * never does -- capacities set from an initcall are invisible to the
++		 * asymmetry machinery for ever (measured, builds #66-#67).
+ 		 */
+ 		cpu0: cpu@0 {
+ 			device_type = "cpu";
+@@ -130,6 +143,9 @@
+ 			compatible = "arm,cortex-a72";
+ 			enable-method = "psci";
+ 			reg = <0x200>;
++			clocks = <&mcumixed CLK_MCU_B_SEL>,
++				 <&topckgen CLK_TOP_ARMPLL_DIV_PLL1>;
++			clock-names = "cpu", "intermediate";
+ 			capacity-dmips-mhz = <1024>;
+ 		};
+ 
+@@ -138,6 +154,9 @@
+ 			compatible = "arm,cortex-a72";
+ 			enable-method = "psci";
+ 			reg = <0x201>;
++			clocks = <&mcumixed CLK_MCU_B_SEL>,
++				 <&topckgen CLK_TOP_ARMPLL_DIV_PLL1>;
++			clock-names = "cpu", "intermediate";
+ 			capacity-dmips-mhz = <1024>;
+ 		};
+ 

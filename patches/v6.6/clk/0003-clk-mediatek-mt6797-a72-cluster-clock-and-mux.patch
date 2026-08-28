@@ -1,0 +1,489 @@
+clk: mediatek: mt6797: model the Cortex-A72 cluster's clock and mux
+
+The A72s have run at a frequency this driver picks and holds, because Linux
+had no way to describe their clock. This gives it one, and the reason it goes
+in the MCUMIXED driver rather than in the driver that powers the cluster up is
+that half of it is already here.
+
+WHAT THE HARDWARE ACTUALLY IS. The cluster's mux is ARMPLLDIV_MUXSEL[1:0], in
+this block, in the same register as the two A53 clusters' fields. Its PLL is
+NOT in this block: the vendor sets MT_CPU_DVFS_B's armpll_addr to NULL and
+changes that cluster's frequency by asking the iDVFS co-processor through ATF
+(BIGIDVFSPLLSETFREQ). So this adds two clocks -- "mcu_b_idvfs", whose
+->set_rate is an SMC, and "mcu_b_sel", an ordinary mux -- and mediatek-cpufreq
+needs nothing else to drive the cluster.
+
+IT ALSO FIXES TWO THINGS THE OPEN-CODED VERSION WAS DOING.
+
+mt6797-a72.c did an unlocked read-modify-write of ARMPLLDIV_MUXSEL while
+mediatek-cpufreq wrote the A53 fields of the same register under
+mt6797_mcumixed_lock. One shared lock is the point of moving it.
+
+Worse, it bracketed each change with
+
+	writel(misc | (3u << 4), topckgen + CLK_MISC_CFG_0);   ... and back
+
+which enables and then DISABLES the armpll_div_pll1/pll2 gates by hand. Those
+are the "intermediate" clock the A53 policies park on, held enabled through
+the clock framework for the life of the boot. The A72's one raise per boot
+therefore left armpll_div_pll1 with a framework enable count of 2 and its
+hardware bit clear -- measured on build #99:
+
+    CLK_MISC_CFG_0 = 0x01ff0000
+    armpll_div_pll1   2   2   0   1092000000   ...   N
+
+The A53 clusters have been parking on a clock the framework believes is
+enabled and the register says is not, on every DVFS transition, since the
+first build that onlined an A72. Nothing here re-enables it; the write simply
+stops happening, and the gate stays where its consumers put it.
+
+THE ONE PLACE THIS DRIVER DOES NOT REPORT THE REGISTER. mcu_b_sel needs its
+own ->get_parent, because the framework reads a mux's parent exactly once, at
+registration, and caches it. At registration the cluster is unpowered and
+MUXSEL[1:0] reads 0. Selector 0 is the 26 MHz oscillator, but on this field it
+does not mean "someone chose 26 MHz", it means "this cluster is off" -- the
+cluster's own PLL does not exist until the firmware powers the domain holding
+it, and the firmware moves the field to 1 during CPU_ON without telling
+anyone (measured: MUXSEL 0x54 before, 0x55 after). Left alone, the cached
+answer stays clk26m for ever and mediatek-cpufreq's first act --
+clk_get_parent() then clk_set_rate() on the result -- would try to retune the
+crystal. Reporting 0 as ARMPLL is the difference between the field's value and
+its meaning. It cannot be corrected from outside this driver either:
+clk_set_parent() to the parent the framework already believes in returns
+without touching anything.
+
+CSPM is ioremapped by address rather than taken from a DT resource. It is not
+part of MCUMIXED -- it is the SoC's shared hardware-semaphore page, which ATF
+takes around its own ARMPLLDIV accesses and polls for without a bound -- and
+mt6797-a72.c maps it the same way for the same reason. Putting it in this
+node's reg would claim it belongs to this block.
+
+--- a/include/dt-bindings/clock/mt6797-clk.h
++++ b/include/dt-bindings/clock/mt6797-clk.h
+@@ -116,7 +116,9 @@
+ #define CLK_MCU_ARMCAXPLL1			1
+ #define CLK_MCU_LL_SEL				2
+ #define CLK_MCU_L_SEL				3
+-#define CLK_MCU_NR				4
++#define CLK_MCU_B_IDVFS				4
++#define CLK_MCU_B_SEL				5
++#define CLK_MCU_NR				6
+ 
+ /* APMIXED_SYS */
+ #define CLK_APMIXED_MAINPLL			1
+--- a/drivers/clk/mediatek/clk-mt6797-mcumixed.c
++++ b/drivers/clk/mediatek/clk-mt6797-mcumixed.c
+@@ -16,12 +16,15 @@
+  *   ARMCAXPLL3  CON0 0x230  CON1 0x234   spare
+  *   ARMPLLDIV_MUXSEL 0x270   ARMPLLDIV_CKDIV 0x274
+  *
+- * Only ARMCAXPLL0 and ARMCAXPLL1 are exposed. ARMCAXPLL2 clocks the CCI and
+- * is deliberately left alone -- it is live and load-bearing, and nothing here
+- * should be able to touch it. ARMCAXPLL3 is unused. The Cortex-A72 cluster
+- * does NOT have a PLL in this list: the vendor driver sets its armpll_addr to
+- * NULL and drives that cluster's frequency through the iDVFS co-processor
+- * instead (mt_cpufreq.c, MT_CPU_DVFS_B).
++ * Only ARMCAXPLL0 and ARMCAXPLL1 are exposed as rate-settable PLLs.
++ * ARMCAXPLL2 clocks the CCI and is deliberately left alone -- it is live and
++ * load-bearing, and nothing here should be able to touch it. ARMCAXPLL3 is
++ * unused. The Cortex-A72 cluster does NOT have a PLL in this list: the vendor
++ * driver sets its armpll_addr to NULL and drives that cluster's frequency
++ * through the iDVFS co-processor instead (mt_cpufreq.c, MT_CPU_DVFS_B). That
++ * cluster is still modelled here -- see "The Cortex-A72 cluster" below -- as a
++ * clock whose ->set_rate is a firmware call rather than a register write,
++ * because its MUX lives in this block and must share this block's lock.
+  *
+  * MUXSEL is two bits per cluster -- LL [3:2], L [5:4], B [1:0], CCI [7:6] --
+  * selecting 0 = 26 MHz, 1 = the cluster's own ARMPLL, 2 = mainpll, 3 = univpll.
+@@ -42,9 +45,11 @@
+  * Copyright (c) 2026 Gemini PDA Linux port
+  */
+ 
++#include <linux/arm-smccc.h>
+ #include <linux/bitfield.h>
+ #include <linux/bitops.h>
+ #include <linux/clk-provider.h>
++#include <linux/cpumask.h>
+ #include <linux/delay.h>
+ #include <linux/io.h>
+ #include <linux/math64.h>
+@@ -206,6 +211,218 @@
+ 	.set_rate	= mt6797_armpll_set_rate,
+ };
+ 
++/*
++ * The Cortex-A72 cluster ("B").
++ *
++ * Its mux is bits [1:0] of ARMPLLDIV_MUXSEL, in this block, alongside the two
++ * A53 clusters' -- which is why it is modelled here and not in the driver that
++ * powers the cluster up. Before this, mt6797-a72.c did its own unlocked
++ * read-modify-write of ARMPLLDIV_MUXSEL while mediatek-cpufreq was writing the
++ * A53 fields of the same register under mt6797_mcumixed_lock. One shared lock
++ * is the point of moving it.
++ *
++ * What is NOT in this block is the cluster's PLL. There isn't one: the vendor
++ * sets MT_CPU_DVFS_B's armpll_addr to NULL and changes that cluster's
++ * frequency by asking the iDVFS co-processor, through ATF, with
++ * BIGIDVFSPLLSETFREQ. So "mcu_b_idvfs" below is a clock whose ->set_rate is an
++ * SMC. Everything else about it behaves like any other clock, which is exactly
++ * what mediatek-cpufreq needs: a rate-settable parent to retune and a mux to
++ * park on while it does.
++ *
++ * The register half of the old open-coded sequence is gone with it, and one of
++ * its side effects is worth recording. It used to bracket the change with
++ *
++ *	writel(misc | (3u << 4), topckgen + CLK_MISC_CFG_0);   ... and back
++ *
++ * i.e. it enabled and then DISABLED the armpll_div_pll1/pll2 gates by hand.
++ * Those are the "intermediate" clock the A53 policies park on, and
++ * mediatek-cpufreq holds them enabled through the clock framework for the life
++ * of the boot. The A72's one raise per boot therefore left armpll_div_pll1
++ * with enable_count 2 and its hardware enable bit clear -- measured on build
++ * #99: CLK_MISC_CFG_0 = 0x01ff0000, clk_summary "armpll_div_pll1  2  2  ... N".
++ * Driving the mux through the framework removes the write, and the gate now
++ * stays where its consumers put it.
++ */
++#define CSPM_PHYS		0x11015000
++#define CSPM_SIZE		0x1000
++#define CSPM_POWERON_CONFIG	0x000
++#define CSPM_KEY		0x0b160001
++#define CSPM_SEMA		0x448
++
++/* Firmware SIP calls into the iDVFS block. */
++#define SIP_IDVFS_PLLSETFREQ	0xC20003B8U
++#define SIP_IDVFS_SRAMLDOSET	0xC20003BFU
++
++/* Android's upper-bin Vsram, in units of 10 uV: 120000 -> 1.20 V. */
++#define B_VSRAM_X100MV		120000
++#define B_VSRAM_ABOVE_HZ	1001000000UL
++
++/*
++ * Bounds. The floor is the firmware's: BIGIDVFSPLLSETFREQ below ~750 MHz has
++ * never been tested from the running side, and the cluster's power-on gate
++ * wants ~750 anyway, so that is where the firmware parks it. The ceiling is a
++ * backstop only -- the OPP table in the device tree is what actually governs
++ * this cluster, and it stops well below here (issue #59). 2600 MHz is the
++ * silicon's rating and the limit the old sysfs knob enforced; keeping it means
++ * this change does not quietly decide #59's ceiling question.
++ */
++#define B_MIN_HZ		750000000UL
++#define B_MAX_HZ		2600000000UL
++
++/*
++ * The two Cortex-A72s. Hard-coded, as they are in mt6797-a72.c: this SoC has
++ * exactly ten cores and cpu8/cpu9 are the big ones. It is only used to refuse
++ * a firmware call that would go nowhere.
++ */
++#define B_CPU0			8
++#define B_CPU1			9
++
++struct mt6797_b_idvfs {
++	struct clk_hw	hw;
++	void __iomem	*cspm;
++	void __iomem	*muxsel;
++	unsigned long	rate;
++};
++
++#define to_mt6797_b_idvfs(_hw) container_of(_hw, struct mt6797_b_idvfs, hw)
++
++/*
++ * There is nothing to read the rate back from: the PLL is behind the iDVFS
++ * co-processor and its registers are not in this block. So the rate is what we
++ * last asked for -- with one correction that matters.
++ *
++ * MUXSEL[1:0] == 0 means the cluster is UNPOWERED (see
++ * mt6797_b_mux_get_parent). Every time the firmware powers it back up it parks
++ * the PLL at B_MIN_HZ, so a cached rate from before a power cycle is a lie the
++ * moment we can see that selector. Notice it here and forget the stale value:
++ * otherwise clk_set_rate() back to the old rate short-circuits on the cached
++ * value and does nothing at all, leaving the cluster at 750 MHz while cpufreq,
++ * the scheduler capacity and the sysfs knob all report the old figure -- on
++ * whatever voltage that figure implies.
++ *
++ * Paired with CLK_GET_RATE_NOCACHE, so clk_get_rate() actually reaches here,
++ * and with a clk_get_rate() from mt6797_a72_prepare() while the cluster is
++ * still down, which is what guarantees the correction happens before anything
++ * asks for a frequency.
++ */
++static unsigned long mt6797_b_idvfs_recalc_rate(struct clk_hw *hw,
++						unsigned long parent_rate)
++{
++	struct mt6797_b_idvfs *b = to_mt6797_b_idvfs(hw);
++
++	if (!(readl(b->muxsel) & 0x3))
++		b->rate = B_MIN_HZ;
++
++	return b->rate;
++}
++
++static long mt6797_b_idvfs_round_rate(struct clk_hw *hw, unsigned long rate,
++				      unsigned long *parent_rate)
++{
++	/* The firmware call takes whole MHz and nothing finer. */
++	return clamp(rate, B_MIN_HZ, B_MAX_HZ) / 1000000 * 1000000;
++}
++
++static int mt6797_b_idvfs_set_rate(struct clk_hw *hw, unsigned long rate,
++				   unsigned long parent_rate)
++{
++	struct mt6797_b_idvfs *b = to_mt6797_b_idvfs(hw);
++	unsigned int mhz = rate / 1000000;
++	struct arm_smccc_res res;
++	bool sema = false;
++	int i;
++
++	if (rate < B_MIN_HZ || rate > B_MAX_HZ)
++		return -EINVAL;
++
++	/*
++	 * The iDVFS block is inside the cluster's own power domain, so the call
++	 * only means anything while the cluster is up. Checked without
++	 * cpus_read_lock() deliberately: this runs under the clock framework's
++	 * prepare mutex, and cpufreq reaches it from inside a hotplug callback
++	 * that already holds cpu_hotplug_lock for read -- taking it again the
++	 * other way round is the classic percpu-rwsem inversion. Nothing on
++	 * this board offlines the A72s once they are up (mt6797-a72.c has no
++	 * offline path at all), so an advisory check is what this can be.
++	 */
++	if (!cpu_online(B_CPU0) && !cpu_online(B_CPU1)) {
++		pr_err("mcu_b_idvfs: cluster is down; not asking for %u MHz\n",
++		       mhz);
++		return -ENODEV;
++	}
++
++	/*
++	 * Vsram before the clock. The on-die SRAM LDO array has to be at or
++	 * above Vproc, and the bring-up leaves it at 1.10 V -- below the 1.14 V
++	 * this cluster's own OPP table asks for at the top. So raise it to
++	 * Android's upper-bin 1.20 V, which covers the whole Vproc range in use,
++	 * and never lower it.
++	 *
++	 * EVERY TIME, not once. This used to latch in a bool, and the latch is
++	 * wrong across a cluster power cycle: mt6797_a72_apply_prereqs() sets
++	 * the LDO back to 1.10 V on every power-up, so a latch that survived
++	 * would skip the raise and run 1.14 V of Vproc against 1.10 V of Vsram
++	 * -- the vendor's one rule about these two, broken silently. The cost of
++	 * being unconditional is one SMC and 240 us, and only on transitions
++	 * that cross 1 GHz upward.
++	 */
++	if (rate > B_VSRAM_ABOVE_HZ) {
++		arm_smccc_smc(SIP_IDVFS_SRAMLDOSET, B_VSRAM_X100MV,
++			      0, 0, 0, 0, 0, 0, &res);
++		udelay(240);
++	}
++
++	/*
++	 * ATF takes this hardware semaphore around its own ARMPLLDIV accesses
++	 * and polls for it WITHOUT A BOUND, so it has to be held here and it
++	 * has to be handed back. If it is ever left held, the next firmware
++	 * call never returns and the calling CPU is stuck at EL3.
++	 */
++	writel(CSPM_KEY, b->cspm + CSPM_POWERON_CONFIG);
++	for (i = 0; i < 200; i++) {
++		writel(1, b->cspm + CSPM_SEMA);
++		if (readl(b->cspm + CSPM_SEMA) & 1) {
++			sema = true;
++			break;
++		}
++		udelay(10);
++	}
++	if (!sema) {
++		pr_err("mcu_b_idvfs: CSPM semaphore not granted; leaving the clock alone\n");
++		return -EBUSY;
++	}
++
++	arm_smccc_smc(SIP_IDVFS_PLLSETFREQ, mhz, 0, 0, 0, 0, 0, 0, &res);
++
++	writel(1, b->cspm + CSPM_SEMA);
++
++	if (res.a0) {
++		pr_err("mcu_b_idvfs: BIGIDVFSPLLSETFREQ(%u) failed (%ld)\n",
++		       mhz, (long)res.a0);
++		return -EIO;
++	}
++
++	b->rate = (unsigned long)mhz * 1000000;
++	return 0;
++}
++
++/*
++ * No .enable/.disable, for the same reason the ARMPLLs above have none: the
++ * cluster's clock is not something this driver may gate, and a clock with no
++ * enable op is treated as permanently enabled.
++ *
++ * The cluster IS gated, by being powered off -- but that is the CPU hotplug
++ * path's business, and the firmware re-parks the clock at B_MIN_HZ every time
++ * it powers the cluster up. ->rate is seeded to match, and this driver assumes
++ * the cluster is never taken back down; there is no offline path on this board
++ * that would make it safe.
++ */
++static const struct clk_ops mt6797_b_idvfs_ops = {
++	.recalc_rate	= mt6797_b_idvfs_recalc_rate,
++	.round_rate	= mt6797_b_idvfs_round_rate,
++	.set_rate	= mt6797_b_idvfs_set_rate,
++};
++
+ static const char * const ll_parents[] = {
+ 	[ARMPLL_MUX_CLKSQ]	= "clk26m",
+ 	[ARMPLL_MUX_ARMPLL]	= "armcaxpll0",
+@@ -243,6 +460,54 @@
+ 	u8			shift;
+ };
+ 
++static const char * const b_parents[] = {
++	[ARMPLL_MUX_CLKSQ]	= "clk26m",
++	[ARMPLL_MUX_ARMPLL]	= "mcu_b_idvfs",
++	[ARMPLL_MUX_MAINPLL]	= "armpll_div_pll1",
++	[ARMPLL_MUX_UNIVPLL]	= "armpll_div_pll2",
++};
++
++/*
++ * The A72 mux needs its own ->get_parent, and this is the whole of why.
++ *
++ * The clock framework reads a mux's parent EXACTLY ONCE, at registration, and
++ * caches it; clk_get_parent() hands back that cache and nothing ever re-reads
++ * the register. This driver registers at boot, when the A72 cluster is still
++ * unpowered and ARMPLLDIV_MUXSEL[1:0] reads 0. Selector 0 is the 26 MHz
++ * oscillator -- but on this field it does not mean "someone chose 26 MHz", it
++ * means "this cluster is off", because the cluster's own PLL does not exist
++ * until the firmware powers the domain that holds it.
++ *
++ * The firmware then moves the field to 1 as part of PSCI CPU_ON (measured:
++ * ARMPLLDIV_MUXSEL 0x54 before, 0x55 after) and tells nobody. So the cached
++ * answer stays "clk26m" for the life of the boot, and mediatek-cpufreq's very
++ * first act on this policy --
++ *
++ *	struct clk *armpll = clk_get_parent(cpu_clk);
++ *	... clk_set_rate(armpll, freq_hz);
++ *
++ * -- would try to retune the 26 MHz crystal and fail every transition.
++ *
++ * Reporting 0 as ARMPLL fixes it at the source. It is not a lie about the
++ * hardware: it is the difference between the field's value and its meaning,
++ * and by the time anything asks, the firmware has put a 1 there. Nothing in
++ * this driver ever selects 0, and the vendor never selects it for cluster B
++ * either -- its DVFS only ever moves between ARMPLL and MAINPLL.
++ *
++ * Doing it here rather than having the cluster's bring-up driver "correct" the
++ * framework afterwards is deliberate: clk_set_parent() to the parent the
++ * framework already believes in returns immediately without touching anything,
++ * so there is no correction to make from outside.
++ */
++static u8 mt6797_b_mux_get_parent(struct clk_hw *hw)
++{
++	u8 idx = clk_mux_ops.get_parent(hw);
++
++	return idx ? idx : ARMPLL_MUX_ARMPLL;
++}
++
++static struct clk_ops mt6797_b_mux_ops;
++
+ static const struct mt6797_cpumux_desc mt6797_cpumuxes[] = {
+ 	{ CLK_MCU_LL_SEL, "mcu_ll_sel", ll_parents, 2 },
+ 	{ CLK_MCU_L_SEL,  "mcu_l_sel",  l_parents,  4 },
+@@ -258,6 +523,7 @@
+ {
+ 	struct device *dev = &pdev->dev;
+ 	struct clk_hw_onecell_data *clk_data;
++	struct mt6797_b_idvfs *b;
+ 	void __iomem *base;
+ 	u32 ckdiv;
+ 	int i, ret;
+@@ -315,6 +581,52 @@
+ 		clk_data->hws[d->id] = &pll->hw;
+ 	}
+ 
++	/*
++	 * The A72 cluster's clock, before the muxes: mcu_b_sel names it as a
++	 * parent and the framework resolves parent names at registration.
++	 */
++	b = devm_kzalloc(dev, sizeof(*b), GFP_KERNEL);
++	if (!b) {
++		ret = -ENOMEM;
++		goto err;
++	}
++
++	/*
++	 * ioremap by address rather than from a DT resource. CSPM is not part
++	 * of this block -- it is the SoC's shared hardware-semaphore page, and
++	 * mt6797-a72.c maps it the same way for the same reason. Putting it in
++	 * this node's reg would say it belongs to MCUMIXED, which it does not.
++	 */
++	b->cspm = devm_ioremap(dev, CSPM_PHYS, CSPM_SIZE);
++	if (!b->cspm) {
++		dev_err(dev, "cannot map CSPM; the A72 clock needs its semaphore\n");
++		ret = -ENOMEM;
++		goto err;
++	}
++
++	b->muxsel = base + ARMPLLDIV_MUXSEL;
++	/* Where the firmware parks the cluster every time it powers it up. */
++	b->rate = B_MIN_HZ;
++
++	{
++		struct clk_init_data init = {
++			.name = "mcu_b_idvfs",
++			.ops = &mt6797_b_idvfs_ops,
++			.parent_names = (const char *[]){ "clk26m" },
++			.num_parents = 1,
++			/* ->recalc_rate has a correction to make; let it run. */
++			.flags = CLK_GET_RATE_NOCACHE,
++		};
++
++		b->hw.init = &init;
++		ret = devm_clk_hw_register(dev, &b->hw);
++		if (ret) {
++			dev_err(dev, "failed to register mcu_b_idvfs: %d\n", ret);
++			goto err;
++		}
++	}
++	clk_data->hws[CLK_MCU_B_IDVFS] = &b->hw;
++
+ 	for (i = 0; i < ARRAY_SIZE(mt6797_cpumuxes); i++) {
+ 		const struct mt6797_cpumux_desc *d = &mt6797_cpumuxes[i];
+ 		struct clk_hw *hw;
+@@ -345,6 +657,44 @@
+ 		clk_data->hws[d->id] = hw;
+ 	}
+ 
++	/*
++	 * The A72 mux, by hand: same register, same lock, same flags as the two
++	 * above, but with the ->get_parent described at mt6797_b_mux_get_parent.
++	 */
++	{
++		struct clk_init_data init = {
++			.name = "mcu_b_sel",
++			.ops = &mt6797_b_mux_ops,
++			.parent_names = b_parents,
++			.num_parents = ARRAY_SIZE(b_parents),
++			.flags = CLK_SET_RATE_NO_REPARENT,
++		};
++		struct clk_mux *mux;
++
++		mt6797_b_mux_ops = clk_mux_ops;
++		mt6797_b_mux_ops.get_parent = mt6797_b_mux_get_parent;
++
++		mux = devm_kzalloc(dev, sizeof(*mux), GFP_KERNEL);
++		if (!mux) {
++			ret = -ENOMEM;
++			goto err;
++		}
++
++		mux->reg = base + ARMPLLDIV_MUXSEL;
++		mux->shift = 0;			/* B is MUXSEL[1:0] */
++		mux->mask = 0x3;
++		mux->lock = &mt6797_mcumixed_lock;
++		mux->hw.init = &init;
++
++		ret = devm_clk_hw_register(dev, &mux->hw);
++		if (ret) {
++			dev_err(dev, "failed to register mcu_b_sel: %d\n", ret);
++			goto err;
++		}
++
++		clk_data->hws[CLK_MCU_B_SEL] = &mux->hw;
++	}
++
+ 	ret = of_clk_add_hw_provider(dev->of_node, of_clk_hw_onecell_get,
+ 				     clk_data);
+ 	if (ret)
