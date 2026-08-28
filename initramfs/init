@@ -31,7 +31,18 @@ ROOTDEV=                    # optional explicit device (devname under /dev)
 NEWINIT=/sbin/init          # init to exec inside the loop rootfs
 FORCE_RESCUE=
 
-log() { echo "gemini-init: $*"; }
+log() {
+    echo "gemini-init: $*"
+    # ...and to /dev/kmsg, because stdout here is /dev/console -- a TTY, not
+    # printk -- so every line this script has ever printed was invisible to
+    # netconsole, to the ramoops console zone, and to the journal of the boot
+    # that follows. A boot that dies inside /init is silent by construction,
+    # which is half of why #85 took so long to see. /dev/kmsg lands in all
+    # three. (Before the devtmpfs mount below there is no /dev/kmsg; the guard
+    # makes those early calls fall back to stdout alone.)
+    [ -w /dev/kmsg ] && echo "gemini-init: $*" >/dev/kmsg 2>/dev/null
+    return 0
+}
 
 rescue() {
     log "$MARK_RESCUE: $*"
