@@ -47,12 +47,43 @@ one of six capabilities. #60 records the unmitigated state as *accepted*
 ("acceptable for a single-user pocket terminal"), and reversing an accepted
 trade and charging 6% for it is a decision for the owner, not a default.
 
-SCOPE. Spectre-v2 only. The other five the A72 brings -- v3a, v4, BHB, erratum
-1742098 and errata 1165522/1319367/1530923, now enumerated for the first time
-because this patch also makes the permit message pr_info rather than
-pr_info_once -- follow the same shape. Three are matches functions in this file;
-the two errata go through is_affected_midr_range[_list] and want a
-compatible-to-MIDR mapping rather than a DT presence check.
+SCOPE, AND WHERE THIS ROUTE STOPS. Spectre-v2 only, and that is not an accident
+of effort -- it is where the technique works. The other five the A72 brings are
+enumerated for the first time here, because this patch also makes the permit
+message pr_info rather than pr_info_once:
+
+    59  Spectre-v3a
+    60  Spectre-v4
+    61  Spectre-BHB
+    73  ARM erratum 1742098
+    96  ARM errata 1165522, 1319367, or 1530923
+
+They do NOT all follow this shape, and it is worth being exact about why.
+
+Spectre-v2's mitigation is uniform across CPUs -- an SMCCC_ARCH_WORKAROUND_1
+call -- so the only thing that had to happen at boot was patching the
+alternatives. Force the detection and everything else falls out.
+
+v3a, v4 and BHB are different: their mitigation is CHOSEN PER CPU from the local
+CPU's features, and their enable paths self-guard on the local CPU being
+affected. spectre_bhb_enable_mitigation() opens with
+
+    if (!is_spectre_bhb_affected(entry, SCOPE_LOCAL_CPU))
+            return;
+
+and then picks a vector table (EL1_VECTOR_BHB_CLEAR_INSN, a loop count, or the
+firmware one) from what the local CPU supports. spectre_v3a_enable_mitigation()
+is guarded by this_cpu_has_cap(). So forcing the capability at boot makes the
+A53s detect it and then decline to install anything, and the vector table the
+A72 needs still has unpatched alternatives. That is exactly #60's option 2 --
+late-patch a per-CPU vector table -- and this route does not shortcut it.
+
+The two errata are the other way. ARM64_WORKAROUND_1742098 has no .cpu_enable at
+all: it is CAP_MIDR_RANGE_LIST plus the capability, and its whole effect is the
+cap being set (it withdraws the aarch32 AES hwcap). Those should extend cleanly
+by the same DT route, needing a compatible-to-MIDR mapping rather than a
+presence check -- but note they are errata, not speculation mitigations, so they
+are not what #60 is actually about.
 
 --- a/arch/arm64/Kconfig
 +++ b/arch/arm64/Kconfig
