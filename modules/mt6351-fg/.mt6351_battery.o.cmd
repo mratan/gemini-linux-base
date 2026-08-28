@@ -1062,6 +1062,7 @@ deps_/mercury/data/projects/gemini_linux/07-kernel/wt-main/modules/mt6351-fg/mt6
     $(wildcard include/config/LEDS_TRIGGER_CPU) \
     $(wildcard include/config/LEDS_TRIGGER_AUDIO) \
   include/dt-bindings/leds/common.h \
+  include/linux/sort.h \
   /mercury/data/projects/gemini_linux/07-kernel/wt-main/modules/mt6351-fg/mt6351_battery_tables.h \
 
 /mercury/data/projects/gemini_linux/07-kernel/wt-main/modules/mt6351-fg/mt6351_battery.o: $(deps_/mercury/data/projects/gemini_linux/07-kernel/wt-main/modules/mt6351-fg/mt6351_battery.o)
