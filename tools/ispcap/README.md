@@ -1,5 +1,16 @@
 # Capturing the vendor's ISP register programme (#66)
 
+> **TESTED 2026-08-29 ON boot1, AND THE PREMISE BELOW IS WRONG.** The ioctls
+> work and the log line exists, but it is a `pr_debug` (needs
+> `echo "file camera_isp.c line 4933 +p" > /sys/kernel/debug/dynamic_debug/control`)
+> **and the HAL never calls that path**: it hands the kernel a command-queue
+> buffer (`ISP_SetMemInfo: set comq memory info is done!!`) and the ISP fetches
+> the programme itself. Zero writes were logged with everything enabled and the
+> camera streaming. The programme is in a DMA buffer, not in a syscall.
+> Read `04-docs/captures/66-ispcap-20260829/FINDINGS.md` before spending time
+> here — it also records what the trip DID establish, which is a complete vendor
+> CAM_A pass1 sequence.
+
 The MT6797 vendor kernel writes only 16 of pass1's 555 registers itself. Every
 tuning value the camera HAL uses — OBC, LSC, BNR, the demosaic block, AWB, RRZ —
 arrives from userspace, either through `ISP_WriteReg` (an ioctl taking arbitrary
