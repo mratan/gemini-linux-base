@@ -1,0 +1,141 @@
+From: Gemini PDA Linux bring-up
+Subject: [PATCH] clk: mt6797: do not sweep gates inside a power domain nobody holds
+
+#85. VENCSYS, VDECSYS and IMGSYS live inside MT6797_POWER_DOMAIN_VENC, _VDEC
+and _ISP, and nothing in this kernel holds any of them -- there is no codec
+driver, and the camera takes ISP only while it is open. genpd_power_off_unused()
+is a late_initcall_sync exactly like clk_disable_unused() and queues one
+power-off work per domain onto pm_wq, so the two run at the same instant on
+different CPUs.
+
+Whichever reaches the block first decides the boot. Measured on build #119 with
+a trace that survives the reset:
+
+  clk-trace: previous boot's sweep DID NOT FINISH after 7 entries
+  clk-trace:    6 disable   venc_3            <-- NEVER RETURNED
+
+The gate write went to an already-dark VENCSYS and never completed, with
+clk_enable_lock() held and interrupts off -- so the next CPU to call
+clk_enable() hard-locked too, /init never ran, and watchdog.open_timeout=120
+reset the machine 120 s later. Roughly half of all reboots.
+
+CLK_IGNORE_UNUSED makes clk_disable_unused_subtree() and
+clk_unprepare_unused_subtree() both skip these gates, so the sweep never writes
+those registers and the race cannot happen.
+
+WHY NOT THE PROPER FIX. The right answer is for the provider to hold its domain,
+and it is not available on this SoC yet. Merely adding `power-domains` to the
+node makes platform_probe() call dev_pm_domain_attach(dev, true), which powers
+the domain ON -- and scp_domain_data_mt6797[] gives VDEC, VENC and ISP no
+bus_prot_mask, while MM has one and the vendor's clk-mt6797-pg.c applies TOPAXI
+protection to all of them. Powering them up without that handshake hangs the
+interconnect, which is the same failure by another route. Three builds tried it
+and every one looped on EVERY boot: #120 (runtime PM), #122 (+ upstream's
+v6.11 get-all reordering), #123 (the phandles alone, no runtime PM). Those
+patches are kept at patches/v6.6/clk/*.patch.parked with the full argument in
+README-parked.md.
+
+COST: none in power. The domain is still free to be powered off, and a gate
+inside an unpowered domain draws nothing whichever way it is left.
+
+Revert this in favour of the runtime-PM patches once mtk-scpsys learns MT6797's
+bus protection for these three domains -- and prove a domain can be cycled
+before trusting it.
+
+--- a/drivers/clk/mediatek/clk-mt6797-venc.c
++++ b/drivers/clk/mediatek/clk-mt6797-venc.c
+@@ -18,8 +18,27 @@
+ 	.sta_ofs = 0x0000,
+ };
+ 
++/*
++ * #85: these registers live inside a power domain that nothing in this kernel
++ * holds, and genpd_power_off_unused() -- a late_initcall_sync, exactly like
++ * clk_disable_unused() -- powers it off from pm_wq while the sweep is walking
++ * the tree. Whichever gets there first decides the boot: the sweep wedged
++ * gating venc_3 with the block already dark, taking two CPUs down with
++ * clk_enable_lock() held. So do not let the sweep touch them.
++ *
++ * The proper fix is for the provider to hold its domain, and it is NOT
++ * available yet: merely putting `power-domains` in the node makes
++ * platform_probe() call dev_pm_domain_attach(dev, true), which powers the
++ * domain ON -- and scp_domain_data_mt6797[] gives VDEC, VENC and ISP no
++ * bus_prot_mask, while MM has one and the vendor applies TOPAXI protection to
++ * all of them. Three builds tried it (#120, #122, #123) and every one looped on
++ * every boot. See patches/v6.6/clk/README-parked.md.
++ *
++ * Costs nothing in power: the domain is still free to be powered off, and a
++ * gate inside an unpowered domain draws nothing either way.
++ */
+ #define GATE_VENC(_id, _name, _parent, _shift)				\
+-	GATE_MTK(_id, _name, _parent, &venc_cg_regs, _shift, &mtk_clk_gate_ops_setclr_inv)
++	GATE_MTK_FLAGS(_id, _name, _parent, &venc_cg_regs, _shift, &mtk_clk_gate_ops_setclr_inv, CLK_IGNORE_UNUSED)
+ 
+ static const struct mtk_gate venc_clks[] = {
+ 	GATE_VENC(CLK_VENC_0, "venc_0", "mm_sel", 0),
+--- a/drivers/clk/mediatek/clk-mt6797-vdec.c
++++ b/drivers/clk/mediatek/clk-mt6797-vdec.c
+@@ -24,11 +24,30 @@
+ 	.sta_ofs = 0x0008,
+ };
+ 
++/*
++ * #85: these registers live inside a power domain that nothing in this kernel
++ * holds, and genpd_power_off_unused() -- a late_initcall_sync, exactly like
++ * clk_disable_unused() -- powers it off from pm_wq while the sweep is walking
++ * the tree. Whichever gets there first decides the boot: the sweep wedged
++ * gating venc_3 with the block already dark, taking two CPUs down with
++ * clk_enable_lock() held. So do not let the sweep touch them.
++ *
++ * The proper fix is for the provider to hold its domain, and it is NOT
++ * available yet: merely putting `power-domains` in the node makes
++ * platform_probe() call dev_pm_domain_attach(dev, true), which powers the
++ * domain ON -- and scp_domain_data_mt6797[] gives VDEC, VENC and ISP no
++ * bus_prot_mask, while MM has one and the vendor applies TOPAXI protection to
++ * all of them. Three builds tried it (#120, #122, #123) and every one looped on
++ * every boot. See patches/v6.6/clk/README-parked.md.
++ *
++ * Costs nothing in power: the domain is still free to be powered off, and a
++ * gate inside an unpowered domain draws nothing either way.
++ */
+ #define GATE_VDEC0(_id, _name, _parent, _shift)				\
+-	GATE_MTK(_id, _name, _parent, &vdec0_cg_regs, _shift, &mtk_clk_gate_ops_setclr_inv)
++	GATE_MTK_FLAGS(_id, _name, _parent, &vdec0_cg_regs, _shift, &mtk_clk_gate_ops_setclr_inv, CLK_IGNORE_UNUSED)
+ 
+ #define GATE_VDEC1(_id, _name, _parent, _shift)				\
+-	GATE_MTK(_id, _name, _parent, &vdec1_cg_regs, _shift, &mtk_clk_gate_ops_setclr_inv)
++	GATE_MTK_FLAGS(_id, _name, _parent, &vdec1_cg_regs, _shift, &mtk_clk_gate_ops_setclr_inv, CLK_IGNORE_UNUSED)
+ 
+ static const struct mtk_gate vdec_clks[] = {
+ 	GATE_VDEC0(CLK_VDEC_CKEN_ENG, "vdec_cken_eng", "vdec_sel", 8),
+--- a/drivers/clk/mediatek/clk-mt6797-img.c
++++ b/drivers/clk/mediatek/clk-mt6797-img.c
+@@ -16,8 +16,27 @@
+ 	.sta_ofs = 0x0000,
+ };
+ 
++/*
++ * #85: these registers live inside a power domain that nothing in this kernel
++ * holds, and genpd_power_off_unused() -- a late_initcall_sync, exactly like
++ * clk_disable_unused() -- powers it off from pm_wq while the sweep is walking
++ * the tree. Whichever gets there first decides the boot: the sweep wedged
++ * gating venc_3 with the block already dark, taking two CPUs down with
++ * clk_enable_lock() held. So do not let the sweep touch them.
++ *
++ * The proper fix is for the provider to hold its domain, and it is NOT
++ * available yet: merely putting `power-domains` in the node makes
++ * platform_probe() call dev_pm_domain_attach(dev, true), which powers the
++ * domain ON -- and scp_domain_data_mt6797[] gives VDEC, VENC and ISP no
++ * bus_prot_mask, while MM has one and the vendor applies TOPAXI protection to
++ * all of them. Three builds tried it (#120, #122, #123) and every one looped on
++ * every boot. See patches/v6.6/clk/README-parked.md.
++ *
++ * Costs nothing in power: the domain is still free to be powered off, and a
++ * gate inside an unpowered domain draws nothing either way.
++ */
+ #define GATE_IMG(_id, _name, _parent, _shift)			\
+-	GATE_MTK(_id, _name, _parent, &img_cg_regs, _shift, &mtk_clk_gate_ops_setclr)
++	GATE_MTK_FLAGS(_id, _name, _parent, &img_cg_regs, _shift, &mtk_clk_gate_ops_setclr, CLK_IGNORE_UNUSED)
+ 
+ static const struct mtk_gate img_clks[] = {
+ 	GATE_IMG(CLK_IMG_FDVT, "img_fdvt", "mm_sel", 11),
