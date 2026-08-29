@@ -40,7 +40,15 @@ the clk_core_is_enabled()/is_prepared() read as well as the gate itself, since
 that read is MMIO too.
 
 Measured working on build #119: 390 entries on a healthy boot, "previous boot's
-sweep FINISHED", 200 disable-pass and 190 unprepare-pass.
+sweep FINISHED", 200 disable-pass and 190 unprepare-pass. It then caught the
+failure on the first reboot cycle -- "DID NOT FINISH after 7 entries", the
+last being "venc_3 <-- NEVER RETURNED". See patches/v6.6/clk/0011 for what
+that turned out to mean.
+
+A finished sweep prints one summary line, not 390: the ordered record is only
+worth the noise when the previous boot died inside it. That makes this cheap
+enough to leave in the daily kernel, which is the point -- if this ever
+regresses, the next boot says so by itself.
 
 This patch also DROPS the five-clock skip list that used to live here
 (0009-clk-do-not-gate-the-five-clocks-mt6797-needs.patch). It was built on the
@@ -56,7 +64,7 @@ misread above and #118 measured it not to work.
  
  #include "clk.h"
  
-@@ -1344,6 +1345,144 @@
+@@ -1344,6 +1345,153 @@
  	clk_core_unprepare_lock(core);
  }
  
@@ -189,6 +197,15 @@ misread above and #118 measured it not to work.
 +	pr_info("clk-trace: previous boot's sweep %s after %u entries\n",
 +		prev->state == 2 ? "FINISHED" : "DID NOT FINISH", n);
 +
++	/*
++	 * A finished sweep is the normal case and its 390 lines are noise, so
++	 * say so and stop. The whole ordered record is only worth printing
++	 * when the previous boot died in the middle of it -- which is the boot
++	 * nobody could see before.
++	 */
++	if (prev->state == 2)
++		return;
++
 +	for (i = 0; i < n; i++) {
 +		const struct gemini_clktrace_entry *e = &prev->entry[i];
 +
@@ -201,7 +218,7 @@ misread above and #118 measured it not to work.
  static void __init clk_unprepare_unused_subtree(struct clk_core *core)
  {
  	struct clk_core *child;
-@@ -1362,6 +1501,7 @@
+@@ -1362,6 +1510,7 @@
  	if (clk_pm_runtime_get(core))
  		return;
  
@@ -209,7 +226,7 @@ misread above and #118 measured it not to work.
  	if (clk_core_is_prepared(core)) {
  		trace_clk_unprepare(core);
  		if (core->ops->unprepare_unused)
-@@ -1370,6 +1510,7 @@
+@@ -1370,6 +1519,7 @@
  			core->ops->unprepare(core->hw);
  		trace_clk_unprepare_complete(core);
  	}
@@ -217,7 +234,7 @@ misread above and #118 measured it not to work.
  
  	clk_pm_runtime_put(core);
  }
-@@ -1403,6 +1544,7 @@
+@@ -1403,6 +1553,7 @@
  	 * sequence.  call .disable_unused if available, otherwise fall
  	 * back to .disable
  	 */
@@ -225,7 +242,7 @@ misread above and #118 measured it not to work.
  	if (clk_core_is_enabled(core)) {
  		trace_clk_disable(core);
  		if (core->ops->disable_unused)
-@@ -1411,6 +1553,7 @@
+@@ -1411,6 +1562,7 @@
  			core->ops->disable(core->hw);
  		trace_clk_disable_complete(core);
  	}
@@ -233,7 +250,7 @@ misread above and #118 measured it not to work.
  
  unlock_out:
  	clk_enable_unlock(flags);
-@@ -1439,6 +1582,8 @@
+@@ -1439,6 +1591,8 @@
  
  	pr_info("clk: Disabling unused clocks\n");
  
@@ -242,7 +259,7 @@ misread above and #118 measured it not to work.
  	clk_prepare_lock();
  
  	hlist_for_each_entry(core, &clk_root_list, child_node)
-@@ -1455,6 +1600,8 @@
+@@ -1455,6 +1609,8 @@
  
  	clk_prepare_unlock();
  

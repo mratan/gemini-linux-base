@@ -1,0 +1,83 @@
+From: Gemini PDA Linux bring-up
+Subject: [PATCH] arm64: dts: mediatek: mt6797: put vencsys/vdecsys/imgsys in their power domains
+
+#85. These three clock providers program registers that live inside
+MT6797_POWER_DOMAIN_VENC, _VDEC and _ISP, and nothing else in this kernel holds
+any of them -- there is no video codec driver, and the camera only takes ISP
+while it is open.
+
+That was fatal in exactly one place. clk_disable_unused() and
+genpd_power_off_unused() are both late_initcall_sync; the latter queues one
+genpd_power_off_work_fn per domain onto pm_wq, so the power-offs run on other
+CPUs while the clock sweep is walking the tree. Roughly half of all reboots,
+the power-off reached VENCSYS first and the sweep's gate write never returned:
+two CPUs hard-locked, /init never ran, and watchdog.open_timeout=120 reset the
+machine 120 s later. Measured on build #119, from a trace that survives the
+reset:
+
+  clk-trace: previous boot's sweep DID NOT FINISH after 7 entries
+  clk-trace:    6 disable   venc_3            <-- NEVER RETURNED
+
+With patches/v6.6/clk/0011 the three providers enable runtime PM, so the clk
+core takes a pm_runtime reference on them before touching any of these gates
+and genpd cannot pull the rug out. This patch is the other half: without a
+power-domains phandle there is no domain for that reference to hold.
+
+camsys is deliberately NOT included. The sweep touches none of its gates, so it
+is not exposed to this race, and its consumers already take the ISP domain
+themselves (see the comment above the node) -- which is load-bearing for #66.
+
+--- a/arch/arm64/boot/dts/mediatek/mt6797.dtsi
++++ b/arch/arm64/boot/dts/mediatek/mt6797.dtsi
+@@ -914,18 +914,51 @@
+ 		compatible = "mediatek,mt6797-imgsys", "syscon";
+ 		reg = <0 0x15000000 0 0x1000>;
+ 		#clock-cells = <1>;
++		/*
++		 * #85: these registers are inside MT6797_POWER_DOMAIN_ISP, and
++		 * nothing else in this kernel holds it -- there is no codec or
++		 * ISP driver bound. genpd_power_off_unused() and
++		 * clk_disable_unused() both run at late_initcall_sync, so
++		 * without this the sweep could write a gate register while the
++		 * block was being powered off underneath it. Measured: build
++		 * #119 wedged gating venc_3 with the CPU never returning from
++		 * the MMIO.
++		 */
++		power-domains = <&scpsys MT6797_POWER_DOMAIN_ISP>;
+ 	};
+ 
+ 	vdecsys: vdec_gcon@16000000 {
+ 		compatible = "mediatek,mt6797-vdecsys", "syscon";
+ 		reg = <0 0x16000000 0 0x10000>;
+ 		#clock-cells = <1>;
++		/*
++		 * #85: these registers are inside MT6797_POWER_DOMAIN_VDEC, and
++		 * nothing else in this kernel holds it -- there is no codec or
++		 * ISP driver bound. genpd_power_off_unused() and
++		 * clk_disable_unused() both run at late_initcall_sync, so
++		 * without this the sweep could write a gate register while the
++		 * block was being powered off underneath it. Measured: build
++		 * #119 wedged gating venc_3 with the CPU never returning from
++		 * the MMIO.
++		 */
++		power-domains = <&scpsys MT6797_POWER_DOMAIN_VDEC>;
+ 	};
+ 
+ 	vencsys: venc_gcon@17000000 {
+ 		compatible = "mediatek,mt6797-vencsys", "syscon";
+ 		reg = <0 0x17000000 0 0x1000>;
+ 		#clock-cells = <1>;
++		/*
++		 * #85: these registers are inside MT6797_POWER_DOMAIN_VENC, and
++		 * nothing else in this kernel holds it -- there is no codec or
++		 * ISP driver bound. genpd_power_off_unused() and
++		 * clk_disable_unused() both run at late_initcall_sync, so
++		 * without this the sweep could write a gate register while the
++		 * block was being powered off underneath it. Measured: build
++		 * #119 wedged gating venc_3 with the CPU never returning from
++		 * the MMIO.
++		 */
++		power-domains = <&scpsys MT6797_POWER_DOMAIN_VENC>;
+ 	};
+ 
+ 	gic: interrupt-controller@19000000 {

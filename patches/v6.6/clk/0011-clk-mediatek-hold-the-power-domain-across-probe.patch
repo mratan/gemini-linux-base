@@ -1,0 +1,154 @@
+From: Gemini PDA Linux bring-up
+Subject: [PATCH] clk: mediatek: hold the provider's power domain across probe
+
+#85, and this is the fix for it.
+
+MT6797 lost roughly half its reboots to a 5-20 minute loop. The boot wedged
+inside clk_disable_unused(), two CPUs hard-locked, /init never ran, and
+watchdog.open_timeout=120 reclaimed the machine. Named at last on build #119 by
+a reset-persistent trace that writes to DRAM instead of a console
+(patches/v6.6/clk/0010):
+
+  clk-trace: previous boot's sweep DID NOT FINISH after 7 entries
+  clk-trace:    6 disable   venc_3            <-- NEVER RETURNED
+
+venc_3 is a gate in VENCSYS at 0x17000000, which lives inside
+MT6797_POWER_DOMAIN_VENC. Nothing in this kernel holds that domain: there is no
+video encoder driver, so it is "unused". And genpd_power_off_unused() is a
+late_initcall_sync exactly like clk_disable_unused() -- it queues one
+genpd_power_off_work_fn per domain onto pm_wq, which then runs concurrently
+with the sweep on another CPU. (The captured #111 boot shows all thirteen of
+them stacked up: "pending: 13*genpd_power_off_work_fn".)
+
+So it is a straight race. If the sweep reaches VENCSYS first the gate write
+lands and the boot lives; if the power-off lands first the block is dark, the
+write never completes, and the CPU that issued it is gone -- with
+clk_enable_lock() held and interrupts off, which is why a second CPU (the next
+one to call clk_enable) hard-locks too, and why the pair varies from boot to
+boot. That is every symptom this issue has ever shown, including why it is
+intermittent, why clk_ignore_unused cures it, and why netconsole -- which
+changes when late_initcall runs relative to pm_wq -- appeared to.
+
+The fix is the one upstream already applies to newer MediaTek SoCs: give
+mtk_clk_desc a need_runtime_pm flag, and have __mtk_clk_simple_probe() enable
+runtime PM and hold a reference across the whole of probe. Enabling it is what
+matters afterwards: clk_register() sets core->rpm_enabled from
+pm_runtime_enabled(dev), so from then on the clk core itself takes a
+pm_runtime reference around every operation on those gates -- including
+clk_disable_unused_subtree(), which is where this bit. The resume_and_get()
+during probe additionally avoids the clk_register()/genpd deadlock upstream
+documents.
+
+Set on the three MT6797 providers whose registers sit in a domain no other
+driver holds and whose gates the sweep actually touches (measured, from the
+same trace on a healthy boot): vencsys (VENC), vdecsys (VDEC) and imgsys (ISP).
+
+NOT set on mmsys: its clk provider is a child platform device created by
+mtk-mmsys (mtk_clk_pdev_probe, no DT node of its own), and the display driver
+holds MT6797_POWER_DOMAIN_MM whenever the panel is up. NOT set on camsys or
+mfgcfg: the sweep touches none of their gates, so neither is exposed to this
+race, and both are load-bearing for work in flight (#66, the GPU).
+
+--- a/drivers/clk/mediatek/clk-mtk.h
++++ b/drivers/clk/mediatek/clk-mtk.h
+@@ -234,6 +234,13 @@
+ 	const struct mtk_clk_rst_desc *rst_desc;
+ 	spinlock_t *clk_lock;
+ 	bool shared_io;
++	/*
++	 * #85: set this on any provider whose registers live inside a power
++	 * domain nothing else holds. Without it clk_disable_unused() can write
++	 * a gate register while genpd_power_off_unused() is powering the block
++	 * off underneath, and the MMIO never returns.
++	 */
++	bool need_runtime_pm;
+ 
+ 	int (*clk_notifier_func)(struct device *dev, struct clk *clk);
+ 	unsigned int mfg_clk_idx;
+--- a/drivers/clk/mediatek/clk-mtk.c
++++ b/drivers/clk/mediatek/clk-mtk.c
+@@ -13,6 +13,7 @@
+ #include <linux/of.h>
+ #include <linux/of_address.h>
+ #include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
+ #include <linux/slab.h>
+ 
+ #include "clk-mtk.h"
+@@ -483,6 +484,21 @@
+ 			return -EINVAL;
+ 	}
+ 
++	/*
++	 * #85: hold the provider's power domain across the whole of probe, and
++	 * leave runtime PM enabled afterwards so the clk core takes the same
++	 * reference every time it touches one of these gates -- including from
++	 * clk_disable_unused(), which is where MT6797 was losing half its
++	 * reboots. The resume_and_get() here also keeps clk_register() from
++	 * deadlocking against genpd.
++	 */
++	if (mcd->need_runtime_pm) {
++		devm_pm_runtime_enable(&pdev->dev);
++		r = pm_runtime_resume_and_get(&pdev->dev);
++		if (r)
++			return r;
++	}
++
+ 	/* Composite and divider clocks needs us to pass iomem pointer */
+ 	if (mcd->composite_clks || mcd->divider_clks) {
+ 		if (!mcd->shared_io)
+@@ -574,6 +590,9 @@
+ 			goto unregister_clks;
+ 	}
+ 
++	if (mcd->need_runtime_pm)
++		pm_runtime_put(&pdev->dev);
++
+ 	return r;
+ 
+ unregister_clks:
+@@ -604,6 +623,8 @@
+ free_base:
+ 	if (mcd->shared_io && base)
+ 		iounmap(base);
++	if (mcd->need_runtime_pm)
++		pm_runtime_put(&pdev->dev);
+ 	return r;
+ }
+ 
+--- a/drivers/clk/mediatek/clk-mt6797-venc.c
++++ b/drivers/clk/mediatek/clk-mt6797-venc.c
+@@ -31,6 +31,9 @@
+ static const struct mtk_clk_desc venc_desc = {
+ 	.clks = venc_clks,
+ 	.num_clks = ARRAY_SIZE(venc_clks),
++
++	/* #85: its registers are inside a power domain nothing else holds. */
++	.need_runtime_pm = true,
+ };
+ 
+ static const struct of_device_id of_match_clk_mt6797_venc[] = {
+--- a/drivers/clk/mediatek/clk-mt6797-vdec.c
++++ b/drivers/clk/mediatek/clk-mt6797-vdec.c
+@@ -40,6 +40,9 @@
+ static const struct mtk_clk_desc vdec_desc = {
+ 	.clks = vdec_clks,
+ 	.num_clks = ARRAY_SIZE(vdec_clks),
++
++	/* #85: its registers are inside a power domain nothing else holds. */
++	.need_runtime_pm = true,
+ };
+ 
+ static const struct of_device_id of_match_clk_mt6797_vdec[] = {
+--- a/drivers/clk/mediatek/clk-mt6797-img.c
++++ b/drivers/clk/mediatek/clk-mt6797-img.c
+@@ -46,6 +46,9 @@
+ 	 * allocation separately from the array length.
+ 	 */
+ 	.num_clks = ARRAY_SIZE(img_clks),
++
++	/* #85: its registers are inside a power domain nothing else holds. */
++	.need_runtime_pm = true,
+ };
+ 
+ static const struct of_device_id of_match_clk_mt6797_img[] = {
