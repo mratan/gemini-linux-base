@@ -725,31 +725,62 @@ static int read_state_locked(struct fg_state *st)
 			seeded_at_rest = at_rest;
 		} else if (!seeded_at_rest) {
 			/*
-			 * DO NOT ANCHOR THE COUNTER TO A READING TAKEN DURING
-			 * THE BOOT STORM.
+			 * NOT YET ANCHORED: the seed we have was taken under
+			 * load, so its ABSOLUTE value is not to be trusted --
+			 * but count coulombs from it anyway.
 			 *
-			 * The reference this whole estimate hangs off is an OCV
-			 * lookup, and an OCV lookup is only worth anything when
-			 * nothing is flowing. Four seconds into boot this device
-			 * is drawing 709 mA, terminal voltage is 3.976 V, and the
-			 * profile says 65% for a pack that is really at 85%.
-			 * Seeding there locks in a twenty-point error and then
-			 * defends it, because coulomb counting is faithful to
-			 * whatever it was told to start from.
+			 * Still true, and why we do not anchor here: an OCV
+			 * lookup is only worth anything when nothing is flowing.
+			 * Four seconds into boot this device draws 709 mA,
+			 * terminal voltage is 3.976 V, and the profile says 65%
+			 * for a pack really at 85%. Anchoring there locks in a
+			 * twenty-point error and then defends it.
 			 *
-			 * So until a genuinely quiet sample turns up, follow the
-			 * OCV estimate directly -- no better than the vendor, but
-			 * no worse, and honest about it -- and keep the counter
-			 * reference rolling forward so nothing is double-counted
-			 * when the latch finally happens.
+			 * WHAT CHANGED, 2026-08-31. This branch used to re-take
+			 * q_ocv every cycle -- "follow the OCV estimate directly,
+			 * no better than the vendor but no worse". On a machine
+			 * that rests often that is nearly harmless, because the
+			 * anchor arrives within minutes. This machine is a
+			 * pocket terminal: at_rest needs |I| < 30 mA and a
+			 * running desktop draws ~950 mA, so unplugged and in use
+			 * it NEVER rests and never anchors. Measured 2026-08-30,
+			 * on battery, this branch running the whole time:
+			 *
+			 *   capacity fell 11% -> 0% in 197 s, i.e. 17.9 s per
+			 *   point against the 20 s slew ceiling -- the reported
+			 *   value descending as fast as it was allowed to, while
+			 *   the pack still delivered 950 mA for another fifteen
+			 *   minutes at "0%".
+			 *
+			 * It was chasing an OCV computed with the vendor
+			 * r_profile, which the note further down measures at
+			 * ~20 mOhm against a real 312. Under ~1 A that lookup
+			 * lands far down the curve from where the pack is.
+			 *
+			 * So do here what the anchored branch does: integrate the
+			 * hardware counter, which does not care what the
+			 * resistance is. The offset stays wrong until a quiet
+			 * sample turns up; the SHAPE is right immediately, and
+			 * monotonic. A steady twenty-point offset is a bad
+			 * gauge. A number that reaches zero with a quarter of the
+			 * pack left is a machine that powers off in your hand.
 			 */
-			tracked_q_uah = q_ocv;
-			car_ref_uah = st->car_uah;
 			if (at_rest) {
+				tracked_q_uah = q_ocv;
+				car_ref_uah = st->car_uah;
 				seeded_at_rest = true;
 				pr_info("mt6351-battery: anchored at %lld uAh (%d%%) on a resting sample\n",
 					tracked_q_uah,
 					(int)div_s64(tracked_q_uah * 100, Q_MAX_UAH));
+			} else {
+				s64 d = st->car_uah - car_ref_uah;
+
+				car_ref_uah = st->car_uah;
+				/* Same wrap rejection as the anchored branch. */
+				if (abs(d) < div_s64(Q_MAX_UAH, 2))
+					tracked_q_uah += d;
+				tracked_q_uah = clamp_t(s64, tracked_q_uah,
+							0, Q_MAX_UAH);
 			}
 		} else {
 			s64 d = st->car_uah - car_ref_uah;
