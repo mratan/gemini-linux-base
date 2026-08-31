@@ -764,6 +764,23 @@ static int read_state_locked(struct fg_state *st)
 			 * monotonic. A steady twenty-point offset is a bad
 			 * gauge. A number that reaches zero with a quarter of the
 			 * pack left is a machine that powers off in your hand.
+			 *
+			 * VERIFIED 2026-08-31 by forcing this branch: a probe
+			 * build with REST_CURRENT_UA 0 never satisfies at_rest,
+			 * so it stays here for ever. Old code vs new, same pack,
+			 * plugged in and idle at ~4.2 V and ~0 A:
+			 *
+			 *   new  charge_now 3798520 x8, steady, while vbat
+			 *        wobbled 4188..4201 mV
+			 *   old  charge_now 3841200 / 3798520 / 3755840,
+			 *        stepping in lockstep with vbat
+			 *
+			 * Those three old values are exactly 42680 uAh apart --
+			 * 1% of Q_MAX. A 10 mV wobble moved the reported charge
+			 * a whole point, and that is at the FLAT top of the
+			 * curve with nothing flowing, the best case OCV ever
+			 * gets. Down at 3.7 V under 950 mA it is far worse, and
+			 * that is the 11% -> 0% walk above.
 			 */
 			if (at_rest) {
 				tracked_q_uah = q_ocv;
