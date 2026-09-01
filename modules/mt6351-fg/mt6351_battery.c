@@ -526,22 +526,64 @@ static int auxadc_vbat_uv(int *uv)
 /* ---- vendor profile interpolation --------------------------------------- */
 
 /* internal resistance at a given OCV, vendor units are 0.1 mOhm */
+/*
+ * THE VENDOR RESISTANCE PROFILE IS LOW BY A FACTOR OF ~16, AND EVERYTHING
+ * DERIVED FROM OCV INHERITS THAT ERROR.
+ *
+ * res_table says 17-25 mOhm across the whole pack. Measured on this cell on
+ * 2026-08-27 across 105 samples of a real discharge: 660 mA at 3867 mV against
+ * 1221 mA at 3691 mV, i.e. dV/dI = 312 mOhm. 312 / 19.5 = 16.
+ *
+ * The consequence is not subtle, because OCV = V + I*R and this machine seeds
+ * its coulomb counter from an OCV lookup taken during the boot storm at over an
+ * amp. Replaying three real seeds through these tables (as-shipped vs scaled),
+ * against a charge known from the anchored counter:
+ *
+ *   vbat   I       true   as-shipped   x16
+ *   3683   1441mA   82%      14%       77%
+ *   3896    863mA   89%      57%       84%
+ *   4070    101mA   89%      76%       80%
+ *
+ * The as-shipped column reproduces what the driver actually printed on those
+ * boots (13%, 56%, 75%), so the replay is faithful and this is the real cause
+ * of a gauge that comes up 70 points low after a reboot on battery.
+ *
+ * WHY 16 AND NOT 18. Fitting the scale to those three points prefers 18 (worst
+ * error 9 pp against 16's 9 pp, mean 4.0 against 6.3). 16 is shipped anyway,
+ * for two reasons: it is what the 105-sample measurement gives, where 18 is
+ * fitted to three points; and 16's residuals are -5/-5/-9, all PESSIMISTIC,
+ * while 18 turns one optimistic. A fuel gauge that reads low is a nuisance; one
+ * that reads high strands you.
+ *
+ * WHAT THIS DOES NOT FIX. The third row above is -9 pp at every scale >= 16: at
+ * 101 mA the I*R term is tiny whatever R is, so that residual is the OCV table
+ * or surface charge, not resistance. Anyone chasing the last few points should
+ * start there, not here.
+ *
+ * A FLAT SCALE IS THE MINIMUM-ASSUMPTION CHOICE. Real R varies with charge and
+ * temperature and the vendor's CURVE SHAPE may be wrong too, but three points
+ * cannot justify re-shaping it. Scaling preserves the shape and fixes the
+ * magnitude, which is the part that is demonstrably wrong.
+ */
+#define R_PROFILE_SCALE 16
+
 static int res_at_mv(int mv)
 {
 	int i;
 
 	if (mv >= res_table[0].ocv_mv)
-		return res_table[0].res;
+		return res_table[0].res * R_PROFILE_SCALE;
 	for (i = 1; i < ARRAY_SIZE(res_table); i++) {
 		if (mv >= res_table[i].ocv_mv) {
 			int v0 = res_table[i - 1].ocv_mv, v1 = res_table[i].ocv_mv;
 			int r0 = res_table[i - 1].res,    r1 = res_table[i].res;
 			if (v0 == v1)
-				return r1;
-			return r1 + (r0 - r1) * (mv - v1) / (v0 - v1);
+				return r1 * R_PROFILE_SCALE;
+			return (r1 + (r0 - r1) * (mv - v1) / (v0 - v1)) *
+			       R_PROFILE_SCALE;
 		}
 	}
-	return res_table[ARRAY_SIZE(res_table) - 1].res;
+	return res_table[ARRAY_SIZE(res_table) - 1].res * R_PROFILE_SCALE;
 }
 
 /* depth-of-discharge (percent of Q_MAX) for an OCV */
