@@ -78,6 +78,16 @@ def main():
     ap.add_argument("--kernel", required=True, help="Image.gz")
     ap.add_argument("--dtb", required=True, help="board DTB, appended after Image.gz")
     ap.add_argument("--out", required=True)
+    ap.add_argument("--cmdline",
+                    help="replace the kernel cmdline in the boot HEADER. INERT "
+                         "ON THIS DEVICE: gemini-cmdline.config sets "
+                         "CONFIG_CMDLINE_FORCE=y, so the kernel discards the "
+                         "header cmdline, what LK passes, and what kexec "
+                         "passes. Verified 2026-09-03: an image packed with "
+                         "resume= booted with the config string instead. Put "
+                         "parameters in configs/gemini-cmdline.config and "
+                         "rebuild. Kept only for a kernel built without "
+                         "CMDLINE_FORCE.")
     ap.add_argument("--kernel-addr", type=lambda s: int(s, 0), default=None,
                      help="override the header's kernel load address (must be 2MB-aligned "
                           "for mainline arm64 kernels -- see boot.md 'Image load offset' finding)")
@@ -90,6 +100,13 @@ def main():
         if args.kernel_addr % (2 * 1024 * 1024) != 0:
             sys.exit(f"--kernel-addr 0x{args.kernel_addr:x} is not 2MB-aligned")
         hdr["kernel_addr"] = args.kernel_addr
+    if args.cmdline is not None:
+        raw = args.cmdline.encode()
+        if len(raw) > 511:
+            sys.exit("cmdline is %d bytes; the boot header field holds 511 plus "
+                     "a NUL terminator" % len(raw))
+        hdr["cmdline"] = raw + b"\x00" * (512 - len(raw))
+
     ramdisk = extract_ramdisk(ref, hdr)
     if len(ramdisk) != hdr["ramdisk_size"]:
         sys.exit(f"ramdisk extraction size mismatch: got {len(ramdisk)}, expected {hdr['ramdisk_size']}")

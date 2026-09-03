@@ -222,6 +222,7 @@ deps_/mercury/data/projects/gemini_linux/07-kernel/wt-main/modules/mt6351-fg/mt6
   arch/arm64/include/asm/hwcap.h \
   arch/arm64/include/uapi/asm/hwcap.h \
   arch/arm64/include/asm/cpufeature.h \
+    $(wildcard include/config/ARM64_MITIGATE_LATE_CPUS) \
     $(wildcard include/config/ARM64_PAN) \
     $(wildcard include/config/ARM64_SW_TTBR0_PAN) \
     $(wildcard include/config/ARM64_SVE) \
